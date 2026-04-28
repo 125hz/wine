@@ -154,7 +154,7 @@ static BOOL send_cross_process_notification( HANDLE process, UINT id, const void
 }
 
 
-static void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METADATA *metadata )
+void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METADATA *metadata )
 {
     const IMAGE_ARM64EC_REDIRECTION_ENTRY *map = get_rva( module, metadata->RedirectionMetadata );
     int min = 0, max = metadata->RedirectionMetadataCount - 1;

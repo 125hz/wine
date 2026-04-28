@@ -1220,6 +1220,15 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
         goto done;
     }
 
+#ifdef __arm64ec__
+    /* For ARM64EC: imports normally resolve to the .hexpthk x86_64 thunks
+     * exported in the EXPORT directory. ARM64-host callers want the
+     * ARM64-native target instead. Apply RedirectionMetadata up front so
+     * IAT entries point directly to ARM64 code, avoiding the runtime
+     * arm64x_check_call fast-forward dance. */
+    const IMAGE_ARM64EC_METADATA *imp_metadata = arm64ec_get_module_metadata( imp_mod );
+#endif
+
     while (import_list->u1.Ordinal)
     {
         if (IMAGE_SNAP_BY_ORDINAL(import_list->u1.Ordinal))
@@ -1235,6 +1244,12 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
                      name, ordinal, debugstr_w(wm->ldr.FullDllName.Buffer),
                      (void *)thunk_list->u1.Function );
             }
+#ifdef __arm64ec__
+            else if (imp_metadata)
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
+                                                                           (void *)thunk_list->u1.Function,
+                                                                           imp_metadata );
+#endif
             TRACE_(imports)("--- Ordinal %s.%d = %p\n", name, ordinal, (void *)thunk_list->u1.Function );
         }
         else  /* import by name */
@@ -1251,6 +1266,12 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
                      name, pe_name->Name, debugstr_w(wm->ldr.FullDllName.Buffer),
                      (void *)thunk_list->u1.Function );
             }
+#ifdef __arm64ec__
+            else if (imp_metadata)
+                thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
+                                                                           (void *)thunk_list->u1.Function,
+                                                                           imp_metadata );
+#endif
             TRACE_(imports)("--- %s %s.%d = %p\n",
                             pe_name->Name, name, pe_name->Hint, (void *)thunk_list->u1.Function);
         }
