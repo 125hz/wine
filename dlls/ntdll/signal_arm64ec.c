@@ -186,6 +186,12 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
     __os_arm64x_dispatch_ret = RtlFindExportedRoutineByName( module, "RetToEntryThunk" );
 
+    /* The dispatcher globals were 0 when xtajit64's process_module ran
+     * arm64ec_update_hybrid_metadata, so xtajit64's hybrid pointer slots
+     * still hold 0. Re-run the metadata update with the now-populated
+     * globals so xtajit64's exit thunks read real dispatcher addresses. */
+    arm64ec_update_hybrid_metadata( module, RtlImageNtHeader( module ), (IMAGE_ARM64EC_METADATA *)metadata );
+
 #define GET_PTR(name) p ## name = arm64ec_redirect_ptr( module, \
                                       RtlFindExportedRoutineByName( module, #name ), metadata )
     GET_PTR( BTCpu64FlushInstructionCache );
