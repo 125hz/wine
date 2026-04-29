@@ -1932,6 +1932,13 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
             free( loader );
             status = STATUS_INVALID_IMAGE_FORMAT;
         }
+#ifdef WINE_IOS
+        /* iOS arm64ec: AMD64 main exe is dispatched via xtajit64 directly
+         * (loaded by load_arm64ec_module in PE-side loader_init). start.exe
+         * is not bundled and not needed — skip the fallback. */
+        if (status == STATUS_INVALID_IMAGE_FORMAT && is_arm64ec())
+            status = STATUS_SUCCESS;
+#endif
     }
 
     if (status)  /* try launching it through start.exe */

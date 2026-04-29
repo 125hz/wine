@@ -182,6 +182,12 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     CHPEV2_PROCESS_INFO *info = (CHPEV2_PROCESS_INFO *)(RtlGetCurrentPeb() + 1);
     const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
 
+    /* Stash arm64x_check_call's address in PEB.WerRegistrationData (unused
+     * on iOS) BEFORE pProcessInit runs, so ntdll-unix's SEGV handler can
+     * dump arm64x_check_call's first instructions if FEX's ProcessInit
+     * crashes inside arm64x_check_call. */
+    RtlGetCurrentPeb()->WerRegistrationData = arm64x_check_call;
+
     __os_arm64x_dispatch_call_no_redirect = RtlFindExportedRoutineByName( module, "ExitToX64" );
     __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
     __os_arm64x_dispatch_ret = RtlFindExportedRoutineByName( module, "RetToEntryThunk" );
@@ -288,6 +294,8 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
     const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
 
     /* assume that all pointers are in the same section */
+    ERR( "arm64ec_update_hybrid_metadata: module=%p dispatch_call_rva=%lx check_call=%p\n",
+         module, (unsigned long)metadata->__os_arm64x_dispatch_call, arm64x_check_call );
 
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
     {
