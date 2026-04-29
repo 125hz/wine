@@ -1935,9 +1935,15 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
 #ifdef WINE_IOS
         /* iOS arm64ec: AMD64 main exe is dispatched via xtajit64 directly
          * (loaded by load_arm64ec_module in PE-side loader_init). start.exe
-         * is not bundled and not needed — skip the fallback. */
-        if (status == STATUS_INVALID_IMAGE_FORMAT && is_arm64ec())
+         * is not bundled in arm64ec-windows/ and not needed — skip fallback. */
+        ERR( "iOS env: status=0x%x main_machine=0x%x current_machine=0x%x is_arm64ec=%d\n",
+             status, main_image_info.Machine, current_machine, is_arm64ec() );
+        if (main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+            current_machine == IMAGE_FILE_MACHINE_ARM64)
+        {
+            ERR( "iOS env: skipping start.exe fallback for AMD64 main on ARM64 host\n" );
             status = STATUS_SUCCESS;
+        }
 #endif
     }
 
