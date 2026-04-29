@@ -4302,10 +4302,26 @@ static void load_arm64ec_module(void)
         NtClose( key );
     }
 
-    if ((status = load_dll( NULL, module, 0, &wm, FALSE )) ||
-        (status = arm64ec_process_init( wm->ldr.DllBase )))
+    if ((status = load_dll( NULL, module, 0, &wm, FALSE )))
     {
         ERR( "could not load %s, status %lx\n", debugstr_w(module), status );
+        NtTerminateProcess( GetCurrentProcess(), status );
+    }
+
+    /* Run process_attach (DllMain) on xtajit64's dependency tree BEFORE calling
+     * arm64ec_process_init. arm64ec_process_init invokes FEX's ProcessInit,
+     * which runs C++ static constructors via InitCRTProcess. Those ctors call
+     * into ucrtbase (e.g. _lock); without ucrtbase's DllMain having run, its
+     * lock_table[17] is uninitialized and _lock(17) recurses infinitely. */
+    if ((status = walk_node_dependencies( wm->ldr.DdagNode, NULL, process_attach )))
+    {
+        ERR( "process_attach for %s deps failed, status %lx\n", debugstr_w(module), status );
+        NtTerminateProcess( GetCurrentProcess(), status );
+    }
+
+    if ((status = arm64ec_process_init( wm->ldr.DllBase )))
+    {
+        ERR( "arm64ec_process_init for %s failed, status %lx\n", debugstr_w(module), status );
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 }
