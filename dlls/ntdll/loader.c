@@ -4351,11 +4351,13 @@ static void load_arm64ec_module(void)
     }
 
     /* Phase 2: invoke FEX's ProcessInit/ThreadInit. */
+    ERR( "load_arm64ec_module: about to call arm64ec_process_init\n" );
     if ((status = arm64ec_process_init( wm->ldr.DllBase )))
     {
         ERR( "arm64ec_process_init for %s failed, status %lx\n", debugstr_w(module), status );
         NtTerminateProcess( GetCurrentProcess(), status );
     }
+    ERR( "load_arm64ec_module: arm64ec_process_init returned cleanly, status=%lx\n", status );
 }
 
 #endif
@@ -4543,8 +4545,11 @@ void loader_init( CONTEXT *context, void **entry )
         wm = build_main_module();
         build_ntdll_module();
 #ifdef __arm64ec__
+        ERR( "loader_init: calling load_arm64ec_module\n" );
         load_arm64ec_module();
+        ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
         update_load_config( wm->ldr.DllBase );
+        ERR( "loader_init: update_load_config done, proceeding to load kernel32\n" );
 #endif
 
         if ((status = load_dll( NULL, L"kernel32.dll", 0, &kernel32, FALSE )) != STATUS_SUCCESS)
