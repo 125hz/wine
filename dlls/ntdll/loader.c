@@ -1128,6 +1128,15 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
     if (((const char *)proc >= (const char *)exports) &&
         ((const char *)proc < (const char *)exports + exp_size))
         return NULL;
+#ifdef __arm64ec__
+    /* On ARM64EC, exports often point to .hexpthk x86_64 thunks. Redirect
+     * to the ARM64-native target so direct callers (FEX, LdrGetProcedureAddress
+     * paths, etc.) don't execute x86_64 bytes as ARM64. */
+    {
+        const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
+        if (metadata) proc = arm64ec_redirect_ptr( module, proc, metadata );
+    }
+#endif
     return proc;
 }
 
@@ -4320,17 +4329,28 @@ static void load_arm64ec_module(void)
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 
-    /* Run process_attach (DllMain) on xtajit64's dependency tree BEFORE calling
-     * arm64ec_process_init. arm64ec_process_init invokes FEX's ProcessInit,
-     * which runs C++ static constructors via InitCRTProcess. Those ctors call
-     * into ucrtbase (e.g. _lock); without ucrtbase's DllMain having run, its
-     * lock_table[17] is uninitialized and _lock(17) recurses infinitely. */
+    /* Phase 1: set up dispatcher pointers and FEX function pointers BEFORE
+     * the DllMain dependency walk, so that exception dispatch
+     * (KiUserExceptionDispatcher needs __os_arm64x_dispatch_call_no_redirect)
+     * and dispatch_emulation (needs pBeginSimulation) work during DllMain. */
+    if ((status = arm64ec_process_init_dispatchers( wm->ldr.DllBase )))
+    {
+        ERR( "arm64ec_process_init_dispatchers for %s failed, status %lx\n",
+             debugstr_w(module), status );
+        NtTerminateProcess( GetCurrentProcess(), status );
+    }
+
+    /* Phase 1.5: run DllMains on xtajit64's dependency tree so ucrtbase's
+     * lock_table[17] is initialized before FEX's CRT static constructors
+     * (InitCRTProcess) run from pProcessInit. Without this, _lock(17)
+     * recurses infinitely in FEX's ctors. */
     if ((status = walk_node_dependencies( wm->ldr.DdagNode, NULL, process_attach )))
     {
         ERR( "process_attach for %s deps failed, status %lx\n", debugstr_w(module), status );
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 
+    /* Phase 2: invoke FEX's ProcessInit/ThreadInit. */
     if ((status = arm64ec_process_init( wm->ldr.DllBase )))
     {
         ERR( "arm64ec_process_init for %s failed, status %lx\n", debugstr_w(module), status );
