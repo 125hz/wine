@@ -1602,7 +1602,19 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
         if (nt->FileHeader.Characteristics & IMAGE_FILE_DLL)
             wm->ldr.Flags |= LDR_IMAGE_IS_DLL;
         if (nt->OptionalHeader.AddressOfEntryPoint)
+        {
             wm->ldr.EntryPoint = (char *)hModule + nt->OptionalHeader.AddressOfEntryPoint;
+#ifdef __arm64ec__
+            /* For ARM64EC PEs, AddressOfEntryPoint can point into .hexpthk
+             * (x86_64 fast-forward thunks). Redirect to the ARM64-native
+             * target so we don't execute x86_64 bytes as ARM64. */
+            {
+                const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( hModule );
+                if (metadata)
+                    wm->ldr.EntryPoint = arm64ec_redirect_ptr( hModule, wm->ldr.EntryPoint, metadata );
+            }
+#endif
+        }
     }
 
     InsertTailList(&NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList,
