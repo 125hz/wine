@@ -797,6 +797,13 @@ HWND get_desktop_window(void)
     /* don't create an actual explorer desktop window for services */
     is_service = is_service_process();
 
+#ifdef WINE_IOS
+    /* iOS: explorer.exe launch is deferred (no CreateProcess yet). Ask the
+     * server to create the desktop window directly (force=1, same path as
+     * service processes) and skip the NtCreateUserProcess fallback below. */
+    is_service = TRUE;
+#endif
+
     SERVER_START_REQ( get_desktop_window )
     {
         req->force = is_service;
@@ -807,6 +814,20 @@ HWND get_desktop_window(void)
         }
     }
     SERVER_END_REQ;
+
+#ifdef WINE_IOS
+    /* iOS: explorer.exe launch is deferred (no CreateProcess yet). If the
+     * server didn't return a top_window above (e.g. shared_session not yet
+     * initialized when the very first builtin-class register fires), skip
+     * the launch entirely. We rely on the server-create path on subsequent
+     * calls (force=1) once init_user has finished. Better than spinning up
+     * a child thread that fails to load explorer.exe and kills the process. */
+    if (!thread_info->top_window)
+    {
+        ERR_(win)( "iOS: skipping explorer.exe launch; top_window stays 0\n" );
+        return UlongToHandle( thread_info->top_window );
+    }
+#endif
 
     if (!thread_info->top_window)
     {

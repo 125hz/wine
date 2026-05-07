@@ -1234,8 +1234,17 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
      * exported in the EXPORT directory. ARM64-host callers want the
      * ARM64-native target instead. Apply RedirectionMetadata up front so
      * IAT entries point directly to ARM64 code, avoiding the runtime
-     * arm64x_check_call fast-forward dance. */
-    const IMAGE_ARM64EC_METADATA *imp_metadata = arm64ec_get_module_metadata( imp_mod );
+     * arm64x_check_call fast-forward dance.
+     *
+     * IMPORTANT: only redirect when the IMPORTING module is also ARM64EC.
+     * A pure x86_64 importer (e.g. cube-x64.exe under FEX) MUST get the
+     * .hexpthk x86_64 thunk address — not the ARM64 native target — or its
+     * `call qword ptr [iat]` lands on ARM64 instructions interpreted as x86,
+     * corrupts the guest state, and crashes via dispatch_icall with
+     * x11=garbage. */
+    const IMAGE_ARM64EC_METADATA *imp_metadata = NULL;
+    if (arm64ec_get_module_metadata( module ))  /* importer is ARM64EC */
+        imp_metadata = arm64ec_get_module_metadata( imp_mod );
 #endif
 
     while (import_list->u1.Ordinal)

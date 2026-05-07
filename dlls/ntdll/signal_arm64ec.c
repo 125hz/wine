@@ -197,11 +197,20 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
         {
             LONG off = *(const LONG *)&bytes[2];
             void **imp = (void **)(bytes + 6 + off);
-            if (*imp && *imp != ptr)
+            void *target = *imp;
+            /* Only follow the forwarder if the IAT slot is actually bound to
+             * a usable pointer. At import-binding time the target module's
+             * IAT may still hold raw IBN RVAs (small 32-bit values) — chasing
+             * those returns a low integer that gets stored as a "function
+             * pointer" and crashes later when called. Require the value to
+             * look like a real address (above the lowest module DllBase).
+             * If it doesn't, fall through to `return ptr;` so the IAT entry
+             * gets the thunk address, and runtime arm64x_check_call handles
+             * the (now-bound) forwarder on first call. */
+            if (target && target != ptr && (ULONG_PTR)target >= 0x10000000)
             {
                 /* Find the module containing the target and redirect within
                  * it. If the target is also a thunk, this recurses. */
-                void *target = *imp;
                 LDR_DATA_TABLE_ENTRY *mod_entry;
                 LIST_ENTRY *list = &RtlGetCurrentPeb()->LdrData->InLoadOrderModuleList;
                 LIST_ENTRY *entry;
