@@ -154,6 +154,35 @@ static BOOL send_cross_process_notification( HANDLE process, UINT id, const void
 }
 
 
+/* iOS: PE .text sections are non-executable at their unix VA; an executable
+ * alias lives in the JIT pool. arm64ec_redirect_ptr resolves to unix .text
+ * addresses, so on iOS every return path must be translated to the JIT alias.
+ *
+ * `p_ios_jit_translate_addr` holds the address of unix-side
+ * ios_jit_translate_addr (a native ARM64 function), set by unix-side
+ * load_ntdll_functions. NULL on non-iOS / pre-init.
+ *
+ * `xlate_ios_jit` is a naked PE-side thunk that does `br x16` to the unix
+ * function — bypassing arm64x_check_call which would otherwise misroute a
+ * non-EC target through x86 emulation. Same trick as __wine_unix_call_arm64ec.
+ *
+ * The pointer is exported via ntdll.spec so unix-side can install the address. */
+void *p_ios_jit_translate_addr = NULL;
+
+void *__attribute__((naked)) xlate_ios_jit( void *ptr )
+{
+    asm( ".seh_proc \"#xlate_ios_jit\"\n\t"
+         ".seh_endprologue\n\t"
+         "cbz x0, 1f\n\t"                                 /* NULL → return NULL */
+         "adrp x16, p_ios_jit_translate_addr\n\t"
+         "ldr x16, [x16, #:lo12:p_ios_jit_translate_addr]\n\t"
+         "cbz x16, 1f\n\t"                                /* fn-ptr unset → identity */
+         "br x16\n"                                       /* tail-call unix fn */
+         "1: ret\n\t"
+         ".seh_endproc" );
+}
+
+
 void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METADATA *metadata )
 {
     const IMAGE_ARM64EC_REDIRECTION_ENTRY *map = get_rva( module, metadata->RedirectionMetadata );
@@ -164,7 +193,7 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
     while (min <= max)
     {
         int pos = (min + max) / 2;
-        if (map[pos].Source == rva) return get_rva( module, map[pos].Destination );
+        if (map[pos].Source == rva) return xlate_ios_jit( get_rva( module, map[pos].Destination ) );
         if (map[pos].Source < rva) min = pos + 1;
         else max = pos - 1;
     }
@@ -190,7 +219,7 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
         {
             LONG off = *(const LONG *)&bytes[10];
             void *target = (char *)ptr + 14 + off;
-            return target;
+            return xlate_ios_jit( target );
         }
         /* (a) simple forwarder thunk */
         if (bytes[0] == 0xff && bytes[1] == 0x25)
@@ -222,16 +251,18 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
                     {
                         const IMAGE_ARM64EC_METADATA *target_metadata =
                             arm64ec_get_module_metadata( mod_entry->DllBase );
+                        /* Recursive call already applies xlate_ios_jit at its
+                         * own return paths; passing through unchanged is correct. */
                         if (target_metadata)
                             return arm64ec_redirect_ptr( mod_entry->DllBase, target, target_metadata );
-                        return target;
+                        return xlate_ios_jit( target );
                     }
                 }
-                return target;
+                return xlate_ios_jit( target );
             }
         }
     }
-    return ptr;
+    return xlate_ios_jit( ptr );
 }
 
 static void arm64x_check_call(void);
