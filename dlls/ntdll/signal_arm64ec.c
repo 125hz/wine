@@ -1552,6 +1552,10 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 {
     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
     ULONG_PTR page = ptr / page_size;
+    /* The EcCodeBitMap covers only the canonical 48-bit user-space range. Querying
+       a non-canonical / corrupted pointer (e.g. from a damaged unwind context) must
+       not segfault — return FALSE for any pointer the bitmap can't represent. */
+    if (!map || ptr >= 0x800000000000ULL) return FALSE;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
