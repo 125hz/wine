@@ -1688,6 +1688,13 @@ static NTSTATUS alloc_thread_tls(void)
         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
     }
     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
+    ERR( "iOS-Mythic alloc_thread_tls: TEB=%p TEB->TLS=%p TLS[0]=%p TLS[1]=%p TLS[2]=%p TLS[3]=%p (count=%u)\n",
+         NtCurrentTeb(), pointers,
+         tls_module_count > 0 ? pointers[0] : NULL,
+         tls_module_count > 1 ? pointers[1] : NULL,
+         tls_module_count > 2 ? pointers[2] : NULL,
+         tls_module_count > 3 ? pointers[3] : NULL,
+         tls_module_count );
     return STATUS_SUCCESS;
 }
 
