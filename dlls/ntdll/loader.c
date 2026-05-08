@@ -1530,7 +1530,12 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
     if (!(wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)) return STATUS_SUCCESS;  /* already done */
     wm->ldr.Flags &= ~LDR_DONT_RESOLVE_REFS;
 
-    if (alloc_tls_slot( &wm->ldr )) wm->ldr.TlsIndex = -1;
+    /* iOS-Mythic: TlsIndex == -1 marks "alloc_tls_slot already done for this
+     * module" (set below). loader_init pre-allocates the main EXE's slot
+     * before load_arm64ec_module() so the EXE claims slot 0 instead of
+     * xtajit64.dll — Thumper-style games have compiler-generated magic-static
+     * guards that read `TLS[0]` hardcoded, assuming the main EXE is slot 0. */
+    if (wm->ldr.TlsIndex != -1 && alloc_tls_slot( &wm->ldr )) wm->ldr.TlsIndex = -1;
 
     if (!(imports = RtlImageDirectoryEntryToData( wm->ldr.DllBase, TRUE,
                                                   IMAGE_DIRECTORY_ENTRY_IMPORT, &size )))
@@ -4561,6 +4566,18 @@ void loader_init( CONTEXT *context, void **entry )
         wm = build_main_module();
         build_ntdll_module();
 #ifdef __arm64ec__
+        /* iOS-Mythic: pre-allocate the main EXE's TLS slot BEFORE
+         * load_arm64ec_module() so the main EXE claims slot 0 instead of
+         * xtajit64.dll. Compiler-emitted magic-static / __declspec(thread)
+         * code in main EXEs frequently hardcodes `TLS[0]`, assuming the
+         * normal Windows convention that the EXE always gets slot 0. With
+         * xtajit64 in slot 0, those reads see the wrong module's TLS data
+         * and treat magic-static state as already-initialized when it
+         * isn't, leaving zero-initialized registries that later get virt-
+         * called and crash. fixup_imports() guards against double-alloc
+         * via the TlsIndex == -1 marker. */
+        if (alloc_tls_slot( &wm->ldr )) wm->ldr.TlsIndex = -1;
+        ERR( "loader_init: pre-allocated main EXE TLS slot (TlsIndex=%ld)\n", wm->ldr.TlsIndex );
         ERR( "loader_init: calling load_arm64ec_module\n" );
         load_arm64ec_module();
         ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );
