@@ -31,6 +31,7 @@
 #include "wine/exception.h"
 #include "wine/list.h"
 #include "ntdll_misc.h"
+#include "unixlib.h"
 #include "unwind.h"
 #include "wine/debug.h"
 #include "ntsyscalls.h"
@@ -41,6 +42,12 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 /* xtajit64.dll functions */
 static void     (WINAPI *pBTCpu64FlushInstructionCache)(const void*,SIZE_T);
 static BOOLEAN  (WINAPI *pBTCpu64IsProcessorFeaturePresent)(UINT);
+/* iOS-only xtajit64 export — see BTInterface.h. On non-iOS hosts the
+ * export doesn't exist and the GET_PTR call below returns NULL; the
+ * pointer-null check around the unix-call invocation skips it. No
+ * #ifdef guard because PE-side builds don't have an iOS-specific
+ * macro (target is arm64ec-windows in all cases). */
+static void     (WINAPI *pBTCpu64IosAddAliasMapping)(unsigned long long, unsigned long long, unsigned long long);
 static void     (WINAPI *pBTCpu64NotifyMemoryDirty)(void*,SIZE_T);
 static void     (WINAPI *pBTCpu64NotifyReadFile)(HANDLE,void*,SIZE_T,BOOL,NTSTATUS);
 static void     (WINAPI *pBeginSimulation)(void);
@@ -346,6 +353,7 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
 #define GET_PTR(name) p ## name = arm64ec_redirect_ptr( module, \
                                       RtlFindExportedRoutineByName( module, #name ), metadata )
     GET_PTR( BTCpu64FlushInstructionCache );
+    GET_PTR( BTCpu64IosAddAliasMapping );  /* iOS-only; NULL on non-iOS hosts. */
     GET_PTR( BTCpu64IsProcessorFeaturePresent );
     GET_PTR( BTCpu64NotifyMemoryDirty );
     GET_PTR( BTCpu64NotifyReadFile );
@@ -368,6 +376,24 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     info->NativeMachineType = IMAGE_FILE_MACHINE_ARM64;
     info->EmulatedMachineType = IMAGE_FILE_MACHINE_AMD64;
     memcpy( KiUserExceptionDispatcher_orig, KiUserExceptionDispatcher_thunk, sizeof(KiUserExceptionDispatcher_orig) );
+
+    /* iOS-only: push the iOS JIT-pool alias table to xtajit64 so FEX can
+     * recognize alias addresses as executable. Without this, x86 sub-ranges
+     * inside any copied ARM64EC DLL (sechost, msvcrt, msvcp140, etc.) hit
+     * NoExecOp during translation and trap when executed.
+     *
+     * No #ifdef guard — on non-iOS hosts, pBTCpu64IosAddAliasMapping is NULL
+     * (export doesn't exist) and we skip silently. The unix-side handler
+     * also returns success with zero mappings on non-iOS. */
+    if (pBTCpu64IosAddAliasMapping)
+    {
+        struct ios_push_jit_aliases_params params = { (void *)pBTCpu64IosAddAliasMapping };
+        NTSTATUS push_status = WINE_UNIX_CALL( unix_ios_push_jit_aliases, &params );
+        if (push_status)
+            ERR( "arm64ec_process_init_dispatchers: unix_ios_push_jit_aliases failed: %lx\n", push_status );
+    }
+    /* No else — on non-iOS hosts pBTCpu64IosAddAliasMapping is naturally NULL,
+     * which is silent + correct: the bridge has nothing to do off-iOS. */
 
     return STATUS_SUCCESS;
 }

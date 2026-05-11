@@ -66,6 +66,19 @@ struct unwind_builtin_dll_params
     CONTEXT                    *context;
 };
 
+/* iOS only: push the iOS JIT-pool alias table to FEX/xtajit64. Wine
+ * ntdll-unix knows the (PE_base, JIT_alias_base, size) tuples for every
+ * ARM64EC PE image that got copied into the JIT pool (required because
+ * iOS rejects mprotect(RX) on file-backed mmaps). PE-side ntdll calls
+ * this after binding xtajit64's BTCpu64IosAddAliasMapping export so FEX
+ * can resolve alias addresses as executable. */
+struct ios_push_jit_aliases_params
+{
+    void (*callback)(unsigned long long pe_base,
+                     unsigned long long jit_base,
+                     unsigned long long size);
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -76,6 +89,7 @@ enum ntdll_unix_funcs
     unix_wine_server_handle_to_fd,
     unix_wine_spawnvp,
     unix_system_time_precise,
+    unix_ios_push_jit_aliases,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;
