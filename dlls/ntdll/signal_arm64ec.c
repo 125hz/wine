@@ -189,6 +189,29 @@ void *__attribute__((naked)) xlate_ios_jit( void *ptr )
          ".seh_endproc" );
 }
 
+/* iOS: the reverse mapping (JIT-pool alias → original PE VA). Exception
+ * contexts capture POOL VAs (that's where code physically executes), but
+ * function tables / unwind info are registered for PE VAs — so unwinding a
+ * pool pc finds no tables, the leaf-frame fallback cycles, and SEH handlers
+ * are never found (one boot-time RPC raise spun 1.2e9 unwind steps on a
+ * pegged core; with the no-progress guard it became an unhandled-exception
+ * process death). virtual_unwind reverse-translates each step's pc through
+ * this hook so the walk runs in PE space and handlers resolve. */
+void *p_ios_jit_reverse_translate_addr = NULL;
+
+void *__attribute__((naked)) xlate_ios_jit_rev( void *ptr )
+{
+    asm( ".seh_proc \"#xlate_ios_jit_rev\"\n\t"
+         ".seh_endprologue\n\t"
+         "cbz x0, 1f\n\t"                                 /* NULL → return NULL */
+         "adrp x16, p_ios_jit_reverse_translate_addr\n\t"
+         "ldr x16, [x16, #:lo12:p_ios_jit_reverse_translate_addr]\n\t"
+         "cbz x16, 1f\n\t"                                /* fn-ptr unset → identity */
+         "br x16\n"                                       /* tail-call unix fn */
+         "1: ret\n\t"
+         ".seh_endproc" );
+}
+
 
 void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METADATA *metadata )
 {
@@ -415,13 +438,19 @@ NTSTATUS arm64ec_process_init( HMODULE module )
 
     enter_syscall_callback();
     if (pProcessInit) status = pProcessInit();
+    ERR( "arm64ec_process_init: pProcessInit -> %lx (info=%p)\n", status, info );
     if (!status)
     {
         for (unsigned int i = 0; i < PROCESSOR_FEATURE_MAX; i++)
             emulated_processor_features[i] = pBTCpu64IsProcessorFeaturePresent( i );
         status = create_cross_process_work_list( info );
+        ERR( "arm64ec_process_init: create_cross_process_work_list -> %lx\n", status );
     }
-    if (!status && pThreadInit) status = pThreadInit();
+    if (!status && pThreadInit)
+    {
+        status = pThreadInit();
+        ERR( "arm64ec_process_init: pThreadInit -> %lx\n", status );
+    }
     leave_syscall_callback();
     __os_arm64x_check_call = arm64x_check_call;
     __os_arm64x_check_icall = arm64x_check_call;
@@ -1217,6 +1246,11 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT_ARM64EC *dispatch
     DWORD64 pc = context->Pc;
     int i;
 
+    /* iOS: pc is a JIT-pool VA when captured from executing code; the
+     * function tables live at PE VAs. Reverse-translate so the walk runs
+     * in PE space (identity for non-pool addresses / pre-init). */
+    pc = (DWORD64)xlate_ios_jit_rev( (void *)pc );
+
     dispatch->ScopeIndex = 0;
     dispatch->ControlPc  = pc;
     dispatch->ControlPcIsUnwound = (context->ContextFlags & CONTEXT_UNWOUND_TO_CALL) != 0;
@@ -1352,6 +1386,21 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     ULONG_PTR frame;
     DWORD res;
 
+    /* iOS-Mythic 2026-07-04: [SEH_RATE] — the render worker burns ~75% of
+     * its frame in virtual_unwind/RtlVirtualUnwind2/memset below this
+     * function (PROF), yet nothing logs: these are HANDLED exceptions
+     * (likely software RaiseException/C++ throws — no Mach fault, TRACE
+     * muted). Sampled ERR every 1024 dispatches: total count + code +
+     * faulting address names the thrower and quantifies the rate. */
+    {
+        static LONG seh_dispatch_count;
+        LONG n = InterlockedIncrement( &seh_dispatch_count );
+        if (n == 1 || (n & 0x3FF) == 0)
+            ERR( "[SEH_RATE] n=%d code=%08x addr=%p flags=%x\n",
+                 (int)n, (int)rec->ExceptionCode, rec->ExceptionAddress,
+                 (int)rec->ExceptionFlags );
+    }
+
     context.AMD64_Context = *orig_context;
     context.ContextFlags &= ~0x40; /* Clear xstate flag. */
 
@@ -1360,6 +1409,18 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     dispatch.HistoryTable  = &table;
     dispatch.NonVolatileRegisters = nonvol_regs.Buffer;
 
+    /* iOS-Mythic 2026-07-04: no-progress guard. A dispatch whose context
+     * holds JIT-pool VAs finds no unwind tables (function tables are
+     * registered for the PE VAs), so RtlVirtualUnwind2's leaf-frame
+     * fallback can cycle without advancing — measured: ONE stuck dispatch
+     * spun 1.2e9 unwind steps against the same RtlRaiseException frame,
+     * pegging a P-core since boot. If neither ControlPc nor the frame
+     * advances between iterations, or the walk exceeds a sane depth,
+     * bail with EXCEPTION_STACK_INVALID instead of spinning forever. */
+    {
+        ULONG64 prev_pc = 0, prev_frame = 0;
+        unsigned int walk_steps = 0;
+
     for (;;)
     {
         status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context );
@@ -1367,6 +1428,17 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 
     unwind_done:
         if (!dispatch.EstablisherFrame) break;
+
+        if ((dispatch.ControlPc == prev_pc && dispatch.EstablisherFrame == prev_frame) ||
+            ++walk_steps > 0x10000)
+        {
+            ERR( "unwind stuck: pc=%I64x frame=%I64x steps=%u — abandoning walk\n",
+                 (ULONG64)dispatch.ControlPc, dispatch.EstablisherFrame, walk_steps );
+            rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+            break;
+        }
+        prev_pc = dispatch.ControlPc;
+        prev_frame = dispatch.EstablisherFrame;
 
         if (!is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
         {
@@ -1439,6 +1511,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 
         if (context.Sp == (ULONG64)NtCurrentTeb()->Tib.StackBase) break;
     }
+    } /* no-progress guard scope */
     return STATUS_UNHANDLED_EXCEPTION;
 }
 
@@ -1847,6 +1920,21 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
     }
 
     rec->ExceptionFlags |= EXCEPTION_UNWINDING | (end_frame ? 0 : EXCEPTION_EXIT_UNWIND);
+
+    /* iOS-Mythic 2026-07-04: [UNW_RATE] — [SEH_RATE] in call_seh_handlers
+     * stayed at zero while PROF shows the render worker living in
+     * virtual_unwind/RtlVirtualUnwind2, so THIS entry point (phase-2
+     * unwind without dispatch = longjmp / handled unwinds) must be the
+     * hot caller. code=STATUS_UNWIND (0xC0000027) with a synthesized
+     * record means a NULL-rec caller — longjmp's signature. Log first +
+     * every 1024th: rate, code, source Rip, target. */
+    {
+        static LONG unw_count;
+        LONG n = InterlockedIncrement( &unw_count );
+        if (n == 1 || (n & 0x3FF) == 0)
+            ERR( "[UNW_RATE] n=%d code=%08x from=%p target=%p\n",
+                 (int)n, (int)rec->ExceptionCode, rec->ExceptionAddress, target_ip );
+    }
 
     TRACE( "code=%lx flags=%lx end_frame=%p target_ip=%p\n",
            rec->ExceptionCode, rec->ExceptionFlags, end_frame, target_ip );

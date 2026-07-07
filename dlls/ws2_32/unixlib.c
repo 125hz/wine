@@ -750,7 +750,23 @@ static NTSTATUS unix_getaddrinfo( void *args )
         }
     }
 
+#ifdef WINE_IOS
+    /* iOS-Mythic (Steam S0): getaddrinfo() goes through libsystem_info /
+     * mDNSResponder, which autoreleases internal Objective-C objects. On
+     * a Wine worker thread (no autorelease pool in place) those land in
+     * the implicit top-level pool that Apple's pthread_exit TSD cleanup
+     * drains — and it crashes there (objc_release on a stale object).
+     * Bracket the call in our own pool so nothing survives to thread
+     * exit. The returned unix_info is malloc'd (freeaddrinfo), not
+     * autoreleased, so the pop doesn't touch it. */
+    extern void *objc_autoreleasePoolPush(void);
+    extern void  objc_autoreleasePoolPop(void *);
+    void *ios_arpool = objc_autoreleasePoolPush();
     ret = getaddrinfo( params->node, service, hints ? &unix_hints : NULL, &unix_info );
+    objc_autoreleasePoolPop( ios_arpool );
+#else
+    ret = getaddrinfo( params->node, service, hints ? &unix_hints : NULL, &unix_info );
+#endif
     if (ret)
         return addrinfo_err_from_unix( ret );
 

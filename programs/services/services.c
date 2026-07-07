@@ -426,11 +426,24 @@ static void scmdatabase_autostart_services(struct scmdatabase *db)
 
     LIST_FOR_EACH_ENTRY(service, &db->services, struct service_entry, entry)
     {
-        if (service->config.dwStartType == SERVICE_BOOT_START ||
+        /* iOS-Mythic (task #19): respect SERVICE_DISABLED even for
+         * root-PnP services — upstream's pnp branch overrode Start=4 and
+         * kept autostarting winebus (whose winedevice host wedges on iOS
+         * and starves every demand-start behind the startup lock). On
+         * Windows a disabled service never starts, period. */
+        if (service->config.dwStartType != SERVICE_DISABLED &&
+            (service->config.dwStartType == SERVICE_BOOT_START ||
             service->config.dwStartType == SERVICE_SYSTEM_START ||
             service->config.dwStartType == SERVICE_AUTO_START ||
-            (set != INVALID_HANDLE_VALUE && is_root_pnp_service(set, service)))
+            (set != INVALID_HANDLE_VALUE && is_root_pnp_service(set, service))))
         {
+            /* iOS-Mythic diagnostic (task #19): name every autostart
+             * candidate — a phantom kept spawning winedevice with all
+             * registry Start values at 4. */
+            WINE_ERR("autostart candidate %s (type %#lx start %lu pnp %d)\n",
+                     wine_dbgstr_w(service->name), service->config.dwServiceType,
+                     service->config.dwStartType,
+                     set != INVALID_HANDLE_VALUE && is_root_pnp_service(set, service));
             if (i+1 >= size)
             {
                 struct service_entry **slist_new;
@@ -459,7 +472,9 @@ static void scmdatabase_autostart_services(struct scmdatabase *db)
             services_list[delayed_cnt++] = service;
             continue;
         }
+        WINE_ERR("autostart: starting %s\n", wine_dbgstr_w(service->name));
         err = service_start(service, 0, NULL);
+        WINE_ERR("autostart: %s -> %lu\n", wine_dbgstr_w(service->name), err);
         if (err != ERROR_SUCCESS)
             WINE_FIXME("Auto-start service %s failed to start: %ld\n",
                        wine_dbgstr_w(service->name), err);

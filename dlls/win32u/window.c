@@ -163,6 +163,13 @@ static NTSTATUS get_shared_window( HANDLE handle, struct object_lock *lock, cons
     if (!lock->id || !shared_object_release_seqlock( object, lock->seq ))
     {
         shared_object_acquire_seqlock( object, &lock->seq );
+        /* iOS (task #21): a shared session object freed by a dying
+         * pseudo-process has id==0. Without this guard lock->id stays 0,
+         * `!lock->id` is forever true, and the caller's
+         * `while (== STATUS_PENDING)` loop spins forever holding user_lock —
+         * freezing the whole desktop (repro: close regedit, then any window
+         * op that reads a freed window object). Break the loop instead. */
+        if (!object->id) return STATUS_INVALID_HANDLE;
         *window_shm = &object->shm.window;
         lock->id = object->id;
         return STATUS_PENDING;

@@ -192,6 +192,19 @@ static BOOL start_rpcss(void)
 
     if (!(scm = OpenSCManagerW(NULL, NULL, 0)))
     {
+        /* iOS: services.exe is launched alongside explorer rather than ahead
+         * of the shell, so the first COM call can race the SCM's RPC endpoint
+         * coming up. Retry briefly before giving up. */
+        int retries;
+        for (retries = 0; retries < 20 && !scm; retries++)
+        {
+            Sleep(250);
+            scm = OpenSCManagerW(NULL, NULL, 0);
+        }
+        if (scm) ERR("service manager came up after %d retries\n", retries);
+    }
+    if (!scm)
+    {
         ERR("Failed to open service manager\n");
         return FALSE;
     }

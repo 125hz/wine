@@ -656,6 +656,7 @@ static NTSTATUS schan_handshake( void *args )
         err = pgnutls_handshake(s);
         if (err == GNUTLS_E_SUCCESS)
         {
+            dprintf(2, "[schannel-ios] gnutls_handshake COMPLETED\n");  /* Steam S0 diag */
             TRACE("Handshake completed\n");
             status = SEC_E_OK;
         }
@@ -668,6 +669,7 @@ static NTSTATUS schan_handshake( void *args )
         {
             gnutls_alert_description_t alert = pgnutls_alert_get(s);
 
+            dprintf(2, "[schannel-ios] handshake WARNING ALERT %d\n", alert);  /* Steam S0 diag */
             WARN("WARNING ALERT: %d %s\n", alert, pgnutls_alert_get_name(alert));
 
             if (alert == GNUTLS_A_UNRECOGNIZED_NAME)
@@ -681,11 +683,13 @@ static NTSTATUS schan_handshake( void *args )
         else if (err == GNUTLS_E_FATAL_ALERT_RECEIVED)
         {
             gnutls_alert_description_t alert = pgnutls_alert_get(s);
+            dprintf(2, "[schannel-ios] handshake FATAL ALERT %d\n", alert);  /* Steam S0 diag */
             WARN("FATAL ALERT: %d %s\n", alert, pgnutls_alert_get_name(alert));
             status = SEC_E_INTERNAL_ERROR;
         }
         else
         {
+            dprintf(2, "[schannel-ios] gnutls_handshake FAILED err=%d\n", err);  /* Steam S0 diag */
             pgnutls_perror(err);
             status = SEC_E_INTERNAL_ERROR;
         }
@@ -1465,6 +1469,7 @@ static NTSTATUS process_attach( void *args )
 {
     int ret;
 
+    dprintf(2, "[schannel-ios] process_attach ENTER\n");  /* Steam S0 diag */
     if ((system_priority_file = getenv("GNUTLS_SYSTEM_PRIORITY_FILE")))
     {
         TRACE("GNUTLS_SYSTEM_PRIORITY_FILE is %s.\n", debugstr_a(system_priority_file));
@@ -1476,6 +1481,7 @@ static NTSTATUS process_attach( void *args )
     }
 
     libgnutls_handle = dlopen(SONAME_LIBGNUTLS, RTLD_NOW);
+    dprintf(2, "[schannel-ios] dlopen(gnutls) = %p\n", libgnutls_handle);  /* Steam S0 diag */
     if (!libgnutls_handle)
     {
         ERR_(winediag)("Failed to load libgnutls, secure connections will not be available.\n");
@@ -1485,6 +1491,7 @@ static NTSTATUS process_attach( void *args )
 #define LOAD_FUNCPTR(f) \
     if (!(p##f = dlsym(libgnutls_handle, #f))) \
     { \
+        dprintf(2, "[schannel-ios] MISSING SYMBOL %s\n", #f); /* Steam S0 diag */ \
         ERR("Failed to load %s\n", #f); \
         goto fail; \
     }
@@ -1573,6 +1580,7 @@ static NTSTATUS process_attach( void *args )
     }
 
     ret = pgnutls_global_init();
+    dprintf(2, "[schannel-ios] gnutls_global_init = %d\n", ret);  /* Steam S0 diag */
     if (ret != GNUTLS_E_SUCCESS)
     {
         pgnutls_perror(ret);
@@ -1589,9 +1597,11 @@ static NTSTATUS process_attach( void *args )
 
     check_supported_protocols(client_protocol_priority_flags, ARRAYSIZE(client_protocol_priority_flags), FALSE);
     check_supported_protocols(server_protocol_priority_flags, ARRAYSIZE(server_protocol_priority_flags), TRUE);
+    dprintf(2, "[schannel-ios] process_attach SUCCESS\n");  /* Steam S0 diag */
     return STATUS_SUCCESS;
 
 fail:
+    dprintf(2, "[schannel-ios] process_attach FAIL -> STATUS_DLL_NOT_FOUND\n");  /* Steam S0 diag */
     dlclose(libgnutls_handle);
     libgnutls_handle = NULL;
     return STATUS_DLL_NOT_FOUND;

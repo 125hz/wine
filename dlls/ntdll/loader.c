@@ -3370,6 +3370,40 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
 
     if (status == STATUS_NOT_SUPPORTED) status = STATUS_INVALID_IMAGE_FORMAT;
 
+#ifdef __arm64ec__
+    /* iOS-Mythic mixed-arch pseudo-processes: in a native-ARM64 session the
+     * shared system32 farm serves ARM64 binaries for colliding names, which
+     * an AMD64 child (running this EC ntdll privately) cannot load. Fall
+     * back to C:\windows\sysx64, a farm of the full ARM64EC DLL set —
+     * Windows' own SysWOW64 pattern. EC sessions' system32 already serves
+     * EC binaries, so the retry only ever fires in mixed mode. */
+    if (status == STATUS_INVALID_IMAGE_FORMAT || status == STATUS_DLL_NOT_FOUND)
+    {
+        static const WCHAR sysx64W[] = L"\\??\\C:\\windows\\sysx64\\";
+        WCHAR buf[MAX_PATH];
+        UNICODE_STRING alt;
+        const WCHAR *base = libname, *p;
+        for (p = libname; *p; p++) if (*p == '\\' || *p == '/') base = p + 1;
+        if (wcslen( base ) + ARRAY_SIZE( sysx64W ) + 4 < MAX_PATH)
+        {
+            wcscpy( buf, sysx64W );
+            wcscat( buf, base );
+            if (!wcschr( base, '.' )) wcscat( buf, L".dll" );
+            RtlInitUnicodeString( &alt, buf );
+            if (!open_dll_file( &alt, pwm, mapping, image_info, id ))
+            {
+                if (nt_name->Buffer) RtlFreeUnicodeString( nt_name );
+                if (RtlCreateUnicodeString( nt_name, buf ))
+                {
+                    ERR( "mixed-arch fallback: %s -> %s\n", debugstr_w(libname), debugstr_w(buf) );
+                    status = STATUS_SUCCESS;
+                }
+                else status = STATUS_NO_MEMORY;
+            }
+        }
+    }
+#endif
+
     RtlFreeHeap( GetProcessHeap(), 0, fullname );
     if (wow64_old_value) RtlWow64EnableFsRedirectionEx( 1, &wow64_old_value );
     return status;

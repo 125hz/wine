@@ -106,6 +106,33 @@ __ASM_GLOBAL_FUNC( RtlCaptureContext,
                     "ret" )
 
 
+/* iOS: pool→PE reverse-translate hook, aarch64 counterpart of the one in
+ * signal_arm64ec.c. Native ARM64 PE code executes from JIT-pool aliases,
+ * but function tables are registered at PE VAs — an unwind walk over pool
+ * PCs finds no tables, the leaf-frame fallback (pc = lr) cycles forever,
+ * and SEH handlers are never found (observed: combase RPCSS_CALL raise
+ * spinning in RtlLookupFunctionEntry's loader-CS per step, wedging
+ * explorer at CoRegisterClassObject). Unix-side loader_ios.c fills the
+ * pointer at ntdll load; NULL → identity. */
+#ifndef __arm64ec__
+void *p_ios_jit_reverse_translate_addr = NULL;
+
+void *__attribute__((naked)) xlate_ios_jit_rev( void *ptr )
+{
+    asm( ".seh_proc xlate_ios_jit_rev\n\t"
+         ".seh_endprologue\n\t"
+         "cbz x0, 1f\n\t"                                 /* NULL → return NULL */
+         "adrp x16, p_ios_jit_reverse_translate_addr\n\t"
+         "ldr x16, [x16, #:lo12:p_ios_jit_reverse_translate_addr]\n\t"
+         "cbz x16, 1f\n\t"                                /* fn-ptr unset → identity */
+         "br x16\n"                                       /* tail-call unix fn */
+         "1: ret\n\t"
+         ".seh_endproc" );
+}
+#else
+extern void *xlate_ios_jit_rev( void *ptr );
+#endif
+
 /**********************************************************************
  *           virtual_unwind
  */
@@ -114,6 +141,11 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEX
     DISPATCHER_CONTEXT_NONVOLREG_ARM64 *nonvol_regs;
     DWORD64 pc = context->Pc;
     int i;
+
+    /* iOS: pc is a JIT-pool VA when captured from executing code; the
+     * function tables live at PE VAs. Reverse-translate so the walk runs
+     * in PE space (identity for non-pool addresses / pre-init). */
+    pc = (DWORD64)xlate_ios_jit_rev( (void *)pc );
 
     dispatch->ScopeIndex = 0;
     dispatch->ControlPc  = pc;
@@ -690,7 +722,7 @@ ULONG WINAPI RtlWalkFrameChain( void **buffer, ULONG count, ULONG flags )
 
     for (i = 0; i < count; i++)
     {
-        pc = context.Pc;
+        pc = (ULONG_PTR)xlate_ios_jit_rev( (void *)context.Pc );
         if (context.ContextFlags & CONTEXT_UNWOUND_TO_CALL) pc -= 4;
         func = RtlLookupFunctionEntry( pc, &base, &table );
         if (RtlVirtualUnwind2( UNW_FLAG_NHANDLER, base, pc, func, &context, NULL,

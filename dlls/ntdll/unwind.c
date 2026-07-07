@@ -2045,6 +2045,23 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
     unsigned int i, prolog_offset;
     BOOL mach_frame = FALSE, chained = FALSE;
 
+    /* iOS-Mythic 2026-07-04: [VU2_RATE] — the render worker lives in this
+     * function per PROF, yet BOTH exception-path callers (call_seh_handlers,
+     * RtlUnwindEx) measured cold. Someone calls the raw unwind API directly
+     * and constantly. Log first + every 4096th: rate, unwound pc, and the
+     * CALLER (return address) — that names the stack-walker. */
+    {
+        static LONG vu2_count;
+        LONG n = InterlockedIncrement( &vu2_count );
+        /* No n==1 log: the first call can land inside loader init where
+         * ERR isn't safe (n==1 version froze boot pre-splash, debugger
+         * never detached). n==256 is past early init; 4096-stride covers
+         * the steady state. */
+        if (n == 256 || (n & 0xFFF) == 0)
+            ERR( "[VU2_RATE] n=%d pc=%p caller=%p\n",
+                 (int)n, (void *)pc, __builtin_return_address(0) );
+    }
+
 #ifdef __arm64ec__
     if (RtlIsEcCode( pc ))
     {
