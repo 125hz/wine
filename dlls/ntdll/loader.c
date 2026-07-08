@@ -4395,13 +4395,29 @@ static void load_arm64ec_module(void)
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 
-    /* Phase 1.5: run DllMains on xtajit64's dependency tree so ucrtbase's
-     * lock_table[17] is initialized before FEX's CRT static constructors
-     * (InitCRTProcess) run from pProcessInit. Without this, _lock(17)
-     * recurses infinitely in FEX's ctors. */
-    if ((status = walk_node_dependencies( wm->ldr.DdagNode, NULL, process_attach )))
+    /* Phase 1.5: attach xtajit64 AND its dependency tree.
+     *
+     * The dependency walk runs ucrtbase/kernel32/etc. DllMains first so
+     * ucrtbase's lock_table[17] is initialized before any FEX CRT constructor
+     * fires (otherwise _lock(17) recurses infinitely).
+     *
+     * CRITICAL on iOS: process_attach() (unlike a bare walk_node_dependencies)
+     * ALSO calls xtajit64's OWN DllMain. walk_node_dependencies attaches only a
+     * node's dependencies (dep->dependency_to), never the node itself. On iOS
+     * the emulator is built with a NO-OP FEX::Windows::InitCRTProcess
+     * (CRT_iOS.cpp) and relies on mingw's default DllMainCRTStartup -> _initterm
+     * to run its C++ static constructors — e.g. libc++'s lazily-resolved
+     * GetSystemTimePreciseAsFileTime pointer that std::chrono::system_clock::now()
+     * calls. Because the root node's DllMain was never invoked, _initterm never
+     * ran, that pointer stayed NULL, and the first system_clock::now() dispatched
+     * an indirect call to 0 -> fault in #arm64x_check_call (x11=0) -> runaway.
+     * On non-iOS FEX runs the ctors from InitCRTProcess (pProcessInit) instead,
+     * and xtajit64's own DllMain is a harmless stub, so attaching the root is
+     * safe there too. Idempotent: process_attach() early-outs on
+     * LDR_PROCESS_ATTACHED. */
+    if ((status = process_attach( wm->ldr.DdagNode, NULL )))
     {
-        ERR( "process_attach for %s deps failed, status %lx\n", debugstr_w(module), status );
+        ERR( "process_attach for %s (root+deps) failed, status %lx\n", debugstr_w(module), status );
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 
@@ -4612,6 +4628,19 @@ void loader_init( CONTEXT *context, void **entry )
          * via the TlsIndex == -1 marker. */
         if (alloc_tls_slot( &wm->ldr )) wm->ldr.TlsIndex = -1;
         ERR( "loader_init: pre-allocated main EXE TLS slot (TlsIndex=%ld)\n", wm->ldr.TlsIndex );
+        /* iOS-Mythic (FEX-2607 rebase): wire the NLS casemap BEFORE
+         * load_arm64ec_module(). The rebased xtajit64 arm64ec_process_init
+         * uppercases strings (RtlUpcaseUnicodeStringToCountedOemString ->
+         * upcase_unicode_to_utf8), which reads nls_info's upcase table set by
+         * locale_init(). Stock order runs locale_init() ~15 lines below (after
+         * kernel32 + actctx_init), so on a fresh x64-child EC ntdll the upcase
+         * hit a NULL table and livelocked in the SEGV handler before the app
+         * ever rendered. Calling it here first is safe: RtlQueryActivation-
+         * ContextApplicationSettings (the only actctx dependency) fails
+         * gracefully with no actctx, and the later locale_init() re-runs with
+         * actctx available so the activeCodePage manifest still applies. */
+        locale_init();
+        ERR( "loader_init: [iOS] early locale_init done (casemap wired before arm64ec module)\n" );
         ERR( "loader_init: calling load_arm64ec_module\n" );
         load_arm64ec_module();
         ERR( "loader_init: load_arm64ec_module returned, calling update_load_config\n" );

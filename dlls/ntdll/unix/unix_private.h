@@ -442,7 +442,20 @@ static inline BOOL is_inside_syscall( ULONG_PTR sp )
 
 static inline BOOL is_ec_code( ULONG_PTR ptr )
 {
+#ifdef WINE_IOS
+    /* iOS-Mythic: co-resident pseudo-processes share one address space and the
+     * global `peb` drifts to whichever process last ran, so a WORKER thread of
+     * one process (e.g. a cube-x64 / Steam render thread) can read a SIBLING
+     * process's peb whose EcCodeBitMap is null -> is_ec_code faults on a null
+     * bitmap during context restore. Use THIS thread's peb via the TEB TSD,
+     * which is reliable even when x18 is clobbered (0) in a signal context. */
+    TEB *cur_teb = (TEB *)pthread_getspecific( teb_key );
+    PEB *cur_peb = cur_teb ? (PEB *)cur_teb->Peb : peb;
+    const UINT64 *map = cur_peb ? (const UINT64 *)cur_peb->EcCodeBitMap : NULL;
+    if (!map) return FALSE;
+#else
     const UINT64 *map = (const UINT64 *)peb->EcCodeBitMap;
+#endif
     ULONG_PTR page = ptr / page_size;
     return (map[page / 64] >> (page & 63)) & 1;
 }
