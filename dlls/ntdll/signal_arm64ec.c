@@ -1581,6 +1581,14 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
          /* bypass exit thunk to avoid messing up the stack */
          "adrp x16, __os_arm64x_dispatch_call_no_redirect\n\t"
          "ldr x16, [x16, #:lo12:__os_arm64x_dispatch_call_no_redirect]\n\t"
+         /* iOS-Mythic (task#29): in a child pseudo-process's private ntdll copy
+          * this slot is sometimes still NULL (per-process ntdll global not
+          * populated; arm64ec_process_init_dispatchers SKIPs ntdll re-patch).
+          * A NULL x16 here → `blr x16` to 0 → SEGV loop → dead thread (observed
+          * killing steam.exe). The `blr x16` path is only a stack-cleanliness
+          * optimization; label 1 (dispatch_exception) is the full, correct
+          * ARM64EC SEH dispatcher. So if the slot is NULL, fall through to it. */
+         "cbz x16, 1f\n\t"
          "mov x9, x0\n\t"
          "blr x16\n"
          "1:\tadd x0, sp, #0x3b0+0x4d0\n\t" /* rec */
