@@ -194,6 +194,16 @@ static BOOL CALLBACK init_current_version(PINIT_ONCE init_once, PVOID parameter,
             break;
 
     if (idx < 0) return TRUE;
+
+    /* iOS-Mythic (task #29, 2026-07-10): never apply the Win8 compatibility
+     * lie. Our pseudo-process bootstrap does not build the main exe's
+     * activation context, so the compat-GUID escape hatch below never fires
+     * and every modern app is told 6.2.9200 — Steam's updater then
+     * self-selects the frozen 32-bit steam_client_legacy_win64 channel
+     * (Win7/8 client) and "updates" the 64-bit client into one our
+     * no-WoW64 wine cannot run. Report the real prefix version instead. */
+    return TRUE;
+
     ver = &windows8_version_info;
 
     if (RtlQueryInformationActivationContext(0, NtCurrentTeb()->Peb->ActivationContextData, NULL,

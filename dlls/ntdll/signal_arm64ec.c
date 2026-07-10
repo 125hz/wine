@@ -223,7 +223,20 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
     while (min <= max)
     {
         int pos = (min + max) / 2;
-        if (map[pos].Source == rva) return xlate_ios_jit( get_rva( module, map[pos].Destination ) );
+        if (map[pos].Source == rva)
+        {
+            /* iOS-Mythic 2026-07-10 (Steam S3 run 7): validate the Destination
+             * RVA before trusting it. A corrupt entry once produced
+             * module+0xC483974 (far past SizeOfImage); xlate_ios_jit then
+             * matched that VA against ANOTHER process's module mapping and a
+             * poison pool pointer landed in kernelbase's IAT — the
+             * steamerrorreporter64 2000-fault storm. Out-of-image → treat as
+             * no-entry and let the thunk-decode / runtime check_call resolve. */
+            const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( module );
+            if (!nt || map[pos].Destination < nt->OptionalHeader.SizeOfImage)
+                return xlate_ios_jit( get_rva( module, map[pos].Destination ) );
+            break;
+        }
         if (map[pos].Source < rva) min = pos + 1;
         else max = pos - 1;
     }
@@ -288,6 +301,11 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
                         return xlate_ios_jit( target );
                     }
                 }
+                /* NOTE (2026-07-10): do NOT reject targets missing from the
+                 * module list here — during early loader phases (hybrid
+                 * metadata patching) legit targets live in modules not yet
+                 * linked in, and returning `ptr` instead zeroed ucrtbase's
+                 * dispatch_call_no_redirect slot (blr x16=0 at boot). */
                 return xlate_ios_jit( target );
             }
         }
