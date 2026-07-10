@@ -956,7 +956,27 @@ void stop_thread( struct thread *thread )
     if (thread->context) return;  /* already suspended, no need for a signal */
     if (!(thread->context = create_thread_context( thread ))) return;
     /* can't stop a thread while initialisation is in progress */
-    if (is_process_init_done(thread->process)) send_thread_signal( thread, SIGUSR1 );
+    if (!is_process_init_done(thread->process)) return;
+#ifdef WINE_IOS
+    /* iOS (task #32): POSIX signal suspend is dead (SIGUSR1 via __pthread_kill
+     * never runs the target's usr1_handler), so the target-fills-its-own-context
+     * path never completes and GetThreadContext hung forever. Capture the
+     * context synchronously via Mach (thread_suspend + thread_get_state + read
+     * the guest CPU-area context) and signal the sync so the client returns
+     * without STATUS_PENDING. */
+    {
+        extern int ios_fill_thread_context( struct thread *, struct context_data *,
+                                            struct context_data * );
+        if (ios_fill_thread_context( thread, &thread->context->regs[CTX_NATIVE],
+                                     &thread->context->regs[CTX_WOW] ))
+        {
+            thread->context->status = STATUS_SUCCESS;
+            signal_sync( thread->context->sync );
+        }
+    }
+#else
+    send_thread_signal( thread, SIGUSR1 );
+#endif
 }
 
 /* suspend a thread */
