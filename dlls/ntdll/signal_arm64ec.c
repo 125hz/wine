@@ -77,8 +77,32 @@ static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
 {
     if (frame & (sizeof(void*) - 1)) return FALSE;
     if (is_valid_frame( frame )) return TRUE;
-    return (frame >= get_arm64ec_cpu_area()->EmulatorStackLimit &&
-            frame <= get_arm64ec_cpu_area()->EmulatorStackBase);
+    if (frame >= get_arm64ec_cpu_area()->EmulatorStackLimit &&
+        frame <= get_arm64ec_cpu_area()->EmulatorStackBase) return TRUE;
+    /* iOS-Mythic task#34: EC threads here run on THREE stacks — Tib holds
+     * the NATIVE pthread stack, the CpuArea holds the emulator stack, and
+     * the guest x64 frames live on the GUEST stack that neither range
+     * covers (ml65: frame 0x7ecafb0008 vs Tib 0x153c88000-0x153d80000 →
+     * "unable to dispatch exception" killed steamwebhelper; same failure
+     * class as the old FEX-2607 bootstrapper fault). Windows proper has
+     * Tib = the x64 stack, our port cannot (native code needs the pthread
+     * stack there). Fallback: accept a frame that points into committed
+     * writable private memory — i.e. SOME plausible stack. */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T got;
+        if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)frame, MemoryBasicInformation,
+                                   &mbi, sizeof(mbi), &got ) &&
+            mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)))
+        {
+            static LONG gsf_n;
+            if (gsf_n < 20 && InterlockedIncrement( &gsf_n ) <= 20)
+                ERR( "[guest-frame] accepting frame %I64x outside Tib/emulator stacks (committed RW region %p+%Ix)\n",
+                     (ULONG64)frame, mbi.BaseAddress, mbi.RegionSize );
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 static inline BOOL enter_syscall_callback(void)
@@ -1573,7 +1597,30 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
 {
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
     context_arm_to_x64( context, arm_ctx );
+    /* iOS-Mythic task#34 probe: FEX's LogMan output is invisible on iOS (its
+     * write(2) resolves to the PE CRT's WriteFile → unplumbed std handle),
+     * so trace the guest-exception conversion from the wine side. Rate-
+     * capped; STATUS_EMULATION_SYSCALL is the hot syscall path and is
+     * excluded. Log BEFORE and AFTER ResetToConsistentState so we can see
+     * whether FEX reconstructed the guest Rip or the pool/JIT host pc leaks
+     * through to the dispatchers. RtCS may not return (NtContinueNative). */
+    {
+        static LONG rtcs_n;
+        if (rtcs_n < 40 && InterlockedIncrement( &rtcs_n ) <= 40)
+            ERR( "[rtcs] pre: code=%08x addr=%p armPc=%p ecRip=%p rtcs=%p insim=%u\n",
+                 (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
+                 (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)context->AMD64_Context.Rip,
+                 pResetToConsistentState, get_arm64ec_cpu_area()->InSimulation );
+    }
     if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
+    {
+        static LONG rtcs_m;
+        if (rtcs_m < 40 && InterlockedIncrement( &rtcs_m ) <= 40)
+            ERR( "[rtcs] post: code=%08x addr=%p ecRip=%p ecRsp=%p armPc=%p\n",
+                 (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
+                 (void *)(ULONG_PTR)context->AMD64_Context.Rip, (void *)(ULONG_PTR)context->AMD64_Context.Rsp,
+                 (void *)(ULONG_PTR)arm_ctx->Pc );
+    }
     /* call x64 dispatcher if the thunk or the function pointer was modified */
     if (pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
                                              sizeof(KiUserExceptionDispatcher_orig) ))
