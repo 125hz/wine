@@ -509,6 +509,46 @@ void client_do_args( PMIDL_STUB_MESSAGE pStubMsg, PFORMAT_STRING pFormat, enum s
         }
     }
 
+    /* iOS-Mythic ml216 PROBE: is the argument window shifted by exactly one 8-byte slot?
+     *
+     * Steam faults in #NdrContextHandleUnmarshall+0xcc (ndr_marshall.c:7024) with
+     * ccontext == 0x10. The [ec-stacktop] probe above tested "StackTop is tiny" and
+     * correctly stayed silent -- StackTop is a large, valid pointer. The surviving
+     * hypothesis is a SHIFT, not a bogus base: FEX's ARM64EC entry path takes
+     *   ret_sp_misaligned:  adrp lr, X64ReturnInstr ; br x17
+     * without popping the return address, so the entry thunk's `add x4, x4, #0x20` lands
+     * on RSP+0x20 instead of RSP+0x28 -- every stack argument off by one slot. The normal
+     * path pops first (`ldr lr,[x4],#0x8`) and is correct.
+     *
+     * Test it directly: a shifted window shows an implausible tiny value where we read AND
+     * a plausible pointer one slot away. Self-targeting on that signature rather than a
+     * first-N cap, so early boot RPC traffic cannot exhaust the budget before the failing
+     * call. Neighbours are printed either way, so "not shifted" is a real answer rather
+     * than silence. Diagnostic only -- no behaviour change. */
+    {
+        static int shift_reports;
+        unsigned int j;
+
+        for (j = 0; pStubMsg->StackTop && j < number_of_params && shift_reports < 10; j++)
+        {
+            const ULONG_PTR *slot = (const ULONG_PTR *)(pStubMsg->StackTop + params[j].stack_offset);
+            ULONG_PTR here = slot[0];
+
+            if (here == 0 || here >= 0x10000) continue;   /* plausible -- not our signature */
+
+            shift_reports++;
+            ERR( "[ndr-shift] param%u off=0x%x phase=%d StackTop=%p | prev=%p HERE=%p "
+                 "next=%p next2=%p => %s\n",
+                 j, params[j].stack_offset, phase, pStubMsg->StackTop,
+                 (void *)slot[-1], (void *)here, (void *)slot[1], (void *)slot[2],
+                 (slot[1] >= 0x10000 && slot[1] < 0x8000000000ull)
+                     ? "SHIFT: real pointer is ONE SLOT LATER (+8)"
+                     : (slot[-1] >= 0x10000 && slot[-1] < 0x8000000000ull)
+                           ? "SHIFT: real pointer is ONE SLOT EARLIER (-8)"
+                           : "no neighbouring pointer -- shift NOT indicated" );
+        }
+    }
+
     for (i = 0; i < number_of_params; i++)
     {
         unsigned char *pArg = pStubMsg->StackTop + params[i].stack_offset;

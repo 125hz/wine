@@ -7019,6 +7019,34 @@ static unsigned char *WINAPI NdrContextHandleUnmarshall(
             ccontext = *(NDR_CCONTEXT **)ppMemory;
         else
             ccontext = (NDR_CCONTEXT *)ppMemory;
+        /* iOS-Mythic ml219 PROBE: this is where Steam dies, with ccontext == 0x10.
+         *
+         * An earlier probe in client_do_args flagged "argument window shifted by one slot"
+         * from a heuristic -- a small value sitting next to a pointer -- and that was a
+         * FALSE POSITIVE: plenty of RPC parameters are legitimately small integers, and
+         * StackTop mod 16 shows the failing call takes the ALIGNED entry path, where
+         * StackTop is already correct. So report from the actual failure site instead, and
+         * print the facts that discriminate rather than a verdict:
+         *   via_ptr  -- whether ccontext was LOADED from the arg slot or IS the slot
+         *   *ppMemory-- the raw value sitting in that slot
+         *   mod16    -- which ARM64EC entry path produced StackTop (0 = aligned/correct,
+         *               8 = the ret_sp_misaligned path)
+         * If via_ptr is set, 0x10 is a value the caller supplied and the bug is upstream of
+         * NDR entirely; if it is clear, ppMemory itself is 0x10 and the arg base is wrong. */
+        if ((ULONG_PTR)ccontext < 0x10000)
+        {
+            static int ctxh_reports;
+
+            if (ctxh_reports < 8)
+            {
+                ctxh_reports++;
+                ERR( "[ctxh] BAD ccontext=%p flags=0x%02x via_ptr=%d ppMemory=%p slot=%p "
+                     "StackTop=%p mod16=%u IsClient=%d\n",
+                     ccontext, pFormat[1], !!(pFormat[1] & HANDLE_PARAM_IS_VIA_PTR),
+                     ppMemory, (void *)*(ULONG_PTR *)ppMemory, pStubMsg->StackTop,
+                     (unsigned)((ULONG_PTR)pStubMsg->StackTop & 15), pStubMsg->IsClient );
+            }
+        }
         /* [out]-only or [ret] param */
         if ((pFormat[1] & (HANDLE_PARAM_IS_IN|HANDLE_PARAM_IS_OUT)) == HANDLE_PARAM_IS_OUT)
             *ccontext = NULL;
