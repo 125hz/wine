@@ -483,6 +483,32 @@ void client_do_args( PMIDL_STUB_MESSAGE pStubMsg, PFORMAT_STRING pFormat, enum s
     const NDR_PARAM_OIF *params = (const NDR_PARAM_OIF *)pFormat;
     unsigned int i;
 
+    /* iOS-Mythic ml175 PROBE: Steam dies at ndr_marshall.c:7024 `*ccontext = NULL` with
+     * ccontext == 0x10, and pArg is computed below as StackTop + stack_offset — so a
+     * StackTop of 0 or 0x10 explains the value exactly.
+     *
+     * Suspected cause: NdrClientCall2/3 are __attribute__((naked)) variadic ARM64EC
+     * functions whose thunk does `stp x2,x3,[x4,#-0x10]!; mov x2,x4`, i.e. it REQUIRES x4
+     * to point at the caller's stack-argument area. x4 is R10 in the EC register map, and
+     * only the x64->EC entry thunk establishes it. llvm-nm shows NdrClientCall2,
+     * NdrClientCall3, NdrAsyncClientCall and Ndr64AsyncClientCall all have ZERO
+     * $ientry_thunk bindings (rpcrt4 has 23 for other functions), so a call arriving from
+     * emulated x64 code would run with x4 = whatever R10 held.
+     *
+     * Log any implausible StackTop. If StackTop is tiny here, the thunk/ABI path is
+     * confirmed and the fix belongs at the EC entry, not in the NDR layer. */
+    if ((ULONG_PTR)pStubMsg->StackTop < 0x10000)
+    {
+        static int reported;
+        if (reported < 8)
+        {
+            reported++;
+            ERR("[ec-stacktop] BAD StackTop=%p phase=%d nparams=%u first_offset=0x%x\n",
+                pStubMsg->StackTop, phase, number_of_params,
+                number_of_params ? params[0].stack_offset : 0);
+        }
+    }
+
     for (i = 0; i < number_of_params; i++)
     {
         unsigned char *pArg = pStubMsg->StackTop + params[i].stack_offset;
