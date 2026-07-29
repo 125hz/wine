@@ -1147,6 +1147,35 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
  * Import the dll specified by the given import descriptor.
  * The loader_section must be locked while calling this function.
  */
+#ifdef __arm64ec__
+/* ml233: slots recorded by the [ec-bind] probe, re-read after process init — see there. */
+static void *ec_recheck_slot[8];
+static void *ec_recheck_want[8];
+static unsigned int ec_recheck_n;
+static unsigned int ec_recheck_prints;
+void ios_ec_recheck_iat( const char *when );
+
+void ios_ec_recheck_iat( const char *when )
+{
+    extern void *xlate_ios_jit( void *ptr );
+    unsigned int i;
+
+    for (i = 0; i < ec_recheck_n; i++)
+    {
+        void *pslot = xlate_ios_jit( ec_recheck_slot[i] );
+        void *peval = *(void **)ec_recheck_slot[i];
+        void *pval = (pslot && pslot != ec_recheck_slot[i]) ? *(void **)pslot : (void *)-1;
+
+        if (ec_recheck_prints++ >= 24) return;
+        ERR( "[ec-recheck:%s] slot=%p pe_val=%p pool_val=%p want=%p %s\n",
+             when, ec_recheck_slot[i], peval, pval, ec_recheck_want[i],
+             pval == ec_recheck_want[i] ? "POOL OK"
+             : peval != ec_recheck_want[i] ? "PE ALSO CHANGED (rebound?)"
+             : "POOL STILL STALE  <== calls use the unbound entry" );
+    }
+}
+#endif
+
 static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, LPCWSTR load_path, WINE_MODREF **pwm )
 {
     HMODULE module = wm->ldr.DllBase;
@@ -1286,9 +1315,79 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             }
 #ifdef __arm64ec__
             else if (imp_metadata)
+            {
+                void *pre = (void *)thunk_list->u1.Function;
+
                 thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
                                                                            (void *)thunk_list->u1.Function,
                                                                            imp_metadata );
+                /* iOS-Mythic ml230: does the EC->EC import bind actually land on native
+                 * code, and is that code MARKED EC?
+                 *
+                 * sechost calls rpcrt4's NdrClientCall2 through $iexit_thunk$cdecl$i8$varargs
+                 * -- the EC->x64 path -- which double-thunks and displaces the caller's
+                 * STACK arguments by one slot (register args survive, which is why only
+                 * variadic calls break, i.e. only RPC). rpcrt4's redirection metadata is
+                 * correct (thunk 0x60800 -> native 0x2c3d8, verified against the shipped
+                 * binary), so either this redirect is not applied, or the redirected target
+                 * is not recognised as EC and the indirect-call check routes it to x64
+                 * anyway. Log both facts for the calls in question; RtlIsEcCode is the same
+                 * predicate that decision uses. */
+                if (!strcmp( (const char *)pe_name->Name, "NdrClientCall2" ) ||
+                    !strcmp( (const char *)pe_name->Name, "NdrClientCall3" ) ||
+                    !strcmp( (const char *)pe_name->Name, "NdrAsyncClientCall" ))
+                {
+                    /* iOS-Mythic ml231: the bind is CORRECT (redirected=1, IsEcCode=1,
+                     * native pool address) yet sechost still reached NdrClientCall2 via
+                     * $iexit_thunk$cdecl$i8$varargs -- the EC->x64 path. Both can only be
+                     * true if the EXECUTING copy reads a different IAT than the loader
+                     * wrote: the loader writes the PE image's .data, but code runs from the
+                     * JIT-pool copy, whose .data is CLONED (same class as the ntdll
+                     * dispatcher bug #33, and why the XLATE hooks need ios_jit_sync_write).
+                     *
+                     * Translate the IAT SLOT itself through the forward pool hook and read
+                     * the value the running code actually sees. Equal => this theory is
+                     * dead and the exit thunk has another cause; different => the pool
+                     * copy is stale and that is the bug. */
+                    /* ml232 FIX: call xlate_ios_jit, NOT the raw pointer. A direct call
+                     * through p_ios_jit_translate_addr goes via arm64x_check_call, which
+                     * sees a unix ARM64 function that is not marked EC and misroutes it
+                     * through x86 emulation -- ARM64 code executed as x86, dead at 182 unix
+                     * calls before any module loads. The naked thunk does `br x16` and
+                     * bypasses that check; its comment says so explicitly. */
+                    extern void *xlate_ios_jit( void *ptr );
+                    void *slot = &thunk_list->u1.Function;
+                    void *pslot = xlate_ios_jit( slot ), *pval = (void *)-1;
+
+                    if (pslot && pslot != slot) pval = *(void **)pslot;
+                    /* ml233: remember the slot so it can be RE-READ after process init.
+                     * The bind-time value is not the interesting one: the pool copy is
+                     * taken at MAP time, long before imports are bound (jit-pool line 257
+                     * vs ec-bind line >1519), so of course it still holds the unbound entry
+                     * here. If that were also true at CALL time nothing would work at all,
+                     * so the question is what the slot holds once init completes. */
+                    /* ml234: also re-read what was recorded earlier. This is guaranteed to
+                     * execute (unlike a hand-picked attach site) and each later bind gives a
+                     * progressively later reading of the earlier slots. */
+                    if (ec_recheck_n) ios_ec_recheck_iat( "later-bind" );
+                    if (ec_recheck_n < 8)
+                    {
+                        ec_recheck_slot[ec_recheck_n] = slot;
+                        ec_recheck_want[ec_recheck_n] = (void *)thunk_list->u1.Function;
+                        ec_recheck_n++;
+                    }
+                    ERR( "[ec-bind] %s.%s pre=%p post=%p redirected=%d IsEcCode(post)=%d importer=%p"
+                         " | slot=%p poolslot=%p poolval=%p %s (BIND TIME)\n",
+                         name, pe_name->Name, pre, (void *)thunk_list->u1.Function,
+                         pre != (void *)thunk_list->u1.Function,
+                         (int)RtlIsEcCode( thunk_list->u1.Function ), module,
+                         slot, pslot, pval,
+                         !pslot ? "(no pool copy / hook unset)"
+                                : pval == (void *)thunk_list->u1.Function
+                                      ? "POOL IN SYNC"
+                                      : "POOL STALE  <== executing copy sees the OLD x64 thunk" );
+                }
+            }
 #endif
             TRACE_(imports)("--- %s %s.%d = %p\n",
                             pe_name->Name, name, pe_name->Hint, (void *)thunk_list->u1.Function);
@@ -3562,6 +3661,13 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
 
     if (nts == STATUS_SUCCESS)
     {
+#ifdef __arm64ec__
+        /* ml234: re-read recorded IAT slots here — this attach runs AFTER the module's
+         * imports are bound, so it is representative of call time. (The earlier call site
+         * was inside load_arm64ec_module(), which runs before sechost/rpcrt4 even load, so
+         * the list was empty and the probe printed nothing.) */
+        { void ios_ec_recheck_iat( const char * ); ios_ec_recheck_iat( "ldrload-attach" ); }
+#endif
         nts = process_attach( wm->ldr.DdagNode, NULL );
         if (nts != STATUS_SUCCESS)
         {
@@ -3963,7 +4069,57 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
     }
     if (!nts)
     {
+#ifdef __arm64ec__
+        /* iOS-Mythic ml237 ROOT-CAUSE FIX. import_dll redirects EC->EC imports from the
+         * x64 .hexpthk export thunk to the ARM64-native target; the DELAY-LOAD path never
+         * did, so it stored the thunk. Measured: every rpcrt4 delay import resolved to
+         * base+0x60800 (NdrClientCall2's FFS thunk) with IsEcCode(fp)=0.
+         *
+         * Consequence: sechost's stub hands that address to __os_arm64x_check_icall, which
+         * correctly sees non-EC code and selects $iexit_thunk$cdecl$i8$varargs. That thunk
+         * does `stp x4,x5,[sp,#0x20]`, depositing the VARIADIC DESCRIPTOR (x4 = pointer to
+         * the stack args, x5 = their size) into the x64 arg5/arg6 home slots. NdrClientCall2
+         * then reads the descriptor as arguments, so ROpenSCManagerW saw dwDesiredAccess = a
+         * pointer and lpScHandle = 0x10 -- the SIZE -- and wrote through 0x10. That is the
+         * ccontext == 0x10 crash, livelocking 3500+ times and gating whether a run reaches
+         * CEF at all.
+         *
+         * Only variadic callees are affected: non-variadic entry thunks never read x4, so
+         * everything except RPC worked. Gate on the importer being EC, exactly as
+         * import_dll does. */
+        if (arm64ec_get_module_metadata( base ))
+        {
+            const IMAGE_ARM64EC_METADATA *tgt_metadata = arm64ec_get_module_metadata( *phmod );
+
+            if (tgt_metadata) fp = (FARPROC)arm64ec_redirect_ptr( *phmod, fp, tgt_metadata );
+        }
+#endif
         pIAT[id].u1.Function = (ULONG_PTR)fp;
+#ifdef __arm64ec__
+        /* iOS-Mythic ml236: DELAY-LOAD is a separate binding path from import_dll, and the
+         * ARM64EC redirect lives in import_dll -- so this was never instrumented.
+         *
+         * sechost DELAY-loads rpcrt4. Its native stub does
+         *   ldr x16,[__imp_NdrClientCall2]; br x16   (.rdata, points at an icall stub)
+         * which loads x11 = this delay IAT entry, x10 = $iexit_thunk$cdecl$i8$varargs, and
+         * lets __os_arm64x_check_icall pick. If what we store here is NOT recognised as EC,
+         * check_icall selects the EXIT THUNK -- the EC->x64 path -- and that thunk does
+         * `stp x4,x5,[sp,#0x20]`, depositing the VARIADIC DESCRIPTOR (x4 = stack-arg
+         * pointer, x5 = size) into the x64 arg5/arg6 slots. NdrClientCall2 then reads the
+         * descriptor as if it were arguments: dwDesiredAccess becomes a pointer and
+         * lpScHandle becomes 0x10 (the size), which is the ccontext == 0x10 crash.
+         *
+         * Log what we actually stored and whether it counts as EC. */
+        {
+            static int dl_n;
+            if (dl_n < 12 && name && strstr( name, "rpcrt4" ))
+            {
+                dl_n++;
+                ERR( "[ec-delay] %s ord/name id=%d fp=%p IsEcCode(fp)=%d slot=%p\n",
+                     name, (int)id, fp, (int)RtlIsEcCode( (ULONG_PTR)fp ), &pIAT[id].u1.Function );
+            }
+        }
+#endif
         return fp;
     }
 

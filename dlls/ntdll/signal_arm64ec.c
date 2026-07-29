@@ -1617,6 +1617,15 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     {
         ULONG64 prev_pc = 0, prev_frame = 0;
         unsigned int walk_steps = 0;
+        /* ml222: ring of the last few unwind steps, dumped ONLY if the walk ends badly.
+         * The failing dispatch reported ControlPc=0, which has two readings needing
+         * opposite fixes: the walk covered several sane frames and reached the genuine
+         * end of stack (so the exception really is unhandled, and the question is why no
+         * handler matched), or ControlPc was 0 from step 1 (the incoming context is
+         * broken). Recording the trajectory instead of the endpoint distinguishes them,
+         * and costs nothing on the paths that succeed. */
+        ULONG64 trace_pc[8] = { 0 }, trace_frame[8] = { 0 };
+        unsigned int trace_n = 0;
 
     for (;;)
     {
@@ -1624,6 +1633,10 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         if (status != STATUS_SUCCESS) return status;
 
     unwind_done:
+        trace_pc[trace_n & 7] = dispatch.ControlPc;
+        trace_frame[trace_n & 7] = dispatch.EstablisherFrame;
+        trace_n++;
+
         if (!dispatch.EstablisherFrame) break;
 
         if ((dispatch.ControlPc == prev_pc && dispatch.EstablisherFrame == prev_frame) ||
@@ -1639,8 +1652,32 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 
         if (!is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
         {
-            ERR( "invalid frame %I64x (%p-%p)\n", dispatch.EstablisherFrame,
-                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
+            /* ml221: report WHY the walk produced this frame, not just that it did.
+             *
+             * The frame that killed the webhelper was 0x73c9f70008 -- 8 bytes into
+             * DWrite.dll's read-only headers, i.e. the walk had run off the end of the
+             * guest stack. That happens when ControlPc stays a JIT-pool VA: function
+             * tables are registered at PE VAs, so no unwind info is found and the frames
+             * are garbage. virtual_unwind reverse-translates via
+             * p_ios_jit_reverse_translate_addr, but that pointer lives in ntdll's .data
+             * and every pseudo-process gets a CLONED copy -- if a child's copy is NULL the
+             * translation silently degrades to identity. Print it, plus ControlPc, so the
+             * two cases are distinguishable instead of guessed at. */
+            ERR( "invalid frame %I64x (%p-%p) ControlPc=%I64x xlate_rev=%p%s\n",
+                 dispatch.EstablisherFrame,
+                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase,
+                 (ULONG64)dispatch.ControlPc, p_ios_jit_reverse_translate_addr,
+                 p_ios_jit_reverse_translate_addr ? "" : "  <-- NULL: unwind ran in POOL space" );
+            {
+                unsigned int k, shown = trace_n < 8 ? trace_n : 8;
+                ERR( "[unwind-trace] %u steps total, last %u:\n", trace_n, shown );
+                for (k = 0; k < shown; k++)
+                {
+                    unsigned int idx = (trace_n - shown + k) & 7;
+                    ERR( "[unwind-trace]   #%u pc=%I64x frame=%I64x\n",
+                         trace_n - shown + k, trace_pc[idx], trace_frame[idx] );
+                }
+            }
             rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
             break;
         }
@@ -2261,8 +2298,22 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 
         if (!is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
         {
-            ERR( "invalid frame %I64x (%p-%p)\n", dispatch.EstablisherFrame,
-                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
+            /* ml221: report WHY the walk produced this frame, not just that it did.
+             *
+             * The frame that killed the webhelper was 0x73c9f70008 -- 8 bytes into
+             * DWrite.dll's read-only headers, i.e. the walk had run off the end of the
+             * guest stack. That happens when ControlPc stays a JIT-pool VA: function
+             * tables are registered at PE VAs, so no unwind info is found and the frames
+             * are garbage. virtual_unwind reverse-translates via
+             * p_ios_jit_reverse_translate_addr, but that pointer lives in ntdll's .data
+             * and every pseudo-process gets a CLONED copy -- if a child's copy is NULL the
+             * translation silently degrades to identity. Print it, plus ControlPc, so the
+             * two cases are distinguishable instead of guessed at. */
+            ERR( "invalid frame %I64x (%p-%p) ControlPc=%I64x xlate_rev=%p%s\n",
+                 dispatch.EstablisherFrame,
+                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase,
+                 (ULONG64)dispatch.ControlPc, p_ios_jit_reverse_translate_addr,
+                 p_ios_jit_reverse_translate_addr ? "" : "  <-- NULL: unwind ran in POOL space" );
             rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
             break;
         }
@@ -2476,7 +2527,41 @@ static void __attribute__((naked)) arm64x_check_call(void)
     asm( ".seh_proc \"#arm64x_check_call\"\n\t"
          ".seh_endprologue\n\t"
          /* check for EC code */
-         "ldr x16, [x18, #0x60]\n\t"        /* peb */
+         /* iOS-Mythic ml238 ROOT-CAUSE FIX: read the TEB from TPIDRRO_EL0 + TSD slot 275,
+          * NOT from x18. iOS clobbers x18 (every SEGV dump in this port shows x18=0), so
+          * `ldr x16,[x18,#0x60]` fetched a garbage PEB, the EcCodeBitMap pointer was
+          * garbage, the bit test read 0, and this function reported EVERY target as
+          * non-EC. __os_arm64x_check_icall then selected the EC->x64 exit thunk even for
+          * genuinely native targets -- while RtlIsEcCode (C, via NtCurrentTeb()'s TSD
+          * path) correctly said EC, which is exactly the contradiction we measured:
+          * IsEcCode(fp)=1 yet the exit thunk still ran.
+          *
+          * For variadic callees that thunk does `stp x4,x5,[sp,#0x20]`, flattening the
+          * ARM64EC variadic descriptor (x4 = stack-arg pointer, x5 = size) into the x64
+          * arg5/arg6 slots -- producing ROpenSCManagerW's dwDesiredAccess = a pointer and
+          * lpScHandle = 0x10 (the SIZE), i.e. the ccontext == 0x10 livelock.
+          *
+          * FEX's own check_target_ec already does this (IOS_LOAD_TEB); Wine's copy never
+          * did. x16 is scratch here, so the load is free of side effects. */
+         /* iOS-Mythic ml246: this x18 read IS WRONG, and is deliberately kept anyway.
+          *
+          * iOS clobbers x18 (every SEGV dump in this port shows x18=0), so this fetches a
+          * garbage PEB, the EcCodeBitMap pointer is garbage, the bit test reads 0, and this
+          * function reports EVERY target as non-EC. FEX's check_target_ec reads the TEB via
+          * TPIDRRO_EL0 + TSD slot 275 (IOS_LOAD_TEB) for exactly this reason.
+          *
+          * Correcting it (mrs TPIDRRO_EL0 / and #~7 / ldr [#0x898] / ldr [#0x60]) was tried
+          * and A/B-PROVEN to break CEF: cef_log.txt went unwritten for 8 consecutive runs
+          * and returned the moment this line was restored (ml246, run depth also 20-24k ->
+          * 28929 calls). Reporting everything non-EC forces all indirect calls through the
+          * x64 exit thunk, which is slow and breaks VARIADIC callees (the ccontext == 0x10
+          * RPC crash) -- but that detour also absorbs whatever EcCodeBitMap false positive
+          * the correct version turns into a direct branch into x64 bytes executed as ARM64.
+          *
+          * So: correct-but-unlandable until that false positive is found. The fixed version
+          * is preserved in the task notes. Do not "fix" this without re-running the CEF
+          * check -- verifying IsEcCode flips 0->1 does NOT prove the outcome still works. */
+         "ldr x16, [x18, #0x60]\n\t"        /* peb -- see above, intentionally x18 */
          "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
          "ldr x16, [x16, #0x368]\n\t"       /* peb->EcCodeBitMap */
          "lsr x9, x11, #12\n\t"             /* dest / page_size */

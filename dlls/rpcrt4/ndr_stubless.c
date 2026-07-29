@@ -538,14 +538,40 @@ void client_do_args( PMIDL_STUB_MESSAGE pStubMsg, PFORMAT_STRING pFormat, enum s
 
             shift_reports++;
             ERR( "[ndr-shift] param%u off=0x%x phase=%d StackTop=%p | prev=%p HERE=%p "
-                 "next=%p next2=%p => %s\n",
+                 "next=%p next2=%p\n",
                  j, params[j].stack_offset, phase, pStubMsg->StackTop,
-                 (void *)slot[-1], (void *)here, (void *)slot[1], (void *)slot[2],
-                 (slot[1] >= 0x10000 && slot[1] < 0x8000000000ull)
-                     ? "SHIFT: real pointer is ONE SLOT LATER (+8)"
-                     : (slot[-1] >= 0x10000 && slot[-1] < 0x8000000000ull)
-                           ? "SHIFT: real pointer is ONE SLOT EARLIER (-8)"
-                           : "no neighbouring pointer -- shift NOT indicated" );
+                 (void *)slot[-1], (void *)here, (void *)slot[1], (void *)slot[2] );
+
+            /* ml229: dump EVERY param with what the format string says about it.
+             *
+             * Established so far: the interface is svcctl / ROpenSCManagerW, the caller is
+             * sechost.dll, and the frame model is CORRECT (the return address sits at
+             * StackTop-0x18, so StackTop == RSP+0x18 exactly as designed -- there is no
+             * 8-byte shift; that earlier inference was wrong). Params 0 and 1, which the
+             * entry thunk spills from x2/x3, arrive correctly as NULL/NULL. Only params 2
+             * and 3 -- the ones passed on the CALLER'S STACK -- are wrong, and they look
+             * like each other's values.
+             *
+             * Rather than infer intent from value shapes again, print each param's declared
+             * offset and attribute bits next to the raw slot contents, so what NDR expects
+             * at each offset can be read directly instead of guessed. */
+            {
+                unsigned int q;
+
+                for (q = 0; q < number_of_params && q < 8; q++)
+                {
+                    const ULONG_PTR *s2 =
+                        (const ULONG_PTR *)(pStubMsg->StackTop + params[q].stack_offset);
+
+                    ERR( "[ndr-param]   [%u] off=0x%-4x val=%p | IsBasetype=%d IsSimpleRef=%d "
+                         "IsIn=%d IsOut=%d IsRet=%d ByValue=%d type_off=0x%x\n",
+                         q, params[q].stack_offset, (void *)s2[0],
+                         params[q].attr.IsBasetype, params[q].attr.IsSimpleRef,
+                         params[q].attr.IsIn, params[q].attr.IsOut,
+                         params[q].attr.IsReturn, params[q].attr.IsByValue,
+                         params[q].u.type_offset );
+                }
+            }
         }
     }
 

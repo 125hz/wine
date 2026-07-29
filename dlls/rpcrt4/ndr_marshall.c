@@ -7040,11 +7040,66 @@ static unsigned char *WINAPI NdrContextHandleUnmarshall(
             if (ctxh_reports < 8)
             {
                 ctxh_reports++;
+                /* ml227: name the INTERFACE. The fault address is 0x10 itself and it
+                 * livelocks 3500+ times at rpcrt4's fast-forward export thunk, so this is
+                 * the recurring wall rather than a side-issue -- it is why some runs never
+                 * reach CEF's crypt/network stage. Knowing which interface/proc is being
+                 * called separates "our marshalling mangled a good call" from "the wrong
+                 * stub is being invoked, so the format string does not match the arguments"
+                 * (in which case reading 0x10 as &handle is a symptom, not the bug). */
+                const RPC_SYNTAX_IDENTIFIER *iid = NULL;
+                if (pStubMsg->StubDesc && pStubMsg->StubDesc->RpcInterfaceInformation)
+                    iid = &((const RPC_CLIENT_INTERFACE *)
+                            pStubMsg->StubDesc->RpcInterfaceInformation)->InterfaceId;
+
                 ERR( "[ctxh] BAD ccontext=%p flags=0x%02x via_ptr=%d ppMemory=%p slot=%p "
                      "StackTop=%p mod16=%u IsClient=%d\n",
                      ccontext, pFormat[1], !!(pFormat[1] & HANDLE_PARAM_IS_VIA_PTR),
                      ppMemory, (void *)*(ULONG_PTR *)ppMemory, pStubMsg->StackTop,
                      (unsigned)((ULONG_PTR)pStubMsg->StackTop & 15), pStubMsg->IsClient );
+                if (iid)
+                    ERR( "[ctxh]   iface=%08x-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x"
+                         " v%u.%u\n",
+                         iid->SyntaxGUID.Data1, iid->SyntaxGUID.Data2, iid->SyntaxGUID.Data3,
+                         iid->SyntaxGUID.Data4[0], iid->SyntaxGUID.Data4[1],
+                         iid->SyntaxGUID.Data4[2], iid->SyntaxGUID.Data4[3],
+                         iid->SyntaxGUID.Data4[4], iid->SyntaxGUID.Data4[5],
+                         iid->SyntaxGUID.Data4[6], iid->SyntaxGUID.Data4[7],
+                         iid->SyntaxVersion.MajorVersion, iid->SyntaxVersion.MinorVersion );
+                else ERR( "[ctxh]   iface=UNAVAILABLE (StubDesc=%p)\n", pStubMsg->StubDesc );
+
+                /* ml228: MEASURE StackTop - RSP instead of inferring it.
+                 *
+                 * The interface is svcctl and the proc is ROpenSCManagerW(machine, db,
+                 * dwDesiredAccess, SC_RPC_HANDLE *out). Argument TYPES say the window is
+                 * 8 bytes low: at +0x10 we read a pointer where a DWORD access mask
+                 * belongs, and at +0x18 we read 0x10 where the out-pointer belongs, while
+                 * shifting +8 makes BOTH type-correct. That is semantic evidence, unlike
+                 * the earlier "small value beside a pointer" heuristic which was a false
+                 * positive -- and note mod16 does NOT discriminate the two entry paths
+                 * (aligned RSP+0x18 with RSP=8, and pre-fix misaligned RSP+0x10 with
+                 * RSP=0, are both 0 mod 16), so my earlier use of it was wrong.
+                 *
+                 * The return address pinpoints RSP: the guest's CALL pushed it, so
+                 * whichever slot below StackTop holds a code pointer fixes RSP exactly.
+                 * StackTop should be RSP+0x18. Dump the window and let the arithmetic be
+                 * read off rather than argued. */
+                {
+                    /* ml235: extend past +0x28. The two slots NDR reads as params 2/3 look
+                     * exactly like the ARM64EC VARIADIC register pair rather than arguments:
+                     * a pointer (x4 = stack-args pointer) and 0x10 (x5 = size in bytes = two
+                     * 8-byte args). The EC->x64 exit thunk does `stp x4,x5,[sp,#0x20]`,
+                     * i.e. it deposits that pair into the arg5/arg6 home slots. If that is
+                     * what happened, the REAL arguments live AT the pointer -- around
+                     * StackTop+0x30 -- so dump far enough to see them and check whether a
+                     * plausible access mask and &handle appear there. */
+                    const ULONG_PTR *w = (const ULONG_PTR *)(pStubMsg->StackTop - 0x20);
+                    int k;
+
+                    for (k = 0; k < 16; k++)
+                        ERR( "[ctxh]   win[%+d] %p = %p\n", (int)(k * 8 - 0x20),
+                             (const void *)(w + k), (void *)w[k] );
+                }
             }
         }
         /* [out]-only or [ret] param */
