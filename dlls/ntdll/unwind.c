@@ -2086,6 +2086,66 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
 
     if (!function)  /* leaf function */
     {
+        /* ml256: BOUND THE LEAF POP.
+         *
+         * This read is unchecked, and the FIXME above says the caller-supplied
+         * limits are ignored on this path -- so an unwind that walks past the top
+         * of the stack dereferences unmapped VA and takes a fatal SEGV instead of
+         * simply ending. That is what killed CEF: thread 0098 loaded libcef.dll,
+         * then died here with
+         *   pc=ntdll+0x69c50 addr=0x73d2110000, insn f8408528 (ldr x8,[x9],#8)
+         *   [fault-rgn] vprot prev/this/next=23/00/00, NO wine view
+         * i.e. the page BELOW is committed and this one is not -- Rsp one step past
+         * the stack base, every frame already unwound. Our SEGV-loop guard then
+         * force-exited the thread, so CEF never reached its own logging.
+         *
+         * limit_low/limit_high are OUT parameters here (ULONG_PTR *), not bounds the
+         * caller supplies -- which is what the FIXME above is really about -- so the
+         * TEB's stack bounds are the authority.
+         *
+         * Ending with Rip = 0 rather than an error status is deliberate: the unwind
+         * loops here already terminate on ControlPc == 0, so a walk that runs out of
+         * stack now stops the same way a normal one does. */
+        ULONG64 lo = (ULONG64)(ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
+        ULONG64 hi = (ULONG64)(ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
+        BOOL ok = (lo && hi && context->Rsp >= lo && context->Rsp + sizeof(ULONG64) <= hi);
+
+        if (!ok)
+        {
+            /* ml258 CORRECTION: TEB membership alone is the WRONG test here.
+             *
+             * Under ARM64EC+FEX an unwind can legitimately be walking the GUEST x64
+             * stack, which the TEB does not describe -- measured:
+             *   Rsp=0x73ca040000 with TEB stack [0x703d028000,0x703d120000)
+             *   [term-stack] stack=[0x73ca000000..0x73ca040000]
+             * That Rsp really was off the end of the guest stack, so the guard gave
+             * the right answer, but for the wrong reason: as written it would also
+             * reject every VALID guest-stack unwind and silently truncate it.
+             *
+             * So fall back to asking the memory manager whether the slot is actually
+             * readable. Only on this slow path, so ordinary unwinds pay nothing. */
+            MEMORY_BASIC_INFORMATION mbi;
+            SIZE_T len = 0;
+
+            ok = (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)(ULONG_PTR)context->Rsp,
+                                         MemoryBasicInformation, &mbi, sizeof(mbi), &len ) &&
+                  mbi.State == MEM_COMMIT &&
+                  !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                  context->Rsp + sizeof(ULONG64) <=
+                      (ULONG64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize);
+        }
+
+        if (!ok)
+        {
+            static int warned;
+            if (warned++ < 8)
+                ERR( "[unwind-bound] leaf pop unreadable: Rsp=%I64x (TEB stack [%I64x,%I64x)) rip=%I64x"
+                     " -- ending unwind instead of faulting\n", context->Rsp, lo, hi, pc );
+            context->Rip = 0;
+            *data = NULL;
+            *handler_ret = NULL;
+            return STATUS_SUCCESS;
+        }
         context->Rip = *(ULONG64 *)context->Rsp;
         context->Rsp += sizeof(ULONG64);
         *data = NULL;

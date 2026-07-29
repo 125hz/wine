@@ -1639,6 +1639,45 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 
         if (!dispatch.EstablisherFrame) break;
 
+        /* iOS-Mythic ml246: ControlPc == 0 is the END OF THE STACK -- there is nothing to
+         * unwind to, and continuing just walks memory until it faults.
+         *
+         * The existing no-progress guard needs BOTH pc and frame to repeat, so it cannot
+         * catch the observed degeneration: pc stays 0 while the frame creeps upward 8 bytes
+         * per step. Measured 2074 steps ending at a fresh SEGV in ntdll's own walk
+         * (ntdll+0x69c48) reading unmapped memory, which became SEGV LOOP FATAL and killed
+         * the process -- while unwinding an exception raised inside Steam's CEF surface
+         * (chromehtml.dll+0xdc70 via tier0_s64). Stopping here turns a process-killing walk
+         * into an ordinary unhandled exception. */
+        /* ml266 FIX: ControlPc == 0 is the NORMAL END OF THE STACK, not a broken one.
+         *
+         * The ml246 guard above lumped it in with the degenerate cases and set
+         * EXCEPTION_STACK_INVALID, which NtRaiseException turns into
+         *   "Exception frame is not in stack limits => unable to dispatch exception"
+         * followed by an IMMEDIATE NtTerminateProcess. That short-circuits second
+         * chance entirely -- so the process dies before the guest's unhandled-exception
+         * filter (SetUnhandledExceptionFilter, which Chromium installs for crash
+         * reporting) ever runs, and before the debugger event.
+         *
+         * Measured in ml266: FEX did everything right -- reconstructed the guest
+         * context, mapped host pc 0x157424650 -> guest rip 0x7E200E0080, and rethrew
+         * onto the guest stack -- then
+         *   call_seh_handlers unwind stuck: pc=0 frame=703f3ff350 steps=1
+         * with frame == ecRsp + 8, i.e. the leaf pop RAN and read a return address of
+         * ZERO. A guest that jumped to a bogus RIP simply has no caller. That is an
+         * unhandled exception, which is a normal outcome, NOT an invalid stack.
+         *
+         * So: end the search quietly and let the exception take the ordinary unhandled
+         * path. Keep EXCEPTION_STACK_INVALID for what it actually means -- a walk that
+         * degenerates (no forward progress) or runs away. */
+        if (!dispatch.ControlPc)
+        {
+            WARN( "unwind reached end of stack after %u steps (frame=%I64x) —"
+                  " exception is unhandled, dispatching normally\n",
+                  walk_steps, dispatch.EstablisherFrame );
+            break;
+        }
+
         if ((dispatch.ControlPc == prev_pc && dispatch.EstablisherFrame == prev_frame) ||
             ++walk_steps > 0x10000)
         {
@@ -1668,6 +1707,43 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
                  NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase,
                  (ULONG64)dispatch.ControlPc, p_ios_jit_reverse_translate_addr,
                  p_ios_jit_reverse_translate_addr ? "" : "  <-- NULL: unwind ran in POOL space" );
+            /* ml260 (#38): name WHERE the garbage frame came from.
+             *
+             * Symbolised, the failing walk is our OWN dispatch stack:
+             *   #0 set_int_reg (unwind.c:1815)  <- the AV, *val on a garbage frame
+             *   #1 virtual_unwind  #2 call_seh_handlers  #3 dispatch_exception
+             *   #4 KiUserExceptionDispatcher   frame=0x40001131  <- garbage
+             * and the AV address 0x40001171 is exactly frame+0x40, i.e. a saved-register
+             * slot. 0x40001131 is not a corrupted pointer -- it has the shape of a FRAME
+             * REGISTER value, which matters because virtual_unwind above zeroes several
+             * ARM64EC nonvolatile slots (GpNvRegs[4], [5], [9] = 0): if the unwind info
+             * for this pc selects a frame register we do not populate, Rsp is set from
+             * junk and every subsequent slot read is wild.
+             *
+             * So print the x64 nonvolatiles plus the UNWIND_INFO's frame-register fields.
+             * If one of these registers equals the bad frame, the culprit is named
+             * outright; if none do, the frame came from an opcode instead and the fix is
+             * elsewhere. Fires only on this already-fatal path, so it costs nothing. */
+            {
+                CONTEXT *c = &context.AMD64_Context;
+                ERR( "[unwind-why] frame=%I64x | Rsp=%I64x Rbp=%I64x Rbx=%I64x Rsi=%I64x Rdi=%I64x\n",
+                     dispatch.EstablisherFrame, c->Rsp, c->Rbp, c->Rbx, c->Rsi, c->Rdi );
+                ERR( "[unwind-why]   R12=%I64x R13=%I64x R14=%I64x R15=%I64x ImageBase=%I64x FnEntry=%p\n",
+                     c->R12, c->R13, c->R14, c->R15, dispatch.ImageBase,
+                     (void *)dispatch.FunctionEntry );
+                if (dispatch.FunctionEntry && dispatch.ImageBase)
+                {
+                    const RUNTIME_FUNCTION *fn = (const RUNTIME_FUNCTION *)dispatch.FunctionEntry;
+                    const BYTE *info = (const BYTE *)dispatch.ImageBase + fn->UnwindData;
+                    /* UNWIND_INFO: [0]=Version:3|Flags:5, [1]=SizeOfProlog,
+                     * [2]=CountOfCodes, [3]=FrameRegister:4|FrameOffset:4 */
+                    ERR( "[unwind-why]   RUNTIME_FUNCTION begin=%x end=%x unwind=%x | ver/flags=%02x "
+                         "prolog=%02x ncodes=%02x framereg=%u frameoff=%u\n",
+                         (unsigned)fn->BeginAddress, (unsigned)fn->EndAddress,
+                         (unsigned)fn->UnwindData, info[0], info[1], info[2],
+                         info[3] & 0xf, (info[3] >> 4) & 0xf );
+                }
+            }
             {
                 unsigned int k, shown = trace_n < 8 ? trace_n : 8;
                 ERR( "[unwind-trace] %u steps total, last %u:\n", trace_n, shown );
@@ -1799,6 +1875,52 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
     {
         static LONG rtcs_n;
         if (rtcs_n < 40 && InterlockedIncrement( &rtcs_n ) <= 40)
+            /* ml266 (#47): WHY did the guest fault? Name the guest RIP's memory.
+             *
+             * FEX's side is correct -- it reconstructs the context and rethrows onto the
+             * guest stack -- so the fault is a genuine guest fault, and the interesting
+             * question is what the guest RIP points at. Across two runs the value is
+             * suspiciously structured, not random:
+             *   ml265 rip=0x7e600e0080
+             *   ml266 rip=0x7e200e0080
+             * identical low 32 bits (0x000e0080) with a high half differing by exactly
+             * 0x400000000 (16GB). A stable low half plus a 16GB-aligned high half is the
+             * shape of a CORRUPTED POINTER, not a wild jump -- and 16GB is exactly the
+             * PartitionAlloc pool granularity.
+             *
+             * Three outcomes need different fixes: the page is unmapped (the guest jumped
+             * into nothing), mapped but NOT executable (a permissions/exec-interval bug
+             * of the kind #36 fixed), or mapped+executable (then FEX's translation is at
+             * fault, not the memory). Query it instead of theorising. Capped, and only
+             * for access violations whose address IS the reported guest RIP. */
+            if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+            {
+                static int ripq;
+                ULONG64 grip = (ULONG64)(ULONG_PTR)rec->ExceptionAddress;
+
+                if (ripq < 8 && grip > 0x1000)
+                {
+                    MEMORY_BASIC_INFORMATION mbi;
+                    SIZE_T len = 0;
+                    ripq++;
+                    if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)(ULONG_PTR)grip,
+                                               MemoryBasicInformation, &mbi, sizeof(mbi), &len ))
+                        ERR( "[guest-rip] 0x%I64x -> base=%p alloc=%p size=%I64x state=%lx "
+                             "protect=%lx allocprot=%lx type=%lx %s\n",
+                             grip, mbi.BaseAddress, mbi.AllocationBase,
+                             (ULONG64)mbi.RegionSize, mbi.State, mbi.Protect,
+                             mbi.AllocationProtect, mbi.Type,
+                             mbi.State != MEM_COMMIT      ? "<-- NOT COMMITTED (jumped into nothing)" :
+                             !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                              PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+                                                          ? "<-- COMMITTED but NOT EXECUTABLE"
+                                                          : "<-- code address is VALID (fault is in the DATA the "
+                                                            "instruction touches, not the RIP)" );
+                    else
+                        ERR( "[guest-rip] 0x%I64x -> NtQueryVirtualMemory FAILED"
+                             " (address is not in this address space at all)\n", grip );
+                }
+            }
             ERR( "[rtcs] pre: code=%08x addr=%p armPc=%p ecRip=%p rtcs=%p insim=%u\n",
                  (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
                  (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)context->AMD64_Context.Rip,
