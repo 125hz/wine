@@ -636,7 +636,19 @@ static DWORD cache_container_open_index(cache_container *container, DWORD blocks
         if(header && !cache_container_is_valid(header, file_size)) {
             WARN("detected old or broken index.dat file\n");
             UnmapViewOfFile(header);
-            FreeUrlCacheSpaceW(container->path, 100, 0);
+            /* Recreating the cache via FreeUrlCacheSpaceW recurses back into
+             * this function; when the directory delete keeps failing (files
+             * held open -> sharing violation) the mutual recursion is
+             * unbounded and overflows the native stack (ml338/ml339: 503
+             * levels = 1MB).  Reinitialize index.dat in place instead. */
+            CloseHandle(container->mapping);
+            container->mapping = NULL;
+            file = CreateFileW(index_path, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
+            if(file != INVALID_HANDLE_VALUE) {
+                DWORD ret = cache_container_set_size(container, file, MIN_BLOCK_NO);
+                CloseHandle(file);
+                ERR("[cache-reinit] rev=ml340 broken index.dat reinitialized in place -> %lu\n", ret);
+            }
         }else if(header) {
             UnmapViewOfFile(header);
         }else {
@@ -1161,6 +1173,15 @@ static DWORD cache_container_clean_index(cache_container *container, urlcache_he
 
     if(urlcache_clean_leaked_entries(container, header))
         return ERROR_SUCCESS;
+
+    /* iOS: growing the index below (close_index + reopen at double capacity) can never
+     * work — mapped-file writes are silently lost (iOS mmap PROT_WRITE downgrade), so the
+     * reopen reads stale bytes, the reinitialized index is empty at minimum capacity, the
+     * entry still doesn't fit, and the caller's ERROR_HANDLE_DISK_FULL loop cycles forever
+     * (ml342: 3,136 iterations). Report the cache as full instead: both callers break out
+     * of their retry loop on this and fail the single entry gracefully. */
+    ERR("[cache-full] rev=ml342 refusing index growth (iOS: reopen cannot preserve content) — entry will not be cached\n");
+    return ERROR_NOT_ENOUGH_MEMORY;
 
     if(header->size >= ALLOCATION_TABLE_SIZE*8*BLOCKSIZE + ENTRY_START_OFFSET) {
         WARN("index file has maximal size\n");
@@ -1718,7 +1739,17 @@ static BOOL cache_container_delete_dir(LPCWSTR lpszPath)
     ret = SHFileOperationW(&shfos);
     if (ret)
         ERR("SHFileOperationW on %s returned %i\n", debugstr_w(path), ret);
-    return !(ret || shfos.fAnyOperationsAborted);
+    /* Windows' FreeUrlCacheSpace evicts what it can and succeeds even when
+     * some cache files are held open (sharing violations); it never fails the
+     * whole call over them.  Steam's startup cache purge recursively re-calls
+     * it on FALSE until the native stack overflows (ml338: 503 levels = 1MB),
+     * so report best-effort deletion as success. */
+    if (ret == ERROR_SHARING_VIOLATION || shfos.fAnyOperationsAborted)
+    {
+        ERR("[cache-del] rev=ml339 tolerating in-use cache files (best-effort delete)\n");
+        return TRUE;
+    }
+    return !ret;
 }
 
 /***********************************************************************

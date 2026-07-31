@@ -459,6 +459,39 @@ BOOL WINAPI RegisterPointerDeviceNotifications(HWND hwnd, BOOL notifyrange)
 }
 
 /**********************************************************************
+ * GetPointerDevice [USER32.@]
+ *
+ * iOS-Mythic ml335: the ONE export CEF needs that wine's user32 lacked.
+ *
+ * ml332-ml334's fatal was steamwebhelper executing `int3; ud2` -- Chromium's
+ * IMMEDIATE_CRASH() -- inside its delay-load FAILURE hook (identified by the
+ * "DelayLoad-ModuleName" crash-key string next to the trap in the device's own
+ * libcef.dll). Chromium delay-loads 226 user32 functions and treats ANY unresolved
+ * one as fatal; diffing libcef's delay-import table against our user32 exports
+ * showed exactly one gap: GetPointerDevice. GetProcAddress returned NULL,
+ * __delayLoadHelper2 invoked the hook, and CEF killed itself -- deterministically,
+ * at the same point in startup, every run.
+ *
+ * Wine already stubs the rest of this family (GetPointerDevices,
+ * GetPointerDeviceProperties, GetPointerDeviceRects). Match GetPointerDevices'
+ * behaviour: report no device info. Returning FALSE is the documented result for
+ * an unknown device handle, and callers must already handle it because a machine
+ * with no pointer devices answers the same way.
+ */
+BOOL WINAPI GetPointerDevice(HANDLE device, POINTER_DEVICE_INFO *info)
+{
+    FIXME("(%p %p): stub\n", device, info);
+
+    if (!info)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+}
+
+/**********************************************************************
  * GetPointerDevices [USER32.@]
  */
 BOOL WINAPI GetPointerDevices(UINT32 *device_count, POINTER_DEVICE_INFO *devices)

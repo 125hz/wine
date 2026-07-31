@@ -3678,7 +3678,28 @@ done:
     if (nts == STATUS_SUCCESS)
         TRACE("Loaded module %s at %p\n", debugstr_us(&nt_name), (*pwm)->ldr.DllBase);
     else
+    {
+        /* iOS-Mythic ml336: NAME THE DLL THAT ISN'T THERE.
+         *
+         * The webhelper dies in Chromium's delay-load FAILURE hook (int3; ud2 next to the
+         * "DelayLoad-ModuleName" crash key). ml335 ruled out the export theory: the farm
+         * relinked all 83 DLLs, so the new user32!GetPointerDevice IS deployed, and its
+         * FIXME never printed -- CEF never called it. So the failure is dliFailLoadLib, a
+         * DLL that cannot be LOADED. libcef delay-loads 45 DLLs and we ship only 20 of
+         * them; any of the other 25 could be the fatal one, and guessing among 25 is not a
+         * plan. Chromium's own helper (__delayLoadHelper2, linked into libcef) resolves
+         * these with LoadLibrary, which lands here, so this is the one funnel every
+         * candidate must pass through.
+         *
+         * Capped: apps probe optional DLLs constantly, so this is noisy by nature -- but
+         * the fatal one is whatever appears last before the crash. */
+        static int ldrfail_n;
+        if (ldrfail_n++ < 60)
+            ERR( "[dll-missing] rev=ml336 #%d %s status=%08x -- if the webhelper dies right"
+                 " after this, it is the delay-load Chromium kills the process over\n",
+                 ldrfail_n, debugstr_w(libname), (unsigned)nts );
         WARN("Failed to load module %s; status=%lx\n", debugstr_w(libname), nts);
+    }
 
     if (mapping) NtClose( mapping );
     RtlFreeUnicodeString( &nt_name );
@@ -4246,6 +4267,46 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
     }
 
 fail:
+    /* iOS-Mythic ml334: NAME THE FAILING DELAY-LOAD.
+     *
+     * ml332/ml333's fatal is libcef executing `int3; ud2` -- Chromium's IMMEDIATE_CRASH()
+     * -- from a routine that first stores the crash key string "DelayLoad-ModuleName"
+     * (identified by disassembling the device's own cef.win64/libcef.dll at the faulting
+     * RVA). That is Chromium's delay-load FAILURE hook: when a delay-load cannot be
+     * resolved it records the module name and deliberately kills the process. So CEF is
+     * not crashing on a translation bug -- it is telling us a DLL or export is missing.
+     *
+     * Nothing currently logs which one: the [ec-delay] probe above only fires on SUCCESS
+     * and only for rpcrt4, and ios_eager_delay_resolve reports failed=0 because it skips
+     * targets that are not already loaded. Log every failure with the importer, the target
+     * DLL, the specific import, and the status, so the missing piece is named instead of
+     * guessed at. Unconditional (no cap): these are fatal, so there will be very few. */
+    {
+        const char *imp = "?";
+        char ordbuf[24];
+
+        if (IMAGE_SNAP_BY_ORDINAL(pINT[id].u1.Ordinal))
+        {
+            unsigned int o = LOWORD(pINT[id].u1.Ordinal), p = 0;
+            ordbuf[p++] = '#';
+            if (o >= 10000) ordbuf[p++] = '0' + (o / 10000) % 10;
+            if (o >= 1000)  ordbuf[p++] = '0' + (o / 1000) % 10;
+            if (o >= 100)   ordbuf[p++] = '0' + (o / 100) % 10;
+            if (o >= 10)    ordbuf[p++] = '0' + (o / 10) % 10;
+            ordbuf[p++] = '0' + o % 10;
+            ordbuf[p] = 0;
+            imp = ordbuf;
+        }
+        else
+        {
+            const IMAGE_IMPORT_BY_NAME *iibn = get_rva( base, pINT[id].u1.AddressOfData );
+            imp = (const char *)iibn->Name;
+        }
+        ERR( "[delay-fail] rev=ml334 importer=%p target=%s import=%s status=%08x hmod=%p"
+             " -- Chromium's DelayLoad-ModuleName hook kills the process on this\n",
+             base, debugstr_a(name), debugstr_a(imp), nts, *phmod );
+    }
+
     delayinfo.Size = sizeof(delayinfo);
     delayinfo.DelayloadDescriptor = desc;
     delayinfo.ThunkAddress = addr;

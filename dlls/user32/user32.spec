@@ -629,6 +629,7 @@
 # @ stub GetPointerDeviceCursors
 # @ stub GetPointerDeviceInputSpace
 # @ stub GetPointerDeviceOrientation
+@ stdcall GetPointerDevice(ptr ptr)
 @ stdcall GetPointerDeviceProperties(ptr ptr ptr)
 @ stdcall GetPointerDeviceRects(ptr ptr ptr)
 @ stdcall GetPointerDevices(ptr ptr)
