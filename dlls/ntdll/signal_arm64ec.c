@@ -1721,6 +1721,43 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         if ((dispatch.ControlPc == prev_pc && dispatch.EstablisherFrame == prev_frame) ||
             ++walk_steps > 0x10000)
         {
+            /* iOS-Mythic ml327 LIVELOCK BREAKER.
+             *
+             * Abandoning the walk ends THIS dispatch, but nothing stops the same fault
+             * from recurring: a live run was caught repeating
+             *   unwind stuck: pc=149dc0110 frame=71e01fdfb0 steps=2 — abandoning walk
+             * 58,045 times with byte-identical pc and frame, spinning until the user
+             * killed the app (20MB of log, battery burn, no progress). Faults became
+             * survivable in #38, which is right for ordinary guest faults, but a fault
+             * whose handler cannot make progress just retries the same instruction
+             * forever.
+             *
+             * Count CONSECUTIVE abandons at the same (pc, frame). A different site
+             * resets the counter, so genuinely distinct unwindable faults are unaffected.
+             * Past the threshold, stop pretending this is recoverable and terminate with
+             * the real exception code -- a diagnosable crash beats an infinite loop. */
+            {
+                static ULONG64 stuck_pc, stuck_frame;
+                static unsigned stuck_n;
+
+                if ((ULONG64)dispatch.ControlPc == stuck_pc && dispatch.EstablisherFrame == stuck_frame)
+                {
+                    if (++stuck_n >= 16)
+                    {
+                        ERR( "unwind stuck: SAME site pc=%I64x frame=%I64x abandoned %u times in a row"
+                             " — livelock, terminating with code %08lx\n",
+                             (ULONG64)dispatch.ControlPc, dispatch.EstablisherFrame, stuck_n,
+                             rec->ExceptionCode );
+                        NtTerminateProcess( GetCurrentProcess(), rec->ExceptionCode );
+                    }
+                }
+                else
+                {
+                    stuck_pc = (ULONG64)dispatch.ControlPc;
+                    stuck_frame = dispatch.EstablisherFrame;
+                    stuck_n = 1;
+                }
+            }
             ERR( "unwind stuck: pc=%I64x frame=%I64x steps=%u — abandoning walk\n",
                  (ULONG64)dispatch.ControlPc, dispatch.EstablisherFrame, walk_steps );
             rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
