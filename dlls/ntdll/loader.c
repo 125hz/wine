@@ -1174,6 +1174,113 @@ void ios_ec_recheck_iat( const char *when )
              : "POOL STILL STALE  <== calls use the unbound entry" );
     }
 }
+
+/* iOS-Mythic ml318: EAGER delay-import resolution for ARM64EC modules.
+ *
+ * ml318 proved the lazy path is unfixable for the FIRST call: the pool-side aux
+ * slot is now dual-written on resolution (POOL-SYNCED, 6/6), but resolution runs
+ * lazily INSIDE the first call, whose frame was already mangled by the unresolved
+ * x64 lazy-thunk round trip (native caller frame through emulation loses the
+ * x4/x5 varargs descriptor). Steam does NOT retry the failed OpenSCManagerW --
+ * one corrupt SCM RPC and it exits with code 1.
+ *
+ * So resolve eagerly at attach time, BEFORE any call: walk every EC module's
+ * delay-import descriptors and resolve entries whose target DLL is ALREADY
+ * LOADED (never triggering new loads, so lazy semantics for genuinely optional
+ * DLLs are preserved). Unresolved entries are recognisable because the lazy
+ * thunk points INSIDE the importer's own image. Failures are absorbed by a
+ * hook that returns NULL (the no-hook failure path calls a NULL syshook).
+ * Idempotent: resolved slots point outside the image and are skipped. */
+static void * WINAPI ios_delay_fail_hook( ULONG reason, DELAYLOAD_INFO *info )
+{
+    return NULL;
+}
+
+void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIPTOR* desc,
+                                       PDELAYLOAD_FAILURE_DLL_CALLBACK dllhook,
+                                       PDELAYLOAD_FAILURE_SYSTEM_ROUTINE syshook,
+                                       IMAGE_THUNK_DATA* addr, ULONG flags );
+
+void ios_eager_delay_resolve( const char *when );
+
+void ios_eager_delay_resolve( const char *when )
+{
+    /* ml319 HARD GATES -- the ungated version killed steam.exe at 284 unix calls
+     * (STATUS_STACK_OVERFLOW after a jump-to-0x2xxx storm with
+     * __os_arm64x_check_call still NULL):
+     * 1. Never run during process bootstrap: the EC dispatchers are not installed
+     *    yet, so resolution machinery (redirect_ptr / IsEcCode) produces garbage
+     *    that gets WRITTEN into IATs. Gate on imports_fixup_done AND on the
+     *    dispatcher global actually being set in this pseudo-process's ntdll.
+     * 2. Reentrancy: LdrResolveDelayLoadedAPI calls LdrLoadDll (refcount bump on
+     *    the already-loaded target), whose completion re-enters this hook and
+     *    finds the same still-unresolved slot -> unbounded recursion. All of this
+     *    runs under the loader critical section, so a static flag suffices. */
+    extern void *__os_arm64x_dispatch_call_no_redirect;
+    static int in_progress;
+    LIST_ENTRY *list = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
+    LIST_ENTRY *entry;
+    static int log_n;
+
+    if (in_progress) return;
+    if (!imports_fixup_done) return;
+    if (!__os_arm64x_dispatch_call_no_redirect) return;
+    in_progress = 1;
+
+    for (entry = list->Flink; entry != list; entry = entry->Flink)
+    {
+        LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
+        HMODULE base = mod->DllBase;
+        const IMAGE_DELAYLOAD_DESCRIPTOR *desc;
+        ULONG dir_size;
+        SIZE_T image_size;
+
+        if (!arm64ec_get_module_metadata( base )) continue;
+        desc = RtlImageDirectoryEntryToData( base, TRUE, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &dir_size );
+        if (!desc) continue;
+        image_size = RtlImageNtHeader( base )->OptionalHeader.SizeOfImage;
+
+        for (; desc->DllNameRVA; desc++)
+        {
+            const char *dllname = get_rva( base, desc->DllNameRVA );
+            IMAGE_THUNK_DATA *pIAT = get_rva( base, desc->ImportAddressTableRVA );
+            const IMAGE_THUNK_DATA *pINT = get_rva( base, desc->ImportNameTableRVA );
+            HMODULE *phmod = get_rva( base, desc->ModuleHandleRVA );
+            unsigned int i, resolved = 0, failed = 0;
+
+            if (!*phmod)
+            {
+                UNICODE_STRING us;
+                HMODULE hmod = NULL;
+
+                if (!RtlCreateUnicodeStringFromAsciiz( &us, dllname )) continue;
+                if (LdrGetDllHandle( NULL, 0, &us, &hmod ) || !hmod)
+                {
+                    RtlFreeUnicodeString( &us );
+                    continue;    /* target not loaded: keep lazy semantics */
+                }
+                RtlFreeUnicodeString( &us );
+            }
+            for (i = 0; pINT[i].u1.Ordinal; i++)
+            {
+                ULONG_PTR v = pIAT[i].u1.Function;
+
+                if (v < (ULONG_PTR)base || v >= (ULONG_PTR)base + image_size) continue;  /* resolved */
+                if (LdrResolveDelayLoadedAPI( (void *)base, desc, ios_delay_fail_hook, NULL, &pIAT[i], 0 ))
+                    resolved++;
+                else
+                    failed++;
+            }
+            if ((resolved || failed) && log_n < 24)
+            {
+                log_n++;
+                ERR( "[ec-eager-delay:%s] %s -> %s: resolved=%u failed=%u\n",
+                     when, debugstr_w( mod->BaseDllName.Buffer ), dllname, resolved, failed );
+            }
+        }
+    }
+    in_progress = 0;
+}
 #endif
 
 static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, LPCWSTR load_path, WINE_MODREF **pwm )
@@ -3667,6 +3774,10 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
          * was inside load_arm64ec_module(), which runs before sechost/rpcrt4 even load, so
          * the list was empty and the probe printed nothing.) */
         { void ios_ec_recheck_iat( const char * ); ios_ec_recheck_iat( "ldrload-attach" ); }
+        /* ml318: eager-resolve delay imports for already-loaded targets BEFORE any code
+         * in the new module tree runs -- the first call through a lazy slot is
+         * unsalvageable (see ios_eager_delay_resolve). */
+        { void ios_eager_delay_resolve( const char * ); ios_eager_delay_resolve( "ldrload" ); }
 #endif
         nts = process_attach( wm->ldr.DdagNode, NULL );
         if (nts != STATUS_SUCCESS)
@@ -4096,27 +4207,38 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
 #endif
         pIAT[id].u1.Function = (ULONG_PTR)fp;
 #ifdef __arm64ec__
-        /* iOS-Mythic ml236: DELAY-LOAD is a separate binding path from import_dll, and the
-         * ARM64EC redirect lives in import_dll -- so this was never instrumented.
+        /* iOS-Mythic ml317 -- the ml236 bug, finally closed. The store above lands in the
+         * PE image's .data, but the checker stub that consumes this slot executes from the
+         * module's JIT-POOL COPY and reads the CLONED .data, which nothing ever updated:
+         * delay-load resolution happens lazily at RUNTIME, after every IAT-sync pass has
+         * already run (unlike regular binds, which ios_ec_recheck_iat showed healed by
+         * attach time). ml317's pool dump proved it: sechost's aux slot for NdrClientCall2
+         * still held the unresolved lazy-thunk address at end of run while the PE-side
+         * slot was resolved. Consequence: EVERY call kept taking the unresolved x64 lazy
+         * path through emulation with a NATIVE caller frame, losing the x4/x5 varargs
+         * descriptor exactly as ml236 described -- NdrClientCall2's ccontext == 0x10 == x5
+         * (the stack-args SIZE), the SCM RPC failure that made steam.exe give up (exit 1).
          *
-         * sechost DELAY-loads rpcrt4. Its native stub does
-         *   ldr x16,[__imp_NdrClientCall2]; br x16   (.rdata, points at an icall stub)
-         * which loads x11 = this delay IAT entry, x10 = $iexit_thunk$cdecl$i8$varargs, and
-         * lets __os_arm64x_check_icall pick. If what we store here is NOT recognised as EC,
-         * check_icall selects the EXIT THUNK -- the EC->x64 path -- and that thunk does
-         * `stp x4,x5,[sp,#0x20]`, depositing the VARIADIC DESCRIPTOR (x4 = stack-arg
-         * pointer, x5 = size) into the x64 arg5/arg6 slots. NdrClientCall2 then reads the
-         * descriptor as if it were arguments: dwDesiredAccess becomes a pointer and
-         * lpScHandle becomes 0x10 (the size), which is the ccontext == 0x10 crash.
-         *
-         * Log what we actually stored and whether it counts as EC. */
+         * Fix: write the POOL-side slot as well. Pool-copy .data is writable -- native
+         * code running from copies writes its own globals through pc-relative addressing
+         * constantly, so a plain store is safe. First call through a still-unresolved slot
+         * remains corrupt (the frame is already mangled by the time the resolver runs);
+         * every later call reads the healed slot, sees EC code, and calls natively with
+         * x4/x5 intact. */
         {
-            static int dl_n;
-            if (dl_n < 12 && name && strstr( name, "rpcrt4" ))
+            extern void *xlate_ios_jit( void *ptr );
+            void *slot = &pIAT[id].u1.Function;
+            void *pslot = xlate_ios_jit( slot );
+            if (pslot && pslot != slot) *(volatile ULONG_PTR *)pslot = (ULONG_PTR)fp;
             {
-                dl_n++;
-                ERR( "[ec-delay] %s ord/name id=%d fp=%p IsEcCode(fp)=%d slot=%p\n",
-                     name, (int)id, fp, (int)RtlIsEcCode( (ULONG_PTR)fp ), &pIAT[id].u1.Function );
+                static int dl_n;
+                if (dl_n < 12 && name && strstr( name, "rpcrt4" ))
+                {
+                    dl_n++;
+                    ERR( "[ec-delay] %s ord/name id=%d fp=%p IsEcCode(fp)=%d slot=%p poolslot=%p %s\n",
+                         name, (int)id, fp, (int)RtlIsEcCode( (ULONG_PTR)fp ), slot, pslot,
+                         (pslot && pslot != slot) ? "POOL-SYNCED" : "(no pool copy)" );
+                }
             }
         }
 #endif

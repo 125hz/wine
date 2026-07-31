@@ -1187,6 +1187,46 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
         }
     }
 
+    /* ml283: log every protect that REQUESTS execute, anywhere, with its result.
+     *
+     * The [unexec] probe above cannot answer this: it filters to ios_in_big_image() AND to
+     * protections WITHOUT execute. I nonetheless used its output to claim "the guest never
+     * requests an execute protection", and retracted the V8-JIT theory on that basis. The
+     * claim was unfounded -- that probe is structurally incapable of showing an exec
+     * request, and doubly so outside a big PE image.
+     *
+     * What we actually know (ml273/ml283): libcef.dll+0x59ef805 calls a pointer landing at
+     * 0x7e600f0080, inside a 6.7MB MEM_PRIVATE PAGE_READWRITE region based at
+     * 0x7E60000000, and the target is COMMITTED but NOT EXECUTABLE. A private multi-MB
+     * region entered at a 64KB-slot offset is V8 code-space shape. So the question is
+     * precisely: does anything ask for EXECUTE on it, and does the request SUCCEED?
+     * No address filter, no protection filter, and the status is printed -- so silence
+     * here means "never requested", not "filtered out". */
+    {
+        static int execreq_n;
+        const ULONG exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+
+        if ((new_prot & exec_mask) && execreq_n < 64)
+        {
+            void *req_addr = *addr_ptr;
+            SIZE_T req_size = *size_ptr;
+            NTSTATUS st = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
+
+            execreq_n++;
+            ERR( "[exec-req] #%d addr=%p size=%p new_prot=%lx -> status=%08x%s%s\n",
+                 execreq_n, req_addr, (void *)req_size, new_prot, (unsigned)st,
+                 st ? "  <== FAILED" : "",
+                 is_current ? "" : "  (cross-process)" );
+
+            if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
+                                                             *addr_ptr, *size_ptr, 2, new_prot, st );
+            else if (pNotifyMemoryProtect
+                     && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
+                pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, st );
+            return st;
+        }
+    }
+
     status = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
 
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
@@ -1731,17 +1771,58 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
                 ERR( "[unwind-why]   R12=%I64x R13=%I64x R14=%I64x R15=%I64x ImageBase=%I64x FnEntry=%p\n",
                      c->R12, c->R13, c->R14, c->R15, dispatch.ImageBase,
                      (void *)dispatch.FunctionEntry );
+                /* ml274 CORRECTION: decode per ABI, not blindly as x64.
+                 *
+                 * The first version of this probe read the entry as an x64
+                 * RUNTIME_FUNCTION (12 bytes: Begin/End/UnwindData) and its UnwindData as
+                 * x64 UNWIND_INFO. For EC code that is the WRONG STRUCT, and it produced
+                 * confident nonsense: entry[8840] of ntdll's ExtraRFETable is
+                 * Begin=0x59730 UnwindData=0xb71ec and entry[8841] Begin=0x59770, which the
+                 * probe reported as "begin=59730 end=b71ec unwind=59770" -- inventing a
+                 * 383KB function whose xdata sat inside .text, then decoding a valid ARM64
+                 * unwind RVA as x64 UNWIND_INFO (hence "version 3, 188 codes, framereg R9").
+                 * There was never a fabricated RUNTIME_FUNCTION.
+                 *
+                 * RtlLookupFunctionTable picks the table with RtlIsEcCode: true ->
+                 * ExtraRFETable (ARM64EC, 8-byte entries), false ->
+                 * IMAGE_DIRECTORY_ENTRY_EXCEPTION (x64, 12-byte entries). Report which one
+                 * applies and decode accordingly. */
                 if (dispatch.FunctionEntry && dispatch.ImageBase)
                 {
-                    const RUNTIME_FUNCTION *fn = (const RUNTIME_FUNCTION *)dispatch.FunctionEntry;
-                    const BYTE *info = (const BYTE *)dispatch.ImageBase + fn->UnwindData;
-                    /* UNWIND_INFO: [0]=Version:3|Flags:5, [1]=SizeOfProlog,
-                     * [2]=CountOfCodes, [3]=FrameRegister:4|FrameOffset:4 */
-                    ERR( "[unwind-why]   RUNTIME_FUNCTION begin=%x end=%x unwind=%x | ver/flags=%02x "
-                         "prolog=%02x ncodes=%02x framereg=%u frameoff=%u\n",
-                         (unsigned)fn->BeginAddress, (unsigned)fn->EndAddress,
-                         (unsigned)fn->UnwindData, info[0], info[1], info[2],
-                         info[3] & 0xf, (info[3] >> 4) & 0xf );
+                    BOOLEAN is_ec = RtlIsEcCode( dispatch.ControlPc );
+
+                    if (is_ec)
+                    {
+                        /* ARM64 RUNTIME_FUNCTION: BeginAddress + UnwindData. UnwindData with
+                         * either of the low 2 bits set is PACKED unwind data; otherwise it is
+                         * an RVA to .xdata. */
+                        const DWORD *fn = (const DWORD *)dispatch.FunctionEntry;
+                        DWORD begin = fn[0], ud = fn[1];
+
+                        if (ud & 3)
+                            ERR( "[unwind-why]   EC entry (ARM64, 8B): Begin=%x UnwindData=%x"
+                                 " PACKED (flag=%u)\n", begin, ud, ud & 3 );
+                        else
+                        {
+                            const DWORD *xd = (const DWORD *)(dispatch.ImageBase + ud);
+                            ERR( "[unwind-why]   EC entry (ARM64, 8B): Begin=%x UnwindData=%x"
+                                 " .xdata hdr[0]=%08x hdr[1]=%08x\n", begin, ud, xd[0], xd[1] );
+                        }
+                    }
+                    else
+                    {
+                        const RUNTIME_FUNCTION *fn = (const RUNTIME_FUNCTION *)dispatch.FunctionEntry;
+                        const BYTE *info = (const BYTE *)dispatch.ImageBase + fn->UnwindData;
+
+                        ERR( "[unwind-why]   x64 entry (12B): begin=%x end=%x unwind=%x |"
+                             " ver/flags=%02x prolog=%02x ncodes=%02x framereg=%u frameoff=%u\n",
+                             (unsigned)fn->BeginAddress, (unsigned)fn->EndAddress,
+                             (unsigned)fn->UnwindData, info[0], info[1], info[2],
+                             info[3] & 0xf, (info[3] >> 4) & 0xf );
+                    }
+                    ERR( "[unwind-why]   table=%s ImageBase=%I64x ControlPc=%I64x\n",
+                         is_ec ? "ExtraRFETable(ARM64EC)" : "DIRECTORY_ENTRY_EXCEPTION(x64)",
+                         dispatch.ImageBase, (ULONG64)dispatch.ControlPc );
                 }
             }
             {
@@ -1898,13 +1979,34 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                 static int ripq;
                 ULONG64 grip = (ULONG64)(ULONG_PTR)rec->ExceptionAddress;
 
+                /* ml273 CORRECTION #2. The ml270 attempt used xlate_ios_jit_rev to spot
+                 * pool addresses, but that only translates addresses with a PE equivalent
+                 * -- FEX-EMITTED dispatcher code in the pool tail has none, so it returned
+                 * identity and the bogus "NOT COMMITTED (jumped into nothing)" verdict
+                 * still printed for 0x15cbf8650.
+                 *
+                 * Use the real discriminator instead, straight out of the measured data:
+                 * memory Wine does not own comes back with AllocationBase == 0 AND
+                 * Type == 0 (ml270 0x1577f8700 and ml273 0x15cbf8650 both did), whereas a
+                 * genuine Wine region always has both set (ml273 0x7c600e0080 gave
+                 * alloc=0x7C60000000, type=MEM_PRIVATE). No pool bounds needed on the PE
+                 * side, and it generalises to any foreign mapping. */
                 if (ripq < 8 && grip > 0x1000)
                 {
                     MEMORY_BASIC_INFORMATION mbi;
                     SIZE_T len = 0;
                     ripq++;
-                    if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)(ULONG_PTR)grip,
-                                               MemoryBasicInformation, &mbi, sizeof(mbi), &len ))
+                    NTSTATUS qst = NtQueryVirtualMemory( NtCurrentProcess(),
+                                                        (void *)(ULONG_PTR)grip,
+                                                        MemoryBasicInformation, &mbi,
+                                                        sizeof(mbi), &len );
+                    /* ml274: query ONCE. The else-if used to re-invoke it, which printed a
+                     * spurious second "FAILED" line for every verdict (5 vs 6 in ml274). */
+                    if (!qst && !mbi.AllocationBase && !mbi.Type)
+                        ERR( "[guest-rip] 0x%I64x -> Wine has NO VIEW of this address"
+                             " (AllocationBase=0, Type=0) -- it is a foreign/JIT-pool"
+                             " mapping, so no protection verdict is meaningful\n", grip );
+                    else if (!qst)
                         ERR( "[guest-rip] 0x%I64x -> base=%p alloc=%p size=%I64x state=%lx "
                              "protect=%lx allocprot=%lx type=%lx %s\n",
                              grip, mbi.BaseAddress, mbi.AllocationBase,
@@ -1916,6 +2018,43 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                                                           ? "<-- COMMITTED but NOT EXECUTABLE"
                                                           : "<-- code address is VALID (fault is in the DATA the "
                                                             "instruction touches, not the RIP)" );
+                    /* ml273: when the guest jumps somewhere non-executable, the useful
+                     * question is WHO called it. The recurring target is alloc + 0xe0080
+                     * with the same 0xe0080 offset every run (0x7e600e0080, 0x7e200e0080,
+                     * 0x7c600e0080) into a private READ-WRITE PartitionAlloc region that
+                     * is never protected executable -- so this is a call through a function
+                     * pointer aimed at heap DATA, not a lost W^X flip. Dump the top of the
+                     * guest stack and reverse-translate each slot, so the calling module is
+                     * named instead of guessed. */
+                    if (mbi.State == MEM_COMMIT &&
+                        !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                    {
+                        ULONG64 grsp = context->AMD64_Context.Rsp;
+                        SIZE_T qlen = 0;
+                        MEMORY_BASIC_INFORMATION smbi;
+
+                        if (grsp && !NtQueryVirtualMemory( NtCurrentProcess(), (void *)(ULONG_PTR)grsp,
+                                                           MemoryBasicInformation, &smbi,
+                                                           sizeof(smbi), &qlen )
+                            && smbi.State == MEM_COMMIT)
+                        {
+                            const ULONG64 *sp = (const ULONG64 *)(ULONG_PTR)grsp;
+                            int k;
+                            ERR( "[guest-caller] guest rsp=%I64x, top of stack:\n", grsp );
+                            for (k = 0; k < 6; k++)
+                            {
+                                void *pe = xlate_ios_jit_rev( (void *)(ULONG_PTR)sp[k] );
+                                ERR( "[guest-caller]   [%d] %I64x%s%p\n", k, sp[k],
+                                     (pe && (ULONG64)(ULONG_PTR)pe != sp[k]) ? "  (pool -> PE " : "  (",
+                                     pe );
+                            }
+                        }
+                        else
+                            ERR( "[guest-caller] guest rsp=%I64x is not readable —"
+                                 " cannot name the caller\n", grsp );
+                    }
+
                     else
                         ERR( "[guest-rip] 0x%I64x -> NtQueryVirtualMemory FAILED"
                              " (address is not in this address space at all)\n", grip );
