@@ -77,8 +77,14 @@ static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
 {
     if (frame & (sizeof(void*) - 1)) return FALSE;
     if (is_valid_frame( frame )) return TRUE;
-    if (frame >= get_arm64ec_cpu_area()->EmulatorStackLimit &&
-        frame <= get_arm64ec_cpu_area()->EmulatorStackBase) return TRUE;
+    /* ml382: NULL-safe — this runs during exception dispatch, where a second
+     * fault is far worse than a missed range check (see the enter/leave
+     * _syscall_callback comment below for why the CPU area can be NULL here). */
+    {
+        CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
+        if (area && frame >= area->EmulatorStackLimit &&
+            frame <= area->EmulatorStackBase) return TRUE;
+    }
     /* iOS-Mythic task#34: EC threads here run on THREE stacks — Tib holds
      * the NATIVE pthread stack, the CpuArea holds the emulator stack, and
      * the guest x64 frames live on the GUEST stack that neither range
@@ -105,16 +111,45 @@ static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
     return FALSE;
 }
 
+/* iOS-Mythic ml382: the CPU area can legitimately be NULL on this port.
+ *
+ * get_arm64ec_cpu_area() is NtCurrentTeb()->ChpeV2CpuAreaInfo, and
+ * init_thread_stack deliberately does NOT set it for the native-aarch64
+ * session — logged three times in the ml382 run:
+ *   "iOS arm64ec: NOT setting cpu_area (owner machine=0xaa64 session is_arm64ec=0)"
+ * But ARM64EC ntdll code still executes on those threads (every SYSCALL_API
+ * wrapper here calls enter/leave_syscall_callback), so the unguarded
+ * dereference is a NULL store.
+ *
+ * That is exactly what killed the SESSION process in ml380 AND ml382 — and
+ * killing the session kills the whole app, which is why it capped both runs.
+ * Decoded from our own ntdll at the faulting RVA 0x582e4:
+ *     ldr  x8, [x18, #0x1788]     ; x8 = TEB->ChpeV2CpuAreaInfo  == 0
+ *     strb wzr, [x8, #0x1]        ; InSyscallCallback = 0  -> FAULTS at 0x1
+ * matching the log's `addr=0x1 insn=3900051f` and
+ * `CPUArea(teb+0x1788)=0x0(ok=1)`.
+ *
+ * With no CPU area the thread is not running emulated code, so the
+ * re-entrancy flag is vacuous: report "not already in a callback" and skip the
+ * bookkeeping. Deliberately returning TRUE rather than FALSE — FALSE would
+ * route callers to the raw syscall and skip pNotifyMemoryAlloc, and stale FEX
+ * memory notifications are what caused the ml36 NOEXEC wall. Proceeding keeps
+ * behaviour identical to every thread that does have a CPU area. */
 static inline BOOL enter_syscall_callback(void)
 {
-    if (get_arm64ec_cpu_area()->InSyscallCallback) return FALSE;
-    get_arm64ec_cpu_area()->InSyscallCallback = 1;
+    CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
+
+    if (!area) return TRUE;
+    if (area->InSyscallCallback) return FALSE;
+    area->InSyscallCallback = 1;
     return TRUE;
 }
 
 static inline void leave_syscall_callback(void)
 {
-    get_arm64ec_cpu_area()->InSyscallCallback = 0;
+    CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
+
+    if (area) area->InSyscallCallback = 0;
 }
 
 /**********************************************************************
@@ -638,7 +673,7 @@ DEFINE_SYSCALL(NtCancelIoFileEx, (HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_
 DEFINE_SYSCALL(NtCancelSynchronousIoFile, (HANDLE handle, IO_STATUS_BLOCK *io, IO_STATUS_BLOCK *io_status))
 DEFINE_SYSCALL(NtCancelTimer, (HANDLE handle, BOOLEAN *state))
 DEFINE_SYSCALL(NtClearEvent, (HANDLE handle))
-DEFINE_SYSCALL(NtClose, (HANDLE handle))
+DEFINE_WRAPPED_SYSCALL(NtClose, (HANDLE handle))
 DEFINE_SYSCALL(NtCloseObjectAuditAlarm, (UNICODE_STRING *subsystem, HANDLE handle, BOOLEAN onclose))
 DEFINE_SYSCALL(NtCommitTransaction, (HANDLE transaction, BOOLEAN wait))
 DEFINE_SYSCALL(NtCompareObjects, (HANDLE first, HANDLE second))
@@ -650,7 +685,7 @@ DEFINE_WRAPPED_SYSCALL(NtContinueEx, (ARM64_NT_CONTEXT *context, KCONTINUE_ARGUM
 DEFINE_SYSCALL(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter, (ULONG flag, ULONGLONG *from, ULONGLONG *to, ULONGLONG *error))
 DEFINE_SYSCALL(NtCreateDebugObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG flags))
 DEFINE_SYSCALL(NtCreateDirectoryObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr))
-DEFINE_SYSCALL(NtCreateEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, EVENT_TYPE type, BOOLEAN state))
+DEFINE_WRAPPED_SYSCALL(NtCreateEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, EVENT_TYPE type, BOOLEAN state))
 DEFINE_SYSCALL(NtCreateFile, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size, ULONG attributes, ULONG sharing, ULONG disposition, ULONG options, void *ea_buffer, ULONG ea_length))
 DEFINE_SYSCALL(NtCreateIoCompletion, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, ULONG threads))
 DEFINE_SYSCALL(NtCreateJobObject, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
@@ -659,12 +694,12 @@ DEFINE_SYSCALL(NtCreateKeyTransacted, (HANDLE *key, ACCESS_MASK access, const OB
 DEFINE_SYSCALL(NtCreateKeyedEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, ULONG flags))
 DEFINE_SYSCALL(NtCreateLowBoxToken, (HANDLE *token_handle, HANDLE token, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, SID *sid, ULONG count, SID_AND_ATTRIBUTES *capabilities, ULONG handle_count, HANDLE *handle))
 DEFINE_SYSCALL(NtCreateMailslotFile, (HANDLE *handle, ULONG access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG options, ULONG quota, ULONG msg_size, LARGE_INTEGER *timeout))
-DEFINE_SYSCALL(NtCreateMutant, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, BOOLEAN owned))
+DEFINE_WRAPPED_SYSCALL(NtCreateMutant, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, BOOLEAN owned))
 DEFINE_SYSCALL(NtCreateNamedPipeFile, (HANDLE *handle, ULONG access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG sharing, ULONG dispo, ULONG options, ULONG pipe_type, ULONG read_mode, ULONG completion_mode, ULONG max_inst, ULONG inbound_quota, ULONG outbound_quota, LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtCreatePagingFile, (UNICODE_STRING *name, LARGE_INTEGER *min_size, LARGE_INTEGER *max_size, LARGE_INTEGER *actual_size))
 DEFINE_SYSCALL(NtCreatePort, (HANDLE *handle, OBJECT_ATTRIBUTES *attr, ULONG info_len, ULONG data_len, ULONG *reserved))
 DEFINE_SYSCALL(NtCreateProcessEx, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, HANDLE parent, ULONG flags, HANDLE section, HANDLE debug, HANDLE token, ULONG reserved))
-DEFINE_SYSCALL(NtCreateSection, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags, HANDLE file))
+DEFINE_WRAPPED_SYSCALL(NtCreateSection, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags, HANDLE file))
 DEFINE_SYSCALL(NtCreateSectionEx, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags, HANDLE file, MEM_EXTENDED_PARAMETER *parameters, ULONG count))
 DEFINE_SYSCALL(NtCreateSemaphore, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, LONG initial, LONG max))
 DEFINE_SYSCALL(NtCreateSymbolicLinkObject, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, UNICODE_STRING *target))
@@ -676,12 +711,12 @@ DEFINE_SYSCALL(NtCreateTransaction, (HANDLE *handle, ACCESS_MASK mask, OBJECT_AT
 DEFINE_SYSCALL(NtCreateUserProcess, (HANDLE *process_handle_ptr, HANDLE *thread_handle_ptr, ACCESS_MASK process_access, ACCESS_MASK thread_access, OBJECT_ATTRIBUTES *process_attr, OBJECT_ATTRIBUTES *thread_attr, ULONG process_flags, ULONG thread_flags, RTL_USER_PROCESS_PARAMETERS *params, PS_CREATE_INFO *info, PS_ATTRIBUTE_LIST *ps_attr))
 DEFINE_SYSCALL(NtDebugActiveProcess, (HANDLE process, HANDLE debug))
 DEFINE_SYSCALL(NtDebugContinue, (HANDLE handle, CLIENT_ID *client, NTSTATUS status))
-DEFINE_SYSCALL(NtDelayExecution, (BOOLEAN alertable, const LARGE_INTEGER *timeout))
+DEFINE_WRAPPED_SYSCALL(NtDelayExecution, (BOOLEAN alertable, const LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtDeleteAtom, (RTL_ATOM atom))
 DEFINE_SYSCALL(NtDeleteFile, (OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtDeleteKey, (HANDLE key))
 DEFINE_SYSCALL(NtDeleteValueKey, (HANDLE key, const UNICODE_STRING *name))
-DEFINE_SYSCALL(NtDeviceIoControlFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *io, ULONG code, void *in_buffer, ULONG in_size, void *out_buffer, ULONG out_size))
+DEFINE_WRAPPED_SYSCALL(NtDeviceIoControlFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *io, ULONG code, void *in_buffer, ULONG in_size, void *out_buffer, ULONG out_size))
 DEFINE_SYSCALL(NtDisplayString, (UNICODE_STRING *string))
 DEFINE_SYSCALL(NtDuplicateObject, (HANDLE source_process, HANDLE source, HANDLE dest_process, HANDLE *dest, ACCESS_MASK access, ULONG attributes, ULONG options))
 DEFINE_SYSCALL(NtDuplicateToken, (HANDLE token, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, BOOLEAN effective_only, TOKEN_TYPE type, HANDLE *handle))
@@ -724,7 +759,7 @@ DEFINE_SYSCALL(NtNotifyChangeDirectoryFile, (HANDLE handle, HANDLE event, PIO_AP
 DEFINE_SYSCALL(NtNotifyChangeKey, (HANDLE key, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *io, ULONG filter, BOOLEAN subtree, void *buffer, ULONG length, BOOLEAN async))
 DEFINE_SYSCALL(NtNotifyChangeMultipleKeys, (HANDLE key, ULONG count, OBJECT_ATTRIBUTES *attr, HANDLE event, PIO_APC_ROUTINE apc, void *apc_context, IO_STATUS_BLOCK *io, ULONG filter, BOOLEAN subtree, void *buffer, ULONG length, BOOLEAN async))
 DEFINE_SYSCALL(NtOpenDirectoryObject, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
-DEFINE_SYSCALL(NtOpenEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
+DEFINE_WRAPPED_SYSCALL(NtOpenEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtOpenFile, (HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr, IO_STATUS_BLOCK *io, ULONG sharing, ULONG options))
 DEFINE_SYSCALL(NtOpenIoCompletion, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtOpenJobObject, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
@@ -733,11 +768,11 @@ DEFINE_SYSCALL(NtOpenKeyEx, (HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRI
 DEFINE_SYSCALL(NtOpenKeyTransacted, (HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, HANDLE transaction))
 DEFINE_SYSCALL(NtOpenKeyTransactedEx, (HANDLE *key, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, ULONG options, HANDLE transaction))
 DEFINE_SYSCALL(NtOpenKeyedEvent, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
-DEFINE_SYSCALL(NtOpenMutant, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
+DEFINE_WRAPPED_SYSCALL(NtOpenMutant, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtOpenProcess, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const CLIENT_ID *id))
 DEFINE_SYSCALL(NtOpenProcessToken, (HANDLE process, DWORD access, HANDLE *handle))
 DEFINE_SYSCALL(NtOpenProcessTokenEx, (HANDLE process, DWORD access, DWORD attributes, HANDLE *handle))
-DEFINE_SYSCALL(NtOpenSection, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
+DEFINE_WRAPPED_SYSCALL(NtOpenSection, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtOpenSemaphore, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtOpenSymbolicLinkObject, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr))
 DEFINE_SYSCALL(NtOpenThread, (HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr, const CLIENT_ID *id))
@@ -795,7 +830,7 @@ DEFINE_SYSCALL(NtReadRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG id
 DEFINE_SYSCALL(NtReadVirtualMemory, (HANDLE process, const void *addr, void *buffer, SIZE_T size, SIZE_T *bytes_read))
 DEFINE_SYSCALL(NtRegisterThreadTerminatePort, (HANDLE handle))
 DEFINE_SYSCALL(NtReleaseKeyedEvent, (HANDLE handle, const void *key, BOOLEAN alertable, const LARGE_INTEGER *timeout))
-DEFINE_SYSCALL(NtReleaseMutant, (HANDLE handle, LONG *prev_count))
+DEFINE_WRAPPED_SYSCALL(NtReleaseMutant, (HANDLE handle, LONG *prev_count))
 DEFINE_SYSCALL(NtReleaseSemaphore, (HANDLE handle, ULONG count, ULONG *previous))
 DEFINE_SYSCALL(NtRemoveIoCompletion, (HANDLE handle, ULONG_PTR *key, ULONG_PTR *value, IO_STATUS_BLOCK *io, LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtRemoveIoCompletionEx, (HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count, ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable))
@@ -819,7 +854,7 @@ DEFINE_SYSCALL(NtSetDebugFilterState, (ULONG component_id, ULONG level, BOOLEAN 
 DEFINE_SYSCALL(NtSetDefaultLocale, (BOOLEAN user, LCID lcid))
 DEFINE_SYSCALL(NtSetDefaultUILanguage, (LANGID lang))
 DEFINE_SYSCALL(NtSetEaFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length))
-DEFINE_SYSCALL(NtSetEvent, (HANDLE handle, LONG *prev_state))
+DEFINE_WRAPPED_SYSCALL(NtSetEvent, (HANDLE handle, LONG *prev_state))
 DEFINE_SYSCALL(NtSetEventBoostPriority, (HANDLE handle))
 DEFINE_SYSCALL(NtSetInformationDebugObject, (HANDLE handle, DEBUGOBJECTINFOCLASS class, void *info, ULONG len, ULONG *ret_len))
 DEFINE_SYSCALL(NtSetInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *ptr, ULONG len, FILE_INFORMATION_CLASS class))
@@ -859,18 +894,18 @@ DEFINE_SYSCALL(NtUnlockFile, (HANDLE handle, IO_STATUS_BLOCK *io_status, LARGE_I
 DEFINE_SYSCALL(NtUnlockVirtualMemory, (HANDLE process, PVOID *addr, SIZE_T *size, ULONG unknown))
 DEFINE_WRAPPED_SYSCALL(NtUnmapViewOfSection, (HANDLE process, PVOID addr))
 DEFINE_WRAPPED_SYSCALL(NtUnmapViewOfSectionEx, (HANDLE process, PVOID addr, ULONG flags))
-DEFINE_SYSCALL(NtWaitForAlertByThreadId, (const void *address, const LARGE_INTEGER *timeout))
+DEFINE_WRAPPED_SYSCALL(NtWaitForAlertByThreadId, (const void *address, const LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtWaitForDebugEvent, (HANDLE handle, BOOLEAN alertable, LARGE_INTEGER *timeout, DBGUI_WAIT_STATE_CHANGE *state))
 DEFINE_SYSCALL(NtWaitForKeyedEvent, (HANDLE handle, const void *key, BOOLEAN alertable, const LARGE_INTEGER *timeout))
-DEFINE_SYSCALL(NtWaitForMultipleObjects, (DWORD count, const HANDLE *handles, WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout))
+DEFINE_WRAPPED_SYSCALL(NtWaitForMultipleObjects, (DWORD count, const HANDLE *handles, WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtWaitForMultipleObjects32, (ULONG count, LONG *handles, WAIT_TYPE type, BOOLEAN alertable, const LARGE_INTEGER *timeout))
-DEFINE_SYSCALL(NtWaitForSingleObject, (HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout))
+DEFINE_WRAPPED_SYSCALL(NtWaitForSingleObject, (HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout))
 DEFINE_SYSCALL(NtWorkerFactoryWorkerReady, (HANDLE handle))
 DEFINE_SYSCALL(NtWriteFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, const void *buffer, ULONG length, LARGE_INTEGER *offset, ULONG *key))
 DEFINE_SYSCALL(NtWriteFileGather, (HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key))
 DEFINE_SYSCALL(NtWriteRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG id, void *buffer, ULONG len, ULONG *retlen))
 DEFINE_SYSCALL(NtWriteVirtualMemory, (HANDLE process, void *addr, const void *buffer, SIZE_T size, SIZE_T *bytes_written))
-DEFINE_SYSCALL(NtYieldExecution, (void))
+DEFINE_WRAPPED_SYSCALL(NtYieldExecution, (void))
 
 NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                               SIZE_T *size_ptr, ULONG type, ULONG protect )
@@ -892,6 +927,22 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualAlloc,
                                                       *ret, *size_ptr, 3, type, protect, status );
     else if (pNotifyMemoryAlloc) pNotifyMemoryAlloc( *ret, *size_ptr, type, protect, TRUE, status );
+
+    /* ml387 probe: each new guest thread costs 2x128MB of un-named
+     * reserve-only VA ([guest-reserve] census) and the guest band hit 38MB
+     * free. Name the owner: ret= is the PE caller for wine/FEX-PE callers or
+     * the FEX syscall stub for guest x86 callers; ZERO hits while the unix
+     * census still grows means the reserves are FEX host-side (unixlib). */
+    if (is_current && !status && (type & MEM_RESERVE) && !(type & MEM_COMMIT) && *size_ptr >= 0x4000000)
+    {
+        static ULONG big_n;
+        if (big_n < 24)
+        {
+            big_n++;
+            ERR( "[big-reserve] addr=%p size=%Ix type=%lx prot=%lx ret=%p\n",
+                 *ret, *size_ptr, type, protect, __builtin_return_address(0) );
+        }
+    }
 
     leave_syscall_callback();
     return status;
@@ -953,6 +1004,360 @@ NTSTATUS SYSCALL_API NtFlushInstructionCache( HANDLE process, const void *addr, 
     return status;
 }
 
+NTSTATUS SYSCALL_API NtDeviceIoControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc,
+                                            void *apc_context, IO_STATUS_BLOCK *io, ULONG code,
+                                            void *in_buffer, ULONG in_size, void *out_buffer,
+                                            ULONG out_size )
+{
+    /* ml388 (task #66): three runs died writing the IO_STATUS_BLOCK from the
+     * unix side of THIS syscall — NULL (ml385: server_ioctl_file `stp` through
+     * x9=0), pool-band garbage (ml386), and misaligned 0x7200000103 (ml388:
+     * set_async_direct_result <- sock_send, a BUS not a SEGV, which is what
+     * gives the family away: the pointer is not merely unmapped, it is
+     * MALFORMED). wine writes into it unconditionally (set_sync_iosb), so a
+     * malformed one is an unrecoverable native fault mid-pseudo-process.
+     *
+     * Reject cheaply — this is the hot socket path (every AFD send/recv), so
+     * NO SEH probe and no NtQueryVirtualMemory here: an IO_STATUS_BLOCK is
+     * pointer-aligned by contract, and both observed bad values fail that in
+     * one AND. Returning a status keeps the pseudo-process alive and the
+     * [iosb-guard] line names the caller so the corruption source can be
+     * chased offline. */
+    if (!io || ((ULONG_PTR)io & (sizeof(void *) - 1)) || (ULONG_PTR)io >= 0x8000000000ull)
+    {
+        static ULONG bogus_n;
+        if (bogus_n < 16)
+        {
+            bogus_n++;
+            ERR( "[iosb-guard] #%lu MALFORMED iosb %p (handle=%p code=%lx in=%p/%lu out=%p/%lu "
+                 "ret=%p) — failing the call instead of faulting unix-side\n",
+                 bogus_n, io, handle, code, in_buffer, in_size, out_buffer, out_size,
+                 __builtin_return_address(0) );
+        }
+        return STATUS_ACCESS_VIOLATION;
+    }
+    return syscall_NtDeviceIoControlFile( handle, event, apc, apc_context, io, code,
+                                          in_buffer, in_size, out_buffer, out_size );
+}
+
+/* ml392 (task #60): SteamChrome named-object sniffer.  Section sharing is
+ * fixed ([sec-test] MATCH) yet the webhelper-init hello still never reaches
+ * CSteamUISharedJSController.  The handshake objects are known by name
+ * (SteamChrome_MasterStream_spid%u / _Event_spid%u / _mutex / ClientStream);
+ * log every create/open touching them, with result status, so the next run
+ * maps the topology: who created what, whose open failed, where the chain
+ * stops.  Substring match over a non-terminated UNICODE_STRING. */
+static BOOL ios_name_is_steamchrome( const OBJECT_ATTRIBUTES *attr )
+{
+    const WCHAR *p;
+    static const WCHAR key[] = {'S','t','e','a','m','C','h','r','o','m','e'};
+    ULONG i, n;
+
+    if (!attr || !attr->ObjectName || !attr->ObjectName->Buffer) return FALSE;
+    p = attr->ObjectName->Buffer;
+    n = attr->ObjectName->Length / sizeof(WCHAR);
+    if (n < ARRAY_SIZE(key)) return FALSE;
+    for (i = 0; i + ARRAY_SIZE(key) <= n; i++)
+        if (!memcmp( p + i, key, sizeof(key) )) return TRUE;
+    return FALSE;
+}
+
+/* ml394: data-plane tracking.  Creates/opens all succeed and steam retries
+ * its client-connect 4x — the break is now in the signal/wait/read ping-pong.
+ * Track SteamChrome handles at create/open, then log Set/Wait/Release/Close
+ * ops on them (rate-limited).  Table is per-process (EC ntdll data is a
+ * per-pseudo-process copy); races with the probe are tolerable. */
+#define IOS_CHROME_HANDLES 64
+static struct { HANDLE h; void *view; char tag[40]; } ios_chrome_handles[IOS_CHROME_HANDLES];
+static LONG ios_chrome_handle_count;
+
+static void ios_chrome_track( HANDLE h, const OBJECT_ATTRIBUTES *attr )
+{
+    int i, j, n;
+    const WCHAR *p;
+    LONG idx;
+
+    if (!h) return;
+    p = attr->ObjectName->Buffer;
+    n = attr->ObjectName->Length / sizeof(WCHAR);
+    for (i = 0; i < ios_chrome_handle_count && i < IOS_CHROME_HANDLES; i++)
+        if (ios_chrome_handles[i].h == h) break;
+    if (i >= IOS_CHROME_HANDLES) return;
+    if (i == ios_chrome_handle_count)
+    {
+        idx = InterlockedIncrement( &ios_chrome_handle_count ) - 1;
+        if (idx >= IOS_CHROME_HANDLES) return;
+        i = idx;
+    }
+    /* keep the tail of the name (the distinctive part), narrowed */
+    j = n > 38 ? n - 38 : 0;
+    for (n = 0; j + n < (int)(attr->ObjectName->Length / sizeof(WCHAR)) && n < 38; n++)
+        ios_chrome_handles[i].tag[n] = (char)p[j + n];
+    ios_chrome_handles[i].tag[n] = 0;
+    ios_chrome_handles[i].h = h;
+}
+
+static const char *ios_chrome_lookup( HANDLE h )
+{
+    int i;
+    if (!ios_chrome_handle_count) return NULL;
+    for (i = 0; i < ios_chrome_handle_count && i < IOS_CHROME_HANDLES; i++)
+        if (ios_chrome_handles[i].h == h) return ios_chrome_handles[i].tag;
+    return NULL;
+}
+
+/* ml398 (task #60, last hop): pump wakes on MasterStream_Event but never
+ * replies and never re-waits.  Leading hypothesis: steam's hello write into
+ * the master _mem never becomes visible through webhelper's view (the one
+ * sharing direction [sec-test] never exercised).  Record where each tracked
+ * SteamChrome section gets mapped, then hex-dump the first 64 bytes of every
+ * "_mem" view at the three decisive moments: steam SetEvent(_written)
+ * [what steam wrote], pump Wait1(Stream_Event)==0 [what webhelper sees],
+ * steam Wait1(_written)==0x102 [is the hello still there at timeout].
+ * Reads go through NtReadVirtualMemory so a stale view can't fault the
+ * observed thread. */
+static void ios_chrome_set_view( HANDLE h, void *base )
+{
+    int i;
+    for (i = 0; i < ios_chrome_handle_count && i < IOS_CHROME_HANDLES; i++)
+        if (ios_chrome_handles[i].h == h)
+        {
+            ios_chrome_handles[i].view = base;
+            ERR( "[chrome-ipc] MapView %s base=%p\n", ios_chrome_handles[i].tag, base );
+            return;
+        }
+}
+
+static void ios_chrome_clear_view( void *base )
+{
+    int i;
+    if (!base || !ios_chrome_handle_count) return;
+    for (i = 0; i < ios_chrome_handle_count && i < IOS_CHROME_HANDLES; i++)
+        if (ios_chrome_handles[i].view == base)
+        {
+            ERR( "[chrome-ipc] Unmap %s base=%p\n", ios_chrome_handles[i].tag, base );
+            ios_chrome_handles[i].view = NULL;
+        }
+}
+
+static const char *ios_strstr( const char *s, const char *sub )
+{
+    int i, j;
+    for (i = 0; s[i]; i++)
+    {
+        for (j = 0; sub[j] && s[i + j] == sub[j]; j++) ;
+        if (!sub[j]) return s + i;
+    }
+    return NULL;
+}
+
+static void ios_chrome_dump_views( const char *when )
+{
+    int i;
+    static LONG dumps;
+    if (dumps >= 64) return;
+    for (i = 0; i < ios_chrome_handle_count && i < IOS_CHROME_HANDLES; i++)
+    {
+        ULONGLONG buf[8] = { 0 };
+        SIZE_T got = 0;
+        NTSTATUS st;
+        if (!ios_chrome_handles[i].h || !ios_chrome_handles[i].view) continue;
+        if (!ios_strstr( ios_chrome_handles[i].tag, "_mem" )) continue;
+        if (InterlockedIncrement( &dumps ) > 64) return;
+        st = NtReadVirtualMemory( GetCurrentProcess(), ios_chrome_handles[i].view, buf, sizeof(buf), &got );
+        ERR( "[chrome-mem] %s %s @%p st=%lx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+             when, ios_chrome_handles[i].tag, ios_chrome_handles[i].view, (ULONG)st,
+             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7] );
+    }
+}
+
+#define SNIFF_STEAMCHROME(op, attr, status, handle_ptr) \
+    do { if (ios_name_is_steamchrome( attr )) { \
+        ERR( "[chrome-ipc] %s %s -> status=%lx handle=%p\n", op, \
+             debugstr_us( (attr)->ObjectName ), (ULONG)(status), \
+             (handle_ptr) ? *(handle_ptr) : NULL ); \
+        if (!(status & 0x80000000) && (handle_ptr)) ios_chrome_track( *(handle_ptr), attr ); \
+    } } while (0)
+
+NTSTATUS SYSCALL_API NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                    EVENT_TYPE type, BOOLEAN state )
+{
+    NTSTATUS status = syscall_NtCreateEvent( handle, access, attr, type, state );
+    SNIFF_STEAMCHROME( "CreateEvent", attr, status, handle );
+    /* ml399: the server thread stalled BEFORE its first park (last line =
+     * this very CreateEvent), so the pump-wake beacon never armed.  Stamp the
+     * CREATOR of the master event (status 0 = created, not opened-existing)
+     * so [pump-sample] covers it from birth. */
+    if (status == 0 && handle)
+    {
+        const char *tag = ios_chrome_lookup( *handle );
+        if (tag && ios_strstr( tag, "Stream_Event" ))
+        {
+            NtCurrentTeb()->Instrumentation[10] = (void *)(ULONG_PTR)0x504d5550; /* 'PUMP' */
+            ERR( "[pump-op] beacon armed on creator of %s\n", tag );
+        }
+    }
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtOpenEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
+{
+    NTSTATUS status = syscall_NtOpenEvent( handle, access, attr );
+    SNIFF_STEAMCHROME( "OpenEvent", attr, status, handle );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtCreateMutant( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                     BOOLEAN owned )
+{
+    NTSTATUS status = syscall_NtCreateMutant( handle, access, attr, owned );
+    SNIFF_STEAMCHROME( "CreateMutant", attr, status, handle );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtOpenMutant( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
+{
+    NTSTATUS status = syscall_NtOpenMutant( handle, access, attr );
+    SNIFF_STEAMCHROME( "OpenMutant", attr, status, handle );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtCreateSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr,
+                                      const LARGE_INTEGER *size, ULONG protect, ULONG sec_flags,
+                                      HANDLE file )
+{
+    NTSTATUS status = syscall_NtCreateSection( handle, access, attr, size, protect, sec_flags, file );
+    SNIFF_STEAMCHROME( "CreateSection", attr, status, handle );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtOpenSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_ATTRIBUTES *attr )
+{
+    NTSTATUS status = syscall_NtOpenSection( handle, access, attr );
+    SNIFF_STEAMCHROME( "OpenSection", attr, status, handle );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtSetEvent( HANDLE handle, LONG *prev_state )
+{
+    NTSTATUS status = syscall_NtSetEvent( handle, prev_state );
+    const char *tag = ios_chrome_lookup( handle );
+    static LONG n;
+    if (tag && n < 200) { InterlockedIncrement( &n );
+        ERR( "[chrome-ipc] SetEvent %s -> %lx\n", tag, (ULONG)status ); }
+    if (tag && ios_strstr( tag, "_written" )) ios_chrome_dump_views( "set-written" );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtReleaseMutant( HANDLE handle, LONG *prev_count )
+{
+    NTSTATUS status = syscall_NtReleaseMutant( handle, prev_count );
+    const char *tag = ios_chrome_lookup( handle );
+    static LONG n;
+    if (tag && n < 200) { InterlockedIncrement( &n );
+        ERR( "[chrome-ipc] ReleaseMutant %s -> %lx\n", tag, (ULONG)status ); }
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const LARGE_INTEGER *timeout )
+{
+    const char *tag = ios_chrome_lookup( handle );
+    NTSTATUS status;
+    static LONG n;
+    if (tag && n < 200) { InterlockedIncrement( &n );
+        ERR( "[chrome-ipc] Wait1 %s timeout=%s...\n", tag,
+             timeout ? wine_dbgstr_longlong( timeout->QuadPart ) : "INF" ); }
+    status = syscall_NtWaitForSingleObject( handle, alertable, timeout );
+    if (tag && n < 200) { InterlockedIncrement( &n );
+        ERR( "[chrome-ipc] Wait1 %s -> %lx\n", tag, (ULONG)status ); }
+    if (tag && status == STATUS_SUCCESS && ios_strstr( tag, "Stream_Event" ))
+    {
+        ios_chrome_dump_views( "pump-wake" );
+        /* ml398: beacon for the unix-side [pump-sample] Mach sampler — the
+         * pump goes silent after this wake; mark its TEB so the census thread
+         * can sample pc/run-state and settle spin vs blocked vs dead. */
+        NtCurrentTeb()->Instrumentation[10] = (void *)(ULONG_PTR)0x504d5550; /* 'PUMP' */
+    }
+    if (tag && status == STATUS_TIMEOUT && ios_strstr( tag, "_written" ))
+        ios_chrome_dump_views( "timeout" );
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WAIT_TYPE type,
+                                               BOOLEAN alertable, const LARGE_INTEGER *timeout )
+{
+    NTSTATUS status;
+    DWORD i;
+    int tracked = -1;
+    static LONG n;
+    if (ios_chrome_handle_count && handles)
+        for (i = 0; i < count && i < 64; i++)
+            if (ios_chrome_lookup( handles[i] )) { tracked = i; break; }
+    if (tracked >= 0 && n < 200) { InterlockedIncrement( &n );
+        ERR( "[chrome-ipc] WaitN count=%lu [%d]=%s timeout=%s...\n", (ULONG)count, tracked,
+             ios_chrome_lookup( handles[tracked] ),
+             timeout ? wine_dbgstr_longlong( timeout->QuadPart ) : "INF" ); }
+    status = syscall_NtWaitForMultipleObjects( count, handles, type, alertable, timeout );
+    if (tracked >= 0 && n < 200) { InterlockedIncrement( &n );
+        ERR( "[chrome-ipc] WaitN [%d]=%s -> %lx\n", tracked,
+             ios_chrome_lookup( handles[tracked] ), (ULONG)status ); }
+    return status;
+}
+
+/* ml398: once the pump beacon is set, log the wait-family syscalls our
+ * handle-tag sniffing can't see (critical sections block in
+ * NtWaitForAlertByThreadId; sleeps and yields have no handle at all).  If the
+ * silent pump lands in one of these, the log names the blocker. */
+#define IOS_PUMP_MARKED() (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550)
+
+NTSTATUS SYSCALL_API NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
+{
+    NTSTATUS status;
+    static LONG n;
+    BOOL marked = IOS_PUMP_MARKED();
+    if (marked && n < 40) { InterlockedIncrement( &n );
+        ERR( "[pump-op] WaitForAlertByThreadId addr=%p timeout=%s...\n", address,
+             timeout ? wine_dbgstr_longlong( timeout->QuadPart ) : "INF" ); }
+    status = syscall_NtWaitForAlertByThreadId( address, timeout );
+    if (marked && n < 40) { InterlockedIncrement( &n );
+        ERR( "[pump-op] WaitForAlertByThreadId -> %lx\n", (ULONG)status ); }
+    return status;
+}
+
+NTSTATUS SYSCALL_API NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
+{
+    static LONG n;
+    if (IOS_PUMP_MARKED() && n < 40) { InterlockedIncrement( &n );
+        ERR( "[pump-op] DelayExecution timeout=%s\n",
+             timeout ? wine_dbgstr_longlong( timeout->QuadPart ) : "INF" ); }
+    return syscall_NtDelayExecution( alertable, timeout );
+}
+
+NTSTATUS SYSCALL_API NtYieldExecution(void)
+{
+    static LONG n;
+    if (IOS_PUMP_MARKED() && n < 40) { InterlockedIncrement( &n );
+        ERR( "[pump-op] YieldExecution\n" ); }
+    return syscall_NtYieldExecution();
+}
+
+NTSTATUS SYSCALL_API NtClose( HANDLE handle )
+{
+    if (ios_chrome_handle_count)
+    {
+        int i;
+        for (i = 0; i < ios_chrome_handle_count && i < IOS_CHROME_HANDLES; i++)
+            if (ios_chrome_handles[i].h == handle)
+            {
+                ERR( "[chrome-ipc] Close %s\n", ios_chrome_handles[i].tag );
+                ios_chrome_handles[i].h = NULL;
+                ios_chrome_handles[i].view = NULL;
+                break;
+            }
+    }
+    return syscall_NtClose( handle );
+}
+
 NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr, ULONG type )
 {
     BOOL is_current = RtlIsCurrentProcess( process );
@@ -970,6 +1375,41 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualFree,
                                                       *addr_ptr, *size_ptr, 2, type, status );
     else if (pNotifyMemoryFree) pNotifyMemoryFree( *addr_ptr, *size_ptr, type, TRUE, status );
+
+    /* ml386 probe (task #57): same-region free livelock — CEF calls
+     * NtFreeVirtualMemory on ONE 64KB range thousands of times while making no
+     * progress (ml364: 5,901x; ml386: 1,787+ and climbing). Discriminate the
+     * two possible drivers in one run: (a) our free silently fails (region
+     * still committed/reserved after SUCCESS → the caller's retry is sane), or
+     * (b) the free works and the caller loops for its own reasons (→ map the
+     * host return address to a guest RIP offline via the JIT dump). */
+    if (is_current)
+    {
+        static void *loop_addr;
+        static ULONG loop_type, loop_n, loop_prints;
+        if (*addr_ptr == loop_addr && type == loop_type)
+        {
+            loop_n++;
+            if (loop_prints < 16 && (loop_n == 8 || (loop_n & 0x3ff) == 0))
+            {
+                MEMORY_BASIC_INFORMATION mbi = { 0 };
+                SIZE_T got = 0;
+                NtQueryVirtualMemory( NtCurrentProcess(), *addr_ptr, MemoryBasicInformation,
+                                      &mbi, sizeof(mbi), &got );
+                loop_prints++;
+                ERR( "[free-loop] addr=%p size=%Ix type=%lx status=%lx repeats=%lu ret=%p | "
+                     "after: state=%lx protect=%lx region=%p+%Ix\n",
+                     *addr_ptr, *size_ptr, type, status, loop_n, __builtin_return_address(0),
+                     mbi.State, mbi.Protect, mbi.BaseAddress, mbi.RegionSize );
+            }
+        }
+        else
+        {
+            loop_addr = *addr_ptr;
+            loop_type = type;
+            loop_n = 1;
+        }
+    }
 
     leave_syscall_callback();
     return status;
@@ -1083,6 +1523,8 @@ NTSTATUS SYSCALL_API NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *a
     NTSTATUS status = syscall_NtMapViewOfSection( handle, process, addr_ptr, zero_bits, commit_size,
                                                   offset, size_ptr, inherit, alloc_type, protect );
 
+    if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && ios_chrome_lookup( handle ))
+        ios_chrome_set_view( handle, *addr_ptr );
     if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
     {
         notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
@@ -1098,6 +1540,8 @@ NTSTATUS SYSCALL_API NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID 
     NTSTATUS status = syscall_NtMapViewOfSectionEx( handle, process, addr_ptr, offset, size_ptr,
                                                     alloc_type, protect, parameters, count );
 
+    if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && ios_chrome_lookup( handle ))
+        ios_chrome_set_view( handle, *addr_ptr );
     if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
     {
         notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
@@ -1314,6 +1758,7 @@ NTSTATUS SYSCALL_API NtUnmapViewOfSection( HANDLE process, void *addr )
     BOOL is_current = RtlIsCurrentProcess( process );
     NTSTATUS status;
 
+    if (is_current) ios_chrome_clear_view( addr );
     if (is_current && pNotifyUnmapViewOfSection && enter_syscall_callback())
     {
         ios_log_unmap( addr );
@@ -1331,6 +1776,7 @@ NTSTATUS SYSCALL_API NtUnmapViewOfSectionEx( HANDLE process, void *addr, ULONG f
     BOOL is_current = RtlIsCurrentProcess( process );
     NTSTATUS status;
 
+    if (is_current) ios_chrome_clear_view( addr );
     if (is_current && pNotifyUnmapViewOfSection && enter_syscall_callback())
     {
         ios_log_unmap( addr );
@@ -1623,6 +2069,17 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     ULONG_PTR frame;
     DWORD res;
 
+    /* iOS-Mythic ml409 (#66): third bracket point — see [ki-path]. If Rsp is
+     * already corrupt here but was clean at [veh], the vectored handlers (or
+     * the emulator trip that ran them) are the corruptor. AV-only, capped. */
+    if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+    {
+        static LONG sehent_n;
+        if (sehent_n < 60 && InterlockedIncrement( &sehent_n ) <= 60)
+            ERR( "[seh-entry] ctx=%p Rsp=%p Rip=%p\n", orig_context,
+                 (void *)(ULONG_PTR)orig_context->Rsp, (void *)(ULONG_PTR)orig_context->Rip );
+    }
+
     /* iOS-Mythic 2026-07-04: [SEH_RATE] — the render worker burns ~75% of
      * its frame in virtual_unwind/RtlVirtualUnwind2/memset below this
      * function (PROF), yet nothing logs: these are HANDLED exceptions
@@ -1872,7 +2329,43 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
                          trace_n - shown + k, trace_pc[idx], trace_frame[idx] );
                 }
             }
-            rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+            /* ml377: a FIRST-STEP bad frame is an UNHANDLED exception, not a corrupt
+             * stack — do not set EXCEPTION_STACK_INVALID for it.
+             *
+             * Same reasoning as the ml266 ControlPc==0 fix directly above, and the same
+             * measured consequence: EXCEPTION_STACK_INVALID makes NtRaiseException print
+             * "Exception frame is not in stack limits" and IMMEDIATELY NtTerminateProcess,
+             * which short-circuits second chance — so Chromium's own
+             * SetUnhandledExceptionFilter never runs and the WHOLE APP dies, not just the
+             * offending pseudo-process.
+             *
+             * ml377 measured exactly that: the guest context handed to us was already
+             * bogus (Rip=0x7c861802f1, inside FEX's HOST band, and a truncated
+             * Rsp=0x1db59fba0 whose true value 0x71db59fba0 is in the TEB stack), so step
+             * #0 produced an unusable frame. A guest that jumped to a garbage RIP has no
+             * caller — that is an ordinary unhandled exception. Deep CEF work (profile /
+             * extensions / GAIA sign-in) was lost to a process kill here.
+             *
+             * Keep EXCEPTION_STACK_INVALID for what it is meant to describe: a walk that
+             * PROGRESSED and then degenerated (trace_n > 1). */
+            if (trace_n > 1) rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+            else
+            {
+                ERR( "[unwind-why] first-step bad frame — guest context was already bogus\n" );
+                /* ml395 (task #60/#66): a bogus-context thread has no recoverable
+                 * caller and no useful SEH — but letting it run the unhandled path
+                 * kills the whole PSEUDO-PROCESS (ml395: webhelper died c0000005 in
+                 * exactly this state moments after parking its chrome-ipc server;
+                 * steam's IPC poller died the same way).  Terminate ONLY this
+                 * thread: its work is lost either way, and the process — with the
+                 * handshake threads we need alive — survives.  Known cost: any
+                 * locks the thread held stay taken (ml389-class convoy risk) —
+                 * still strictly better than process death. */
+                ERR( "[bogus-ctx] terminating THREAD only (code=%lx) — process survives\n",
+                     rec->ExceptionCode );
+                NtTerminateThread( NtCurrentThread(), rec->ExceptionCode );
+                /* not reached */
+            }
             break;
         }
 
@@ -2112,9 +2605,32 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                  (void *)(ULONG_PTR)arm_ctx->Pc );
     }
     /* call x64 dispatcher if the thunk or the function pointer was modified */
-    if (pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
-                                             sizeof(KiUserExceptionDispatcher_orig) ))
-        return KiUserExceptionDispatcher_thunk;
+    /* iOS-Mythic ml409 (#66): the fatal [bogus-ctx] walks a context whose Rsp
+     * high dword became exactly 1 and whose Rip/Rbp/R12 turned into FEX-band
+     * host pointers with recurring low bits, while [rtcs] post had printed the
+     * SAME context fields correct moments earlier. The corruption window is
+     * prepare-return → call_seh_handlers, which contains exactly two guest
+     * re-entry points: the patched-thunk redirect below, and the vectored
+     * handlers in dispatch_exception. Bracket it: name the path taken here,
+     * and log the context around each guest handler (exception.c [veh],
+     * call_seh_handlers [seh-entry]). Capped, AV-only. */
+    {
+        int patched = memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
+                              sizeof(KiUserExceptionDispatcher_orig) ) != 0;
+        if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+        {
+            static LONG kipath_n;
+            if (kipath_n < 60 && InterlockedIncrement( &kipath_n ) <= 60)
+                ERR( "[ki-path] code=%08x ctx=%p Rsp=%p Rip=%p -> %s (patched=%d wow64=%p)\n",
+                     (unsigned int)rec->ExceptionCode, context,
+                     (void *)(ULONG_PTR)context->AMD64_Context.Rsp,
+                     (void *)(ULONG_PTR)context->AMD64_Context.Rip,
+                     (pWow64PrepareForException || patched) ? "x64-THUNK (guest hook runs)" : "direct dispatch",
+                     patched, pWow64PrepareForException );
+        }
+        if (pWow64PrepareForException || patched)
+            return KiUserExceptionDispatcher_thunk;
+    }
     return NULL;
 }
 

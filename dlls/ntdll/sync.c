@@ -511,6 +511,50 @@ void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
  *  nested calls from the same thread. "Upgrading" a shared access lock
  *  to an exclusive access lock also doesn't seem to be supported.
  */
+/* iOS-Mythic ml410 (#66→#60): SRWLOCKs are anonymous — when the chrome_ipc
+ * pump parks forever on a lock's `owners` field there is no owner to read.
+ * Keep a ring of the last 512 acquire/release events {lock, tid, mode} so the
+ * parked waiter can name the holder: the newest unmatched acquire for that
+ * lock address is the thread that never released (or died holding shared —
+ * the #66 crash-orphaned-count theory). Ring writes are two plain stores +
+ * one interlocked increment; no logging on the hot path. */
+struct ios_srw_ring_ent { const void *lock; ULONG tid_mode; };
+static struct ios_srw_ring_ent ios_srw_ring[512];
+static LONG ios_srw_ring_idx;
+static const char * const ios_srw_mode_name[4] = { "acqX", "relX", "acqS", "relS" };
+static void ios_srw_note( const void *lock, unsigned int mode )
+{
+    ULONG i = (ULONG)InterlockedIncrement( &ios_srw_ring_idx );
+    ios_srw_ring[i & 511].lock = lock;
+    ios_srw_ring[i & 511].tid_mode =
+        (HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) << 2) | mode;
+}
+
+/* Called from RtlWaitOnAddress when a beacon thread parks on a size-2 wait
+ * (the SRW exclusive path waits on `owners`, size 2, at lock+2). Dump the
+ * lock word (exclusive vs leaked-shared verdict) and the ring history for
+ * this lock (holder's tid). */
+static void ios_srw_dump_park( const void *addr )
+{
+    const struct srw_lock *s = (const struct srw_lock *)((const char *)addr - 2);
+    ULONG i = (ULONG)ios_srw_ring_idx;
+    ULONG n, printed = 0;
+    static LONG dumps;
+
+    if (dumps >= 8 || InterlockedIncrement( &dumps ) > 8) return;
+    ERR( "[srw] parked on lock=%p exclusive_waiters=%04x owners=%u (owners>1 = shared-held/leaked)\n",
+         s, (unsigned short)s->exclusive_waiters, s->owners );
+    for (n = 0; n < 512 && printed < 16; n++)
+    {
+        const struct ios_srw_ring_ent *e = &ios_srw_ring[(i - n) & 511];
+        if (e->lock != (const void *)s) continue;
+        ERR( "[srw]   ring[-%03u] tid=%04x %s\n", n,
+             e->tid_mode >> 2, ios_srw_mode_name[e->tid_mode & 3] );
+        printed++;
+    }
+    if (!printed) ERR( "[srw]   ring has NO events for this lock (acquired before ring wrapped)\n" );
+}
+
 void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
 {
     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
@@ -541,7 +585,11 @@ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
             }
         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
-        if (!wait) return;
+        if (!wait)
+        {
+            ios_srw_note( lock, 0 );
+            return;
+        }
         RtlWaitOnAddress( &u.s->owners, &new.s.owners, sizeof(short), NULL );
     }
 }
@@ -580,7 +628,11 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
             }
         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
-        if (!wait) return;
+        if (!wait)
+        {
+            ios_srw_note( lock, 2 );
+            return;
+        }
         RtlWaitOnAddress( u.s, &new.s, sizeof(struct srw_lock), NULL );
     }
 }
@@ -604,6 +656,7 @@ void WINAPI RtlReleaseSRWLockExclusive( RTL_SRWLOCK *lock )
         new.s.exclusive_waiters &= ~1;
     } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
+    ios_srw_note( lock, 1 );
     if (new.s.exclusive_waiters)
         RtlWakeAddressSingle( &u.s->owners );
     else
@@ -629,6 +682,7 @@ void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
         --new.s.owners;
     } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
+    ios_srw_note( lock, 3 );
     if (!new.s.owners)
         RtlWakeAddressSingle( &u.s->owners );
 }
@@ -664,6 +718,7 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
         }
     } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
+    if (ret) ios_srw_note( lock, 0 );
     return ret;
 }
 
@@ -694,6 +749,7 @@ BOOLEAN WINAPI RtlTryAcquireSRWLockShared( RTL_SRWLOCK *lock )
         }
     } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
 
+    if (ret) ios_srw_note( lock, 2 );
     return ret;
 }
 
@@ -837,6 +893,29 @@ struct futex_queue
 
 static struct futex_queue futex_queues[256];
 
+/* iOS-Mythic ml407 (task #60): the chrome_ipc pump parks in RtlWaitOnAddress
+ * immediately after its master-event wake and is never alerted ([alert-unix]:
+ * one WAIT, no ALERTED, while its sibling server thread cycles normally).
+ * futex_queues is a PER-NTDLL-COPY global and our pseudo-processes each carry
+ * their own ntdll copy (native aarch64 AND EC copies coexist), so a waker
+ * running against a different copy walks a different array and never sees the
+ * waiter.  Record the marked thread's wait address + queue, then log any wake
+ * aimed at that address plus the copy identity (&futex_queues) of both sides:
+ *   wake logged with a DIFFERENT base  => copy-mismatch lost wake (fix: share the queue)
+ *   no wake for the address at all     => the signaller never ran (different bug) */
+static const void *ios_pump_wait_addr;
+static const void *ios_pump_wait_queue;
+
+static void ios_futex_note_wake( const char *how, const void *addr, const void *queue, int found )
+{
+    static LONG n;
+    if (addr != ios_pump_wait_addr || !ios_pump_wait_addr) return;
+    if (n >= 40) return;
+    InterlockedIncrement( &n );
+    ERR( "[futex] WAKE-%s addr=%p queue=%p base=%p found=%d (waiter queue=%p)\n",
+         how, addr, queue, futex_queues, found, ios_pump_wait_queue );
+}
+
 static struct futex_queue *get_futex_queue( const void *addr )
 {
     ULONG_PTR val = (ULONG_PTR)addr;
@@ -906,7 +985,30 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     spin_unlock( &queue->lock );
 
+    if (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550)
+    {
+        static LONG n;
+        ios_pump_wait_addr = addr;
+        ios_pump_wait_queue = queue;
+        if (n < 40) { InterlockedIncrement( &n );
+            ERR( "[futex] WAIT tid=%04x addr=%p size=%Iu queue=%p base=%p timeout=%s\n",
+                 (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, addr, size, queue,
+                 futex_queues, timeout ? "fin" : "INF" ); }
+        /* ml410: a size-2 wait from a beacon is the SRW exclusive path parked
+         * on `owners` — dump the lock word + acquire/release ring history so
+         * the holder that never releases is NAMED (see ios_srw_dump_park). */
+        if (size == 2 && !timeout) ios_srw_dump_park( addr );
+    }
+
     ret = NtWaitForAlertByThreadId( NULL, timeout );
+
+    if (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550)
+    {
+        static LONG n;
+        if (n < 40) { InterlockedIncrement( &n );
+            ERR( "[futex] WAIT tid=%04x addr=%p -> %lx\n",
+                 (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, addr, ret ); }
+    }
 
     /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
     if (entry.addr)
@@ -960,6 +1062,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     /* Try not to make a system call while holding a spinlock (even if that can be responsible for spurious wake
      * up scenario). */
     spin_unlock( &queue->lock );
+    ios_futex_note_wake( "all", addr, queue, count );
     if (count)
         NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
 }
@@ -1000,6 +1103,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
     }
 
     spin_unlock( &queue->lock );
+    ios_futex_note_wake( "single", addr, queue, tid != 0 );
 
     if (tid) NtAlertThreadByThreadId( (HANDLE)(DWORD_PTR)tid );
 }

@@ -68,6 +68,27 @@ static const char * const debug_classes[] = { "fixme", "err", "warn", "trace" };
 static inline struct debug_info *get_info(void)
 {
     if (!init_done) return &initial_info;
+#ifdef WINE_IOS
+    /* iOS-Mythic ml379: a thread with NO TEB must not crash the logger.
+     *
+     * NtCurrentTeb() resolves through a pthread key on this port, and threads
+     * created outside wine (CEF/FEX worker threads, and any thread faulting
+     * before its TEB is registered) have no value for it. This function then
+     * computes NULL + teb_offset + sizeof(TEB32) = 0x3000 and
+     * __wine_dbg_header's `ldr w8,[x25,#4]` faults at 0x3004 — which raises
+     * another SIGSEGV at the SAME pc inside the handler that was reporting the
+     * first one, so it repeats until the debugger script kills the whole app.
+     *
+     * That single bug ate FOUR runs (ml370/374/375/376) and cost two wrong
+     * diagnoses, because the thread that does the logging is the thread that
+     * dies — the log just stops with no explanation. Fixing it at the source is
+     * what makes every ERR/WARN/TRACE in the port safe, rather than auditing
+     * call sites forever.
+     *
+     * initial_info is the same fallback used before init_done; concurrent use
+     * can interleave output, which is strictly better than a crash. */
+    if (!NtCurrentTeb()) return &initial_info;
+#endif
 #ifdef _WIN64
     return (struct debug_info *)((TEB32 *)((char *)NtCurrentTeb() + teb_offset) + 1);
 #else
@@ -339,8 +360,21 @@ int __cdecl __wine_dbg_header( enum __wine_debug_class cls, struct __wine_debug_
             UINT ticks = NtGetTickCount();
             pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%3u.%03u:", ticks / 1000, ticks % 1000 );
         }
+#ifdef WINE_IOS
+        /* ml379: GetCurrentProcessId/ThreadId read NtCurrentTeb()->ClientId
+         * (TEB+0x40/+0x48). On a TEB-less thread those are the SECOND and THIRD
+         * NULL derefs in this function — guarding get_info() alone still left
+         * the logger crashing here (verified in the disassembly: two more
+         * `bl _NtCurrentTeb; ldr x8,[x0,#0x40]` sites). Print a marker instead
+         * so such lines are still attributable. */
+        if (!NtCurrentTeb())
+            pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "no-teb:" );
+        else
+#endif
+        {
         if (TRACE_ON(pid)) pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", GetCurrentProcessId() );
         pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%04x:", GetCurrentThreadId() );
+        }
     }
     if (function && cls < ARRAY_SIZE( classes ))
         pos += snprintf( pos, sizeof(info->output) - (pos - info->output), "%s:%s:%s ",

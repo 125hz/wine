@@ -3517,6 +3517,18 @@ NTSTATUS WINAPI NtAlertMultipleThreadByThreadId( HANDLE *tids, ULONG count, void
 }
 
 
+/* iOS-Mythic ml400 (task #60): last-64 (from-tid, target-tid) alert pairs.
+ * ml400 caught a thread storming instant-ALERTED on INFINITE waits (webhelper
+ * 00c8) while other threads slept through their wakes — the recycled-tid
+ * theory says a stale threadpool/waiter list in another pseudo-process keeps
+ * alerting a dead thread's tid that now belongs to an innocent bystander.
+ * The ring is written lock-free on every alert; the storming WAITER dumps it,
+ * which names the pounder. */
+#define IOS_ALERT_RING 64
+static unsigned int ios_alert_ring[IOS_ALERT_RING];
+static LONG ios_alert_ring_pos;
+static HANDLE ios_pump_alert_tid;   /* ml407: beacon thread's tid, set on its wait */
+
 /***********************************************************************
  *             NtAlertThreadByThreadId (NTDLL.@)
  */
@@ -3531,6 +3543,22 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
 #ifdef USE_FUTEX
     {
         LONG *futex = &entry->futex;
+        /* iOS-Mythic ml400 (task #60): ring of recent alerts so a storming
+         * waiter can name its pounder — see [alert-storm] in
+         * NtWaitForAlertByThreadId. */
+        LONG pos = InterlockedIncrement( &ios_alert_ring_pos );
+        ios_alert_ring[pos & (IOS_ALERT_RING - 1)] =
+            ((unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread << 16) |
+            ((unsigned int)(ULONG_PTR)tid & 0xffff);
+        /* ml407: did ANYONE (any ntdll copy) ever try to wake the parked pump? */
+        if (tid && tid == ios_pump_alert_tid)
+        {
+            static LONG n;
+            if (n < 40) { InterlockedIncrement( &n );
+                ERR( "[alert-unix] ALERT-SENT from=%04x -> pump tid=%04x futex=%p\n",
+                     (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                     (int)(ULONG_PTR)tid, entry ); }
+        }
         if (!InterlockedExchange( futex, 1 ))
             futex_wake_one( futex );
         return STATUS_SUCCESS;
@@ -3546,7 +3574,6 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
             .data = 0,
             .udata = NULL
         };
-
         kevent( entry->kq, &signal_event, 1, NULL, 0, NULL );
         return STATUS_SUCCESS;
     }
@@ -3585,10 +3612,33 @@ static LONGLONG update_timeout( ULONGLONG end )
 NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
 {
     union tid_alert_entry *entry = get_tid_alert_entry( NtCurrentTeb()->ClientId.UniqueThread );
+    /* iOS-Mythic ml406 (task #60): unix-side tap for beacon-marked threads
+     * (TEB->Instrumentation[10] == 'PUMP', stamped by the EC chrome-ipc
+     * wrappers).  The pump entered an alert-wait post-wake WITHOUT hitting
+     * the EC-side [pump-op] wrapper — native-aarch64-ntdll routes bypass it,
+     * but every PE route lands here.  Logs which alert-waits the marked
+     * threads actually make, with the futex entry address (maps to a tid
+     * offline: ((addr & 0xffff) / 4 + 1) * 4). */
+    int ios_marked = (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550);
+    static LONG ios_alert_unix_n;
+
+    /* ml407: remember the marked thread's tid so the ALERT side (which runs on
+     * OTHER threads, possibly against a different PE ntdll copy) can report
+     * whether anyone ever tries to wake it — the unix lib is the single shared
+     * copy every route passes through. */
+    if (ios_marked) ios_pump_alert_tid = NtCurrentTeb()->ClientId.UniqueThread;
 
     TRACE( "%p %s\n", address, debugstr_timeout( timeout ) );
 
     if (!entry) return STATUS_INVALID_CID;
+
+    if (ios_marked && ios_alert_unix_n < 120)
+    {
+        InterlockedIncrement( &ios_alert_unix_n );
+        ERR( "[alert-unix] tid=%04x WAIT addr=%p timeout=%s futex=%p\n",
+             (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, address,
+             timeout ? wine_dbgstr_longlong( timeout->QuadPart ) : "INF", (void *)entry );
+    }
 
 #ifdef USE_FUTEX
     {
@@ -3618,7 +3668,47 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             else
                 ret = futex_wait( futex, 0, NULL );
 
-            if (ret == -1 && errno == ETIMEDOUT) return STATUS_TIMEOUT;
+            if (ret == -1 && errno == ETIMEDOUT)
+            {
+                if (ios_marked && ios_alert_unix_n < 120) { InterlockedIncrement( &ios_alert_unix_n );
+                    ERR( "[alert-unix] tid=%04x -> TIMEOUT\n",
+                         (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread ); }
+                return STATUS_TIMEOUT;
+            }
+        }
+        if (ios_marked && ios_alert_unix_n < 120) { InterlockedIncrement( &ios_alert_unix_n );
+            ERR( "[alert-unix] tid=%04x -> ALERTED\n",
+                 (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread ); }
+        /* iOS-Mythic ml400 (task #60): detect an alert STORM — one thread
+         * getting instant-ALERTED over and over (ml400: webhelper 00c8, 40+
+         * consecutive on INFINITE waits).  Every 16th consecutive hit, dump
+         * the last 16 alert-ring pairs; the from-tids name the pounder.
+         * Recycled-tid theory: a stale waiter list in another pseudo-process
+         * keeps alerting a dead thread's tid now owned by this victim. */
+        {
+            static int storm_n, dump_n;
+            static void *storm_tid;
+            void *cur = NtCurrentTeb()->ClientId.UniqueThread;
+            if (cur == storm_tid) storm_n++;
+            else { storm_tid = cur; storm_n = 1; }
+            if (storm_n >= 16 && (storm_n & 15) == 0 && dump_n < 20)
+            {
+                LONG pos = ios_alert_ring_pos;
+                int i;
+                dump_n++;
+                ERR( "[alert-storm] tid=%04x consecutive=%d ring(from->to):"
+                     " %04x->%04x %04x->%04x %04x->%04x %04x->%04x"
+                     " %04x->%04x %04x->%04x %04x->%04x %04x->%04x\n",
+                     (int)(ULONG_PTR)cur, storm_n,
+                     ios_alert_ring[(pos-0)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-0)&(IOS_ALERT_RING-1)] & 0xffff,
+                     ios_alert_ring[(pos-1)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-1)&(IOS_ALERT_RING-1)] & 0xffff,
+                     ios_alert_ring[(pos-2)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-2)&(IOS_ALERT_RING-1)] & 0xffff,
+                     ios_alert_ring[(pos-3)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-3)&(IOS_ALERT_RING-1)] & 0xffff,
+                     ios_alert_ring[(pos-4)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-4)&(IOS_ALERT_RING-1)] & 0xffff,
+                     ios_alert_ring[(pos-5)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-5)&(IOS_ALERT_RING-1)] & 0xffff,
+                     ios_alert_ring[(pos-6)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-6)&(IOS_ALERT_RING-1)] & 0xffff,
+                     ios_alert_ring[(pos-7)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-7)&(IOS_ALERT_RING-1)] & 0xffff );
+            }
         }
         return STATUS_ALERTED;
     }

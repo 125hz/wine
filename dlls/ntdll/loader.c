@@ -4400,7 +4400,15 @@ void WINAPI LdrShutdownThread(void)
                             DLL_THREAD_DETACH, NULL );
         }
 
-        if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_THREAD_DETACH );
+        /* ml384: wm can be NULL when a thread runs the WRONG process's ntdll
+         * copy (stale/fallback TEB resolution): the module tree it walks then
+         * belongs to another pseudo-process and misses this PEB's exe. If this
+         * fires, TEB resolution is broken again — do not crash the process. */
+        if (!wm)
+            ERR( "[ldr-shutdown] no modref for image base %p — thread ran another "
+                 "process's ntdll copy? (teb=%p peb=%p)\n",
+                 NtCurrentTeb()->Peb->ImageBaseAddress, NtCurrentTeb(), NtCurrentTeb()->Peb );
+        else if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_THREAD_DETACH );
     }
 
     RtlAcquirePebLock();
@@ -4895,6 +4903,78 @@ static void release_address_space(void)
 #endif
 }
 
+#ifdef __arm64ec__
+/* ml390 (task #60): named-section content-sharing self-test.
+ * Steam's webhelper-init handshake is a CSharedMemStream over a named section
+ * (SteamChrome_MasterStream_spid%u): steam.exe creates + writes, webhelper
+ * opens + reads.  On-device an opener has been seen reading ZEROS from an
+ * existing named mapping ("Size on connection ... 1048576, 0").  Replicate the
+ * topology with ntdll only: the first EC process creates the section and
+ * writes a magic pattern (handle and view deliberately leaked so the section
+ * persists), every later EC process opens it and reports what it sees.
+ * MATCH / ZEROS / GARBAGE in the log settles cross-pseudo-process section
+ * sharing directly. */
+static void ios_sectest(void)
+{
+    UNICODE_STRING us;
+    OBJECT_ATTRIBUTES attr;
+    LARGE_INTEGER sec_size;
+    HANDLE handle = 0;
+    NTSTATUS status, mst;
+    void *base = NULL;
+    SIZE_T view_size = 0;
+    ULONG_PTR pid = (ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess;
+    const WCHAR *path = L"\\Sessions\\1\\BaseNamedObjects\\__mythic_sectest";
+
+    RtlInitUnicodeString( &us, path );
+    InitializeObjectAttributes( &attr, &us, OBJ_CASE_INSENSITIVE | OBJ_OPENIF, 0, NULL );
+    sec_size.QuadPart = 0x10000;
+    status = NtCreateSection( &handle, SECTION_ALL_ACCESS, &attr, &sec_size,
+                              PAGE_READWRITE, SEC_COMMIT, 0 );
+    if (status == STATUS_OBJECT_PATH_NOT_FOUND)
+    {
+        path = L"\\BaseNamedObjects\\__mythic_sectest";
+        RtlInitUnicodeString( &us, path );
+        status = NtCreateSection( &handle, SECTION_ALL_ACCESS, &attr, &sec_size,
+                                  PAGE_READWRITE, SEC_COMMIT, 0 );
+    }
+    if (status && status != STATUS_OBJECT_NAME_EXISTS)
+    {
+        ERR( "[sec-test] pid=%04Ix create FAILED status=%lx (%s)\n", pid, status, debugstr_w(path) );
+        return;
+    }
+    mst = NtMapViewOfSection( handle, GetCurrentProcess(), &base, 0, 0, NULL, &view_size,
+                              ViewShare, 0, PAGE_READWRITE );
+    if (mst)
+    {
+        ERR( "[sec-test] pid=%04Ix map FAILED status=%lx (opened_existing=%d)\n",
+             pid, mst, status == STATUS_OBJECT_NAME_EXISTS );
+        NtClose( handle );
+        return;
+    }
+    if (status != STATUS_OBJECT_NAME_EXISTS)   /* we created it: write the pattern */
+    {
+        volatile ULONG64 *p = base;
+        p[0] = 0x4d59544849435345ull;  /* 'MYTHICSE' */
+        p[1] = pid;
+        ERR( "[sec-test] pid=%04Ix CREATED %s base=%p magic written (handle+view leaked on purpose)\n",
+             pid, debugstr_w(path), base );
+        return;   /* keep handle + view alive so the section persists */
+    }
+    else
+    {
+        const volatile ULONG64 *p = base;
+        ULONG64 m = p[0], creator = p[1];
+        ERR( "[sec-test] pid=%04Ix OPENED %s base=%p magic=%016I64x creator_pid=%04I64x -> %s\n",
+             pid, debugstr_w(path), base, m, creator,
+             m == 0x4d59544849435345ull ? "MATCH (sharing OK)" :
+             !m ? "ZEROS (sharing BROKEN - private view)" : "GARBAGE" );
+        NtUnmapViewOfSection( GetCurrentProcess(), base );
+        NtClose( handle );
+    }
+}
+#endif
+
 /******************************************************************
  *		loader_init
  *
@@ -5037,6 +5117,9 @@ void loader_init( CONTEXT *context, void **entry )
     if (!attach_done)  /* first time around */
     {
         attach_done = 1;
+#ifdef __arm64ec__
+        ios_sectest();  /* ml390 task #60 — named-section sharing self-test */
+#endif
         if ((status = alloc_thread_tls()) != STATUS_SUCCESS)
         {
             ERR( "TLS init  failed when loading %s, status %lx\n",

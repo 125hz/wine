@@ -607,7 +607,13 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH RtlFlsFree( ULONG index )
 
         if (fls->fls_data_chunks[chunk_index] && fls->fls_data_chunks[chunk_index][idx + 1])
         {
-            if (callback != (void *)~(ULONG_PTR)0)
+            /* ml384: the UCRT stores (void*)-1 as a reservation sentinel between
+             * FlsSetValue(idx,-1) and the real ptd store; its destroy_fls does NOT
+             * guard -1, so delivering it means free(-1) -> PartitionAlloc crash
+             * (family B, ml372/378/381/384). Windows never delivers it. */
+            if (fls->fls_data_chunks[chunk_index][idx + 1] == (void *)~(ULONG_PTR)0)
+                ERR( "[fls-sweep] skipping sentinel -1 for index %lu (FlsFree)\n", index );
+            else if (callback != (void *)~(ULONG_PTR)0)
             {
                 TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback,
                         fls->fls_data_chunks[chunk_index][idx + 1]);
@@ -704,7 +710,15 @@ void WINAPI DECLSPEC_HOTPATCH RtlProcessFlsData( void *teb_fls_data, ULONG flags
                 if (!fls->fls_data_chunks[i][index + 1])
                     continue;
 
-                if (callback && callback != (void *)~(ULONG_PTR)0)
+                /* ml384: never deliver the UCRT's (void*)-1 reservation sentinel to a
+                 * callback — destroy_fls does not guard it and free(-1) kills the
+                 * process in PartitionAlloc (family B). A thread that exits inside
+                 * the FlsSetValue(idx,-1) .. FlsSetValue(idx,ptd) window (huge under
+                 * emulation) leaves the sentinel in its slot. */
+                if (fls->fls_data_chunks[i][index + 1] == (void *)~(ULONG_PTR)0)
+                    ERR( "[fls-sweep] skipping sentinel -1 at chunk %u index %u (thread exit)\n",
+                         i, index );
+                else if (callback && callback != (void *)~(ULONG_PTR)0)
                 {
                     TRACE_(relay)("Calling FLS callback %p, arg %p.\n", callback,
                             fls->fls_data_chunks[i][index + 1]);

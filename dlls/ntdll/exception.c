@@ -173,7 +173,91 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
 
         TRACE( "calling handler at %p code=%lx flags=%lx\n",
                func, rec->ExceptionCode, rec->ExceptionFlags );
+#ifdef __arm64ec__
+        /* iOS-Mythic ml409 (#66): second bracket point — see [ki-path] in
+         * signal_arm64ec.c. Vectored handlers are guest x64 code running under
+         * the emulator with a pointer to the live dispatch context; log Rsp
+         * around each call to catch the corruptor in the act. AV-only, capped. */
+        if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+        {
+            static LONG veh_n;
+            if (veh_n < 60 && InterlockedIncrement( &veh_n ) <= 60)
+                ERR( "[veh] calling handler %p ctx=%p Rsp=%p Rip=%p\n", func, context,
+                     (void *)(ULONG_PTR)context->Rsp, (void *)(ULONG_PTR)context->Rip );
+        }
+#endif
+#ifdef __arm64ec__
+        /* iOS-Mythic ml418 (#66 CAUGHT): the ml418 freeze was traced to this
+         * exact call.  SDL3's handler returned 0 with the context intact; the
+         * next handler (chrome_elf+0x312c0 = Crashpad's) returned 0 with the
+         * context WRECKED — Rsp's high dword replaced by 1 (0x73DBBAFBA0 →
+         * 0x1DBBAFBA0) and Rip/Rbp/R12 replaced by FEX-host-band addresses.
+         * call_seh_handlers then walked that garbage, declared the context
+         * bogus and killed the thread; it died holding locks and the whole
+         * emulated world parked behind it for the remaining 4 hours.
+         *
+         * A handler returning EXCEPTION_CONTINUE_SEARCH has no business
+         * rewriting the context the rest of the chain must walk, so snapshot
+         * it and put it back when what came out is impossible: Rip in the FEX
+         * host band [0x7c00000000,0x8000000000) or Rsp outside the thread's
+         * own stack.  Restoring keeps the SEH walk on a sane context, which
+         * is the difference between "one guest exception" and "the process
+         * freezes".  The dump is the evidence for the mechanism (ARM64-over-
+         * AMD64 context overlay is the leading theory: at AMD64 Rip's offset
+         * 0xf8 an ARM64_NT_CONTEXT holds Lr, and at Rsp's 0x98 it holds X19). */
+        CONTEXT veh_saved = *context;
+#endif
         ret = func( &except_ptrs );
+#ifdef __arm64ec__
+        if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
+        {
+            static LONG vehr_n;
+            if (vehr_n < 60 && InterlockedIncrement( &vehr_n ) <= 60)
+                ERR( "[veh] handler %p returned %x Rsp=%p Rip=%p\n", func, (unsigned int)ret,
+                     (void *)(ULONG_PTR)context->Rsp, (void *)(ULONG_PTR)context->Rip );
+        }
+        if (ret != EXCEPTION_CONTINUE_EXECUTION &&
+            (context->Rip != veh_saved.Rip || context->Rsp != veh_saved.Rsp))
+        {
+            const ULONG64 host_lo = 0x7c00000000ull, host_hi = 0x8000000000ull;
+            TEB *teb = NtCurrentTeb();
+            BOOL bad_rip = (context->Rip >= host_lo && context->Rip < host_hi);
+            BOOL bad_rsp = (context->Rsp >= (ULONG64)(ULONG_PTR)teb->DeallocationStack &&
+                            context->Rsp <= (ULONG64)(ULONG_PTR)teb->Tib.StackBase) ? FALSE : TRUE;
+            static LONG vehc_n;
+            LONG n = InterlockedIncrement( &vehc_n );
+
+            if (n <= 8)
+            {
+                const ULONG64 *raw = (const ULONG64 *)context;
+                unsigned int i;
+                ERR( "[veh-corrupt] #%d handler %p ret=%x WRECKED the context: "
+                     "Rip %p -> %p, Rsp %p -> %p, Rbp %p -> %p, R12 %p -> %p (bad_rip=%d bad_rsp=%d)\n",
+                     (int)n, func, (unsigned int)ret,
+                     (void *)(ULONG_PTR)veh_saved.Rip, (void *)(ULONG_PTR)context->Rip,
+                     (void *)(ULONG_PTR)veh_saved.Rsp, (void *)(ULONG_PTR)context->Rsp,
+                     (void *)(ULONG_PTR)veh_saved.Rbp, (void *)(ULONG_PTR)context->Rbp,
+                     (void *)(ULONG_PTR)veh_saved.R12, (void *)(ULONG_PTR)context->R12,
+                     bad_rip, bad_rsp );
+                /* Raw words 0x78..0x140 — the window holding Rsp(0x98),
+                 * Rbp(0xa0), R12(0xd8) and Rip(0xf8).  If an ARM64 context was
+                 * laid over this one, these words are X17..X30/Sp/Pc and the
+                 * overlay proves itself offline. */
+                for (i = 0x78 / 8; i <= 0x140 / 8; i += 4)
+                    ERR( "[veh-corrupt]   +0x%03x: %016llx %016llx %016llx %016llx\n",
+                         i * 8, (unsigned long long)raw[i], (unsigned long long)raw[i + 1],
+                         (unsigned long long)raw[i + 2], (unsigned long long)raw[i + 3] );
+            }
+
+            if (bad_rip || bad_rsp)
+            {
+                *context = veh_saved;
+                if (n <= 20)
+                    ERR( "[veh-restore] #%d context restored after handler %p — SEH walk continues "
+                         "on the pre-handler context (was: thread kill + world freeze)\n", (int)n, func );
+            }
+        }
+#endif
         TRACE( "handler at %p returned %lx\n", func, ret );
 
         RtlEnterCriticalSection( &vectored_handlers_section );

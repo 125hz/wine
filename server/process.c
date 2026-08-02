@@ -498,7 +498,15 @@ unsigned int alloc_ptid( void *ptr )
         index = used_ptid_entries + PTID_OFFSET;
         entry = &ptid_entries[used_ptid_entries++];
     }
-    else if (next_free_ptid && num_free_ptids >= 256)
+    /* iOS-Mythic ml400 (task #60/#66): NEVER reuse ptids.  Crash-roulette
+     * leaves dead threads on threadpool/wait-address lists in other
+     * pseudo-processes; when the dead tid is reused, those stale lists
+     * alert/act on an innocent new thread (ml400: instant-ALERTED storm on
+     * webhelper's chrome_ipc thread) while the pounder's own work is never
+     * picked up (silent forever-sleeps).  Monotonic ids kill the whole
+     * confusion class for 16 bytes/thread; the freed-entry list is left
+     * unused by design. */
+    else if (0 && next_free_ptid && num_free_ptids >= 256)
     {
         index = next_free_ptid;
         entry = &ptid_entries[index - PTID_OFFSET];
