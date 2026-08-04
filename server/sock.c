@@ -1410,6 +1410,30 @@ static void sock_dispatch_events( struct sock *sock, enum connection_state prevs
         }
         if (event & (POLLERR | POLLHUP))
             post_socket_event( sock, AFD_POLL_BIT_CONNECT_ERR );
+        /* iOS-Mythic ml493: the OUTCOME half of the [srv-conn] census.
+         * ml493's log proved Steam dials the CMs (dport=443/27018, ret=-1
+         * EINPROGRESS) yet not one appears ESTABLISHED, so every
+         * PingWebSocketCM fails inside a second — but the dial census alone
+         * cannot say whether the handshake completed and a higher layer
+         * (TLS/WebSocket) rejected it, or the handshake never landed at all.
+         * One line per connecting socket's first event decides that. */
+        {
+            static int done_logged;
+            if (done_logged < 96)
+            {
+                unsigned short dport = 0;
+                if (sock->peer_addr.addr.sa_family == WS_AF_INET) dport = ntohs( sock->peer_addr.in.sin_port );
+                else if (sock->peer_addr.addr.sa_family == WS_AF_INET6) dport = ntohs( sock->peer_addr.in6.sin6_port );
+                done_logged++;
+                fprintf( stderr, "[srv-conn-done] dport=%u event=%s%s%s%s err=%d rev=ml493\n",
+                         dport,
+                         (event & POLLOUT) ? "OUT" : "",
+                         (event & POLLERR) ? "|ERR" : "",
+                         (event & POLLHUP) ? "|HUP" : "",
+                         (event & POLLIN) ? "|IN" : "",
+                         sock->errors[AFD_POLL_BIT_CONNECT_ERR] );
+            }
+        }
         break;
 
     case SOCK_LISTENING:

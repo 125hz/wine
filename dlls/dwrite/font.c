@@ -1117,6 +1117,17 @@ static HRESULT WINAPI dwritefontface_GetGlyphRunOutline(IDWriteFontFace5 *iface,
     if (!count)
         return S_OK;
 
+    /* ml493 probe: the OTHER way a glyph can reach a rasteriser (paths
+     * rather than alpha textures). Instrumented so that "zero glyph work
+     * of any kind" is a conclusion the run can actually support, instead
+     * of an absence I would otherwise have to assume. */
+    {
+        static LONG calls;
+        LONG n = InterlockedIncrement(&calls);
+        if (n <= 8 || (n % 500) == 0)
+            ERR("[dwrite-outline] rev=ml493 call#%ld emSize=%.1f glyphs=%u\n", n, emSize, count);
+    }
+
     run.fontFace = (IDWriteFontFace *)iface;
     run.fontEmSize = emSize;
     run.glyphCount = count;
@@ -5889,6 +5900,21 @@ static HRESULT WINAPI glyphrunanalysis_GetAlphaTextureBounds(IDWriteGlyphRunAnal
     }
 
     glyphrunanalysis_get_texturebounds(analysis, bounds);
+
+    /* ml493 probe: an EMPTY rect here means the caller draws nothing and
+     * never reaches CreateAlphaTexture — so a zero [dwrite-ink] count on
+     * its own would be ambiguous. Log both so the two failure modes
+     * ("no glyph has any extent" vs "extent fine, texture blank") are
+     * distinguishable from one run. */
+    {
+        static LONG calls, empties;
+        LONG n = InterlockedIncrement(&calls);
+        BOOL empty = IsRectEmpty(bounds);
+        if (empty) InterlockedIncrement(&empties);
+        if (n <= 12 || (n % 500) == 0)
+            ERR("[dwrite-bounds] rev=ml493 call#%ld type=%d bounds=%s%s (empty=%ld)\n",
+                n, type, wine_dbgstr_rect(bounds), empty ? " EMPTY" : "", empties);
+    }
     return S_OK;
 }
 
@@ -6070,6 +6096,25 @@ static HRESULT WINAPI glyphrunanalysis_CreateAlphaTexture(IDWriteGlyphRunAnalysi
             src += src_width;
             dst += dst_width;
         }
+    }
+
+    /* ml493 probe: is the texture we hand back actually INKED? Chromium
+     * renders every glyph through here, so an all-zero texture is
+     * invisible text with no error anywhere — exactly the symptom on the
+     * Steam login page (boxes, SVG and QR paint; no glyph ever does).
+     * Counting calls alone cannot tell "never asked" from "asked and got
+     * nothing", so this reports both the call count and the ink. */
+    {
+        static LONG calls, inked, blank;
+        UINT32 i, ink = 0;
+        LONG n;
+        for (i = 0; i < size; i++) if (bitmap[i]) { ink++; if (ink > 8) break; }
+        n = InterlockedIncrement(&calls);
+        if (ink) InterlockedIncrement(&inked); else InterlockedIncrement(&blank);
+        if (n <= 12 || (n % 500) == 0)
+            ERR("[dwrite-ink] rev=ml493 call#%ld type=%d size=%u bounds=%s ink=%s "
+                "(inked=%ld blank=%ld)\n", n, type, size, wine_dbgstr_rect(bounds),
+                ink ? "YES" : "NO", inked, blank);
     }
 
     return S_OK;
