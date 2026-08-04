@@ -893,6 +893,31 @@ struct futex_queue
 
 static struct futex_queue futex_queues[256];
 
+/* iOS-Mythic ml441 (#74): futex_queues is per-ntdll-COPY .data, and our
+ * pseudo-processes carry multiple ntdll copies (native + EC), so a waker
+ * walking this copy's array never finds a waiter registered through another
+ * copy — the wake dies here and the waiter parks forever (the post-
+ * BrowserReady stall: ml440 proved every >60s parker was an addr=NULL
+ * RtlWaitOnAddress park with zero alerts delivered).  Fix: every copy uses
+ * the ONE table in the unix dylib's .data, fetched once via a private
+ * NtQuerySystemInformation class.  Falls back to the private array only if
+ * the query fails (never expected on iOS builds). */
+static struct futex_queue *ios_shared_queues;
+static const char ios_futex_shared_pe_marker[] __attribute__((used)) = "ios-futex-shared-pe rev=ml441";
+
+static struct futex_queue *ios_get_futex_table(void)
+{
+    void *ptr = NULL;
+    ULONG len;
+
+    if (ios_shared_queues) return ios_shared_queues;
+    if (!NtQuerySystemInformation( (SYSTEM_INFORMATION_CLASS)0xf00d, &ptr, sizeof(ptr), &len ) && ptr)
+        ios_shared_queues = ptr;
+    else
+        ios_shared_queues = futex_queues;
+    return ios_shared_queues;
+}
+
 /* iOS-Mythic ml407 (task #60): the chrome_ipc pump parks in RtlWaitOnAddress
  * immediately after its master-event wake and is never alerted ([alert-unix]:
  * one WAIT, no ALERTED, while its sibling server thread cycles normally).
@@ -920,7 +945,8 @@ static struct futex_queue *get_futex_queue( const void *addr )
 {
     ULONG_PTR val = (ULONG_PTR)addr;
 
-    return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
+    /* ml441: index the SHARED table, not this copy's private array */
+    return &ios_get_futex_table()[(val >> 4) % ARRAY_SIZE(futex_queues)];
 }
 
 static void spin_lock( LONG *lock )
@@ -1000,7 +1026,10 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
         if (size == 2 && !timeout) ios_srw_dump_park( addr );
     }
 
-    ret = NtWaitForAlertByThreadId( NULL, timeout );
+    /* ml441: pass the real address — the unix layer ignores it functionally
+     * but the [waiters] registry (ml440) records it, so long parks are now
+     * attributable to a named lock word. */
+    ret = NtWaitForAlertByThreadId( addr, timeout );
 
     if (NtCurrentTeb()->Instrumentation[10] == (void *)(ULONG_PTR)0x504d5550)
     {

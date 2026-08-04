@@ -783,6 +783,169 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
     return recv_len;
 }
 
+#ifdef __APPLE__
+/* iOS-Mythic ml464 [sock-big] (#78): steamui's login boot died on
+ * "ChunkLoadError: missing steamloopback.host/libraries/libraries~....js" —
+ * a 1.99MB file that EXISTS on disk, served by steam.exe's loopback HTTP
+ * server, while a 678KB file served fine seconds earlier. Prime suspect is a
+ * large-transfer failure somewhere in this layer. Trace every TCP socket's
+ * cumulative send/recv bytes (milestone log at 128KB, then every 512KB, with
+ * the peer port to identify the HTTP server's socket) plus every hard error.
+ * A transfer that STOPS at a byte count without an error implicates the
+ * file-read side of TransmitFile instead; an errno names the socket layer.
+ * Racy counters are acceptable — fixed array, no pointers, probe-only. */
+static void ios_sock_big_note( int fd, int is_send, long ret_bytes, int err )
+{
+    static struct { int fd; unsigned long long tot[2]; unsigned long long next[2]; } tab[64];
+    static int err_logs;
+    int i, slot = -1;
+
+    if (err)
+    {
+        if (err != EWOULDBLOCK && err != EAGAIN && err != EINTR && err_logs < 64)
+        {
+            err_logs++;
+            dprintf( 2, "[sock-big] %s ERROR fd=%d errno=%d rev=ml464\n", is_send ? "send" : "recv", fd, err );
+        }
+        return;
+    }
+    if (ret_bytes <= 0) return;
+    for (i = 0; i < 64; i++)
+    {
+        if (tab[i].fd == fd) { slot = i; break; }
+        if (slot < 0 && !tab[i].fd) slot = i;
+    }
+    if (slot < 0) return;
+    if (tab[slot].fd != fd)
+    {
+        tab[slot].fd = fd;
+        tab[slot].tot[0] = tab[slot].tot[1] = 0;
+        tab[slot].next[0] = tab[slot].next[1] = 0x20000;
+    }
+    tab[slot].tot[is_send] += (unsigned long long)ret_bytes;
+    if (tab[slot].tot[is_send] >= tab[slot].next[is_send])
+    {
+        union unix_sockaddr peer;
+        socklen_t plen = sizeof(peer);
+        int pport = -1;
+        if (!getpeername( fd, &peer.addr, &plen ) && peer.addr.sa_family == AF_INET)
+            pport = ntohs( peer.in.sin_port );
+        dprintf( 2, "[sock-big] %s fd=%d total=%lluKB peer_port=%d rev=ml464\n",
+                 is_send ? "send" : "recv", fd, tab[slot].tot[is_send] >> 10, pport );
+        tab[slot].next[is_send] = tab[slot].tot[is_send] + 0x80000;
+    }
+}
+/* iOS-Mythic ml469 (wall #79 transport): the ml468 run showed steamwebhelper
+ * re-dialing ws://localhost:6252x/transportsocket/ every ~5s forever, with the
+ * only connect evidence being IPv6 EHOSTUNREACH + IPv4 EINPROGRESS and no
+ * completion, while steam.exe's own connectivity test reported NoLAN.  Nothing
+ * on record proves TCP loopback works AT ALL under this port, so measure it
+ * directly, below wine: bind a listener on 127.0.0.1:0, non-blocking connect
+ * to it, poll for writability, read SO_ERROR, accept, and pass one byte each
+ * way.  Whatever step fails names the layer.  IPv6 ::1 is probed too, since
+ * the guest's first choice is what returned EHOSTUNREACH. */
+#include <poll.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+void ios_loopback_selftest(void)
+{
+    struct sockaddr_in a4 = { 0 };
+    socklen_t len = sizeof(a4);
+    int ls = -1, cs = -1, as = -1, err = 0, flags, port = 0;
+    socklen_t elen = sizeof(err);
+    struct pollfd pfd;
+    char tx = 0x5a, rx = 0;
+    ssize_t n;
+
+    if ((ls = socket( AF_INET, SOCK_STREAM, 0 )) < 0)
+    { dprintf( 2, "[loopback] FAIL socket errno=%d rev=ml469\n", errno ); return; }
+    a4.sin_family = AF_INET;
+    a4.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
+    a4.sin_port = 0;
+    if (bind( ls, (struct sockaddr *)&a4, sizeof(a4) ) < 0)
+    { dprintf( 2, "[loopback] FAIL bind errno=%d rev=ml469\n", errno ); goto done; }
+    if (listen( ls, 1 ) < 0)
+    { dprintf( 2, "[loopback] FAIL listen errno=%d rev=ml469\n", errno ); goto done; }
+    if (getsockname( ls, (struct sockaddr *)&a4, &len ) < 0)
+    { dprintf( 2, "[loopback] FAIL getsockname errno=%d rev=ml469\n", errno ); goto done; }
+    port = ntohs( a4.sin_port );
+
+    if ((cs = socket( AF_INET, SOCK_STREAM, 0 )) < 0)
+    { dprintf( 2, "[loopback] FAIL socket2 errno=%d rev=ml469\n", errno ); goto done; }
+    flags = fcntl( cs, F_GETFL, 0 );
+    fcntl( cs, F_SETFL, flags | O_NONBLOCK );
+    if (connect( cs, (struct sockaddr *)&a4, sizeof(a4) ) < 0 && errno != EINPROGRESS)
+    { dprintf( 2, "[loopback] FAIL connect port=%d errno=%d rev=ml469\n", port, errno ); goto done; }
+
+    pfd.fd = cs; pfd.events = POLLOUT; pfd.revents = 0;
+    n = poll( &pfd, 1, 2000 );
+    if (n <= 0)
+    { dprintf( 2, "[loopback] FAIL connect-poll port=%d ret=%d errno=%d (never writable in 2s) rev=ml469\n",
+               port, (int)n, errno ); goto done; }
+    if (getsockopt( cs, SOL_SOCKET, SO_ERROR, &err, &elen ) < 0 || err)
+    { dprintf( 2, "[loopback] FAIL connect-so_error port=%d so_error=%d revents=0x%x rev=ml469\n",
+               port, err, pfd.revents ); goto done; }
+
+    if ((as = accept( ls, NULL, NULL )) < 0)
+    { dprintf( 2, "[loopback] FAIL accept port=%d errno=%d rev=ml469\n", port, errno ); goto done; }
+    if ((n = send( cs, &tx, 1, 0 )) != 1)
+    { dprintf( 2, "[loopback] FAIL send port=%d ret=%d errno=%d rev=ml469\n", port, (int)n, errno ); goto done; }
+    pfd.fd = as; pfd.events = POLLIN; pfd.revents = 0;
+    if (poll( &pfd, 1, 2000 ) <= 0)
+    { dprintf( 2, "[loopback] FAIL recv-poll port=%d (byte never arrived in 2s) rev=ml469\n", port ); goto done; }
+    if ((n = recv( as, &rx, 1, 0 )) != 1 || rx != tx)
+    { dprintf( 2, "[loopback] FAIL recv port=%d ret=%d byte=0x%02x errno=%d rev=ml469\n",
+               port, (int)n, rx, errno ); goto done; }
+    dprintf( 2, "[loopback] OK ipv4 127.0.0.1:%d connect+accept+1-byte roundtrip rev=ml469\n", port );
+
+done:
+    if (as >= 0) close( as );
+    if (cs >= 0) close( cs );
+    if (ls >= 0) close( ls );
+
+#ifdef AF_INET6
+    {
+        struct sockaddr_in6 a6 = { 0 };
+        int l6 = -1, c6 = -1;
+        socklen_t l6len = sizeof(a6);
+        a6.sin6_family = AF_INET6;
+        a6.sin6_addr = in6addr_loopback;
+        if ((l6 = socket( AF_INET6, SOCK_STREAM, 0 )) < 0)
+        { dprintf( 2, "[loopback] ipv6 no socket errno=%d rev=ml469\n", errno ); return; }
+        if (bind( l6, (struct sockaddr *)&a6, sizeof(a6) ) < 0 || listen( l6, 1 ) < 0 ||
+            getsockname( l6, (struct sockaddr *)&a6, &l6len ) < 0)
+        { dprintf( 2, "[loopback] ipv6 bind/listen FAIL errno=%d rev=ml469\n", errno ); close( l6 ); return; }
+        if ((c6 = socket( AF_INET6, SOCK_STREAM, 0 )) >= 0)
+        {
+            /* non-blocking like the v4 leg: a blackholed SYN must cost 2s,
+             * not the platform connect timeout, on the monitor thread */
+            int f6 = fcntl( c6, F_GETFL, 0 );
+            int r, e6 = 0;
+            socklen_t e6len = sizeof(e6);
+            fcntl( c6, F_SETFL, f6 | O_NONBLOCK );
+            r = connect( c6, (struct sockaddr *)&a6, sizeof(a6) );
+            if (r < 0 && errno == EINPROGRESS)
+            {
+                struct pollfd p6;
+                p6.fd = c6; p6.events = POLLOUT; p6.revents = 0;
+                if (poll( &p6, 1, 2000 ) <= 0) e6 = ETIMEDOUT;
+                else if (getsockopt( c6, SOL_SOCKET, SO_ERROR, &e6, &e6len ) < 0) e6 = errno;
+                r = e6 ? -1 : 0;
+            }
+            else if (r < 0) e6 = errno;
+            dprintf( 2, "[loopback] ipv6 [::1]:%d connect ret=%d errno=%d rev=ml469\n",
+                     ntohs( a6.sin6_port ), r, e6 );
+            close( c6 );
+        }
+        close( l6 );
+    }
+#endif
+}
+
+#else
+#define ios_sock_big_note( fd, is_send, ret_bytes, err ) do { } while (0)
+#endif
+
 static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
 {
     char control_buffer[512];
@@ -812,8 +975,10 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
             errno = EWOULDBLOCK;
 
         if (errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( errno ) );
+        ios_sock_big_note( fd, 0, 0, errno );
         return sock_errno_to_status( errno );
     }
+    ios_sock_big_note( fd, 0, ret, 0 );
 
     status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
@@ -1109,11 +1274,13 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
                 continue;
             }
 
+            ios_sock_big_note( fd, 1, 0, errno );
             return sock_errno_to_status( errno );
         }
     }
 
     async->sent_len += ret;
+    ios_sock_big_note( fd, 1, ret, 0 );
 
     while (async->iov_cursor < async->count && ret >= async->iov[async->iov_cursor].iov_len)
         ret -= async->iov[async->iov_cursor++].iov_len;
@@ -1358,6 +1525,9 @@ static ssize_t do_send( int fd, const void *buffer, size_t len, int flags )
     ssize_t ret;
     while ((ret = send( fd, buffer, len, flags )) < 0 && errno == EINTR);
     if (ret < 0 && errno != EWOULDBLOCK) WARN( "send: %s\n", strerror( errno ) );
+    /* ml464: this is the TransmitFile data path — steam's HTTP server serving
+     * static steamui files lands here. */
+    ios_sock_big_note( fd, 1, ret < 0 ? 0 : ret, ret < 0 ? errno : 0 );
     return ret;
 }
 
@@ -1401,6 +1571,20 @@ static NTSTATUS try_transmit( int sock_fd, int file_fd, struct async_transmit_io
             else
                 ret = pread( file_fd, async->buffer, read_size, async->offset.QuadPart );
         } while (ret < 0 && errno == EINTR);
+#ifdef __APPLE__
+        /* ml464 (#78): a TransmitFile whose SOCKET sends look clean but whose
+         * transfer stops implicates this read — name it. */
+        if (ret < 0)
+        {
+            static int xmit_read_logs;
+            if (xmit_read_logs < 16)
+            {
+                xmit_read_logs++;
+                dprintf( 2, "[sock-big] transmit FILE-READ ERROR file_fd=%d errno=%d read_size=%u file_cursor=%u rev=ml464\n",
+                         file_fd, errno, read_size, (unsigned)async->file_cursor );
+            }
+        }
+#endif
         if (ret < 0) return errno_to_status( errno );
         TRACE( "read returned %zd\n", ret );
 

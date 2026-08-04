@@ -1032,6 +1032,35 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
     TRACE("(%p, %lu, %p, %u, %p, %p, %p)\n",
           hProcess, pid, hFile, DumpType, ExceptionParam, UserStreamParam, CallbackParam);
 
+    /* iOS-Mythic ml467 (wall #79, run ml466): Steam's crashhandler64 writes a
+     * minidump whenever its watchdog sees steamwebhelper "not responding".
+     * Under FEX the dump takes minutes — it walks the whole single-process
+     * address space and suspends every thread of the target pseudo-process on
+     * the way (breaking the steam<->webhelper transport) — so Steam's watchdog
+     * TerminateThread()s the dump worker mid-dump.  That orphans the
+     * write_minidump thread spawned below with dc pointing into the dead
+     * worker's freed stack (a live UAF writer), leaks Valve's reserve-then-
+     * commit dump buffers (0xef20000 -> 0x166b0000, 1.5x growth) on every
+     * retry, and the retry spiral ends in jetsam at 4096MB.  A dump of this
+     * process is useless to us anyway: write a header-only file and report
+     * success so the worker finishes instantly and frees its buffers. */
+    {
+        MINIDUMP_HEADER hdr;
+        DWORD           written;
+
+        ERR("[minidump-gate] rev=ml467 refusing dump pid=%lu type=%#x hFile=%p — header-only fast success\n",
+            pid, DumpType, hFile);
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.Signature = MINIDUMP_SIGNATURE;
+        hdr.Version = MINIDUMP_VERSION;
+        hdr.NumberOfStreams = 0;
+        hdr.StreamDirectoryRva = sizeof(hdr);
+        hdr.TimeDateStamp = time(NULL);
+        hdr.Flags = DumpType;
+        WriteFile(hFile, &hdr, sizeof(hdr), &written, NULL);
+        return TRUE;
+    }
+
     if (!(dc.process = process_find_by_handle(hProcess)))
     {
         if (!(sym_initialized = SymInitializeW(hProcess, NULL, TRUE)))

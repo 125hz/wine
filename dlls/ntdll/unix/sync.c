@@ -3529,6 +3529,389 @@ static unsigned int ios_alert_ring[IOS_ALERT_RING];
 static LONG ios_alert_ring_pos;
 static HANDLE ios_pump_alert_tid;   /* ml407: beacon thread's tid, set on its wait */
 
+/* ml439 (#74): periodic alert-flow dump, called from the monitor thread.
+ * The ml438 stall shows dozens of threads parked in NtWaitForAlertByThreadId
+ * with their alert futexes ALL reading 0 — the wakes were never delivered.
+ * Discriminator: if the send-side ring goes STATIC during the stall (pos not
+ * advancing) while waiters accumulate, RtlWakeAddress* is not finding the
+ * waiters at all — the PE-side addr_waiters table is split across ntdll
+ * copies (per-copy .data, the pseudo-process globals family) and the wake
+ * dies before reaching the unix layer. If the ring KEEPS advancing, delivery
+ * or tid-resolution is at fault instead. */
+void ios_alert_ring_dump(void)
+{
+    static LONG last_pos = -1;
+    LONG pos = ios_alert_ring_pos;
+    dprintf( 2, "[alert-ring] pos=%d (%+d since last) last8:"
+             " %04x->%04x %04x->%04x %04x->%04x %04x->%04x"
+             " %04x->%04x %04x->%04x %04x->%04x %04x->%04x rev=ml439\n",
+             (int)pos, (int)(last_pos < 0 ? 0 : pos - last_pos),
+             ios_alert_ring[(pos-0)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-0)&(IOS_ALERT_RING-1)] & 0xffff,
+             ios_alert_ring[(pos-1)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-1)&(IOS_ALERT_RING-1)] & 0xffff,
+             ios_alert_ring[(pos-2)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-2)&(IOS_ALERT_RING-1)] & 0xffff,
+             ios_alert_ring[(pos-3)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-3)&(IOS_ALERT_RING-1)] & 0xffff,
+             ios_alert_ring[(pos-4)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-4)&(IOS_ALERT_RING-1)] & 0xffff,
+             ios_alert_ring[(pos-5)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-5)&(IOS_ALERT_RING-1)] & 0xffff,
+             ios_alert_ring[(pos-6)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-6)&(IOS_ALERT_RING-1)] & 0xffff,
+             ios_alert_ring[(pos-7)&(IOS_ALERT_RING-1)] >> 16, ios_alert_ring[(pos-7)&(IOS_ALERT_RING-1)] & 0xffff );
+    last_pos = pos;
+}
+
+/* ml441 (#74): THE FIX for the lost-wake stall.  PE ntdll's RtlWaitOnAddress/
+ * RtlWakeAddress* (which back SRW locks and condition variables too) keep
+ * their waiter lists in `futex_queues[256]` — a static array in each ntdll
+ * COPY's .data.  Our pseudo-processes carry multiple ntdll copies (native +
+ * EC per pseudo-proc), so a waker walking copy B's array never finds a waiter
+ * registered in copy A: the wake dies PE-side, the futex stays 0, the waiter
+ * parks forever (ml440: every >60s parker was an addr=NULL RtlWaitOnAddress
+ * park).  Fix: ONE table in the unix dylib's .data — single copy per real
+ * process by construction — published to every PE copy via a private
+ * NtQuerySystemInformation class (0xf00d, system.c).  Layout mirrors PE
+ * struct futex_queue { struct list queue; LONG lock; } == 24 bytes; sharing
+ * across pseudo-procs is semantically correct because they share one address
+ * space (same VA == same memory). */
+struct ios_shared_futex_queue
+{
+    void *next, *prev;
+    LONG lock;
+};
+static struct ios_shared_futex_queue ios_shared_futex_queues[256];
+static const char ios_futex_shared_marker[] __attribute__((used)) = "ios-futex-shared rev=ml441";
+void *ios_get_shared_futex_queues(void)
+{
+    return ios_shared_futex_queues;
+}
+
+/* ml445 (#74): DEAD-HOLDER REAPER.  Steam's watchdog TerminateThread()s
+ * threads at arbitrary points ([thr-term] CROSS-TERM, ml444) — a victim
+ * holding FEX's WritePriorityMutex shared (TEB Instrumentation[7]=depth,
+ * [8]=&Futex, stamped by the fork's NoteReadAcquired) leaks the hold and the
+ * whole JIT machinery cascades to a standstill behind it (#74's stall family).
+ * The monitor census spots dead ports whose TEB stamp is still set; when NO
+ * live thread shares that TEB (recycling guard — stamps belong to the live
+ * generation when one exists), repair the lock word directly and deliver the
+ * writer/reader wakes through the ml441 SHARED futex table (single table =
+ * unix side can wake PE waiters).  WPM layout (WritePriorityMutex.h):
+ * bit31 write-owned, bit30 read-waiter, 29:16 write-waiters, 15:0 read-owners;
+ * writers wait on &Futex, readers on &Futex+2. */
+static void ios_shared_futex_wake( const void *addr, int all )
+{
+    struct ios_q { void *next, *prev; LONG lock; } *q;
+    struct ios_e { void *next, *prev; const void *addr; unsigned int tid; } *e;
+    void *head, *cur;
+    unsigned int tids[64];
+    int n = 0, i;
+    q = (struct ios_q *)&ios_shared_futex_queues[(((ULONG_PTR)addr) >> 4) % 256];
+    while (InterlockedCompareExchange( &q->lock, -1, 0 )) YieldProcessor();
+    head = (void *)q;
+    if (q->next)
+    {
+        for (cur = q->next; cur != head && n < 64; )
+        {
+            e = (struct ios_e *)cur;
+            cur = e->next;
+            if (e->addr == addr)
+            {
+                tids[n++] = e->tid;
+                if (!all) break;
+            }
+        }
+    }
+    InterlockedExchange( &q->lock, 0 );
+    for (i = 0; i < n; i++)
+        NtAlertThreadByThreadId( (HANDLE)(ULONG_PTR)tids[i] );
+}
+
+void ios_wpm_reap_shared( unsigned long long mutex_addr, unsigned int depth, unsigned long long dead_teb )
+{
+    volatile LONG *futex = (volatile LONG *)(ULONG_PTR)mutex_addr;
+    LONG old, desired;
+    unsigned int owners;
+    if (!mutex_addr || (mutex_addr & 3) || mutex_addr >= 0x8000000000ULL) return;
+    {
+        char *page = (char *)((ULONG_PTR)mutex_addr & ~0x3fffULL);
+        if (msync( page, 0x4000, MS_ASYNC )) return;
+    }
+    do
+    {
+        old = *futex;
+        owners = (unsigned int)old & 0xffff;
+        if (!owners) { depth = 0; break; }
+        if (depth > owners) depth = owners;
+        desired = old - (LONG)depth;
+    } while (InterlockedCompareExchange( (LONG *)futex, desired, old ) != old);
+    if (!depth) return;
+    dprintf( 2, "[lock-reap] WPM %#llx dead_teb=%#llx released %u shared (word %08x -> %08x) rev=ml445\n",
+             mutex_addr, dead_teb, depth, (unsigned int)old, (unsigned int)desired );
+    /* mirrors unlock_shared: last reader out with writers queued wakes ONE
+     * writer (they wait on the full word at +0); if no writers but the
+     * read-waiter bit is set, wake the readers at +2 */
+    if ((desired & 0xffff) == 0)
+    {
+        if (desired & 0x3fff0000) ios_shared_futex_wake( (const void *)(ULONG_PTR)mutex_addr, 0 );
+        else if (desired & 0x40000000) ios_shared_futex_wake( (const void *)(ULONG_PTR)(mutex_addr + 2), 1 );
+    }
+}
+
+/* ml446 (#74): reap a DEAD EXCLUSIVE owner of a wine-SRW-backed std::mutex
+ * (FEX's CodeBufferWriteMutex, stamped in TEB Instrumentation[6] while held —
+ * JIT.cpp).  Mirrors RtlReleaseSRWLockExclusive: owners=0, clear held bit;
+ * wake one exclusive waiter at lock+2 if any remain, else wake-all at lock.
+ * srw_lock layout: {short exclusive_waiters (bit0=held); ushort owners}. */
+void ios_srw_reap_exclusive( unsigned long long lock_addr, unsigned long long dead_teb )
+{
+    volatile LONG *word = (volatile LONG *)(ULONG_PTR)lock_addr;
+    LONG old, desired;
+    unsigned int excl;
+    if (!lock_addr || (lock_addr & 3) || lock_addr >= 0x8000000000ULL) return;
+    {
+        char *page = (char *)((ULONG_PTR)lock_addr & ~0x3fffULL);
+        if (msync( page, 0x4000, MS_ASYNC )) return;
+    }
+    do
+    {
+        old = *word;
+        excl = (unsigned int)old & 0xffff;
+        if (!(excl & 1)) return;   /* not exclusively held — nothing to reap */
+        desired = (LONG)(excl & ~1u);   /* owners := 0, held bit cleared, waiters kept */
+    } while (InterlockedCompareExchange( (LONG *)word, desired, old ) != old);
+    dprintf( 2, "[lock-reap] SRW %#llx dead_teb=%#llx released exclusive (word %08x -> %08x) rev=ml446\n",
+             lock_addr, dead_teb, (unsigned int)old, (unsigned int)desired );
+    if (desired & 0xffff)
+        ios_shared_futex_wake( (const void *)(ULONG_PTR)(lock_addr + 2), 0 );
+    else
+        ios_shared_futex_wake( (const void *)(ULONG_PTR)lock_addr, 1 );
+}
+
+/* ml440 (#74): waiter-address registry — name the lock everyone is parked on.
+ * ml439 proved the parked crowd receives ZERO alerts while a device-poll trio
+ * monopolizes the ring, so the wakes are never SENT for them.  Both surviving
+ * theories (dead SRW-lock holder vs per-ntdll-copy addr_waiters split) are
+ * discriminated by the WAIT ADDRESS: RtlWaitOnAddress passes the lock word's
+ * address as the cookie here.  Record it per parked thread; the monitor dumps
+ * every >60s parker with the word at its address.  Decode offline:
+ *   wine srw_lock = { short exclusive_waiters; ushort owners }
+ *   FEX WritePriorityMutex = bit31 write-owned, bit30 read-waiter,
+ *                            29:16 write-waiters, 15:0 read-owners
+ * Many threads on ONE address = one poisoned lock; owners!=0 with no live
+ * owner thread = dead holder confirmed. */
+#define IOS_ALERT_WAITER_MAX 512
+static struct
+{
+    void *tid;          /* slot owner; sticky across waits (lock-free claim) */
+    const void *addr;   /* wait-on-address cookie; NULL = not currently parked */
+    ULONGLONG since;    /* NtQuerySystemTime at park entry */
+    int inf;            /* 1 = INFINITE wait */
+} ios_alert_waiters[IOS_ALERT_WAITER_MAX];
+
+static int ios_alert_waiter_slot( void *tid )
+{
+    int i, free_i;
+    for (;;)
+    {
+        free_i = -1;
+        for (i = 0; i < IOS_ALERT_WAITER_MAX; i++)
+        {
+            if (ios_alert_waiters[i].tid == tid) return i;
+            if (free_i < 0 && !ios_alert_waiters[i].tid) free_i = i;
+        }
+        if (free_i < 0) return -1;
+        if (!InterlockedCompareExchangePointer( &ios_alert_waiters[free_i].tid, tid, NULL ))
+            return free_i;
+        /* lost the race for free_i to another thread; rescan */
+    }
+}
+
+/* ml443: x-ref for [census-hold] — return a thread's CURRENT alert-wait
+ * registration even when younger than the 60s dump bar (ml442 showed the
+ * stuck CodeInvalidationMutex holder cycling wake→recheck→re-park, so its
+ * age never accumulates; the address is the discriminator we need). */
+int ios_alert_waiter_lookup( unsigned int tid, const void **addr, int *age_s, int *inf )
+{
+    LARGE_INTEGER now;
+    int i;
+    for (i = 0; i < IOS_ALERT_WAITER_MAX; i++)
+    {
+        if (((unsigned int)(ULONG_PTR)ios_alert_waiters[i].tid & 0xffff) == (tid & 0xffff) &&
+            ios_alert_waiters[i].addr)
+        {
+            NtQuerySystemTime( &now );
+            *addr = ios_alert_waiters[i].addr;
+            *age_s = (int)((now.QuadPart - (LONGLONG)ios_alert_waiters[i].since) / 10000000);
+            *inf = ios_alert_waiters[i].inf;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void ios_alert_waiter_dump(void)
+{
+    LARGE_INTEGER now;
+    int i, parked = 0, over = 0, shown = 0;
+    NtQuerySystemTime( &now );
+    for (i = 0; i < IOS_ALERT_WAITER_MAX; i++)
+    {
+        if (!ios_alert_waiters[i].addr) continue;
+        parked++;
+        if ((now.QuadPart - (LONGLONG)ios_alert_waiters[i].since) / 10000000 >= 60) over++;
+    }
+    dprintf( 2, "[waiters] parked=%d over60s=%d rev=ml444\n", parked, over );
+
+    /* ml444: an address with >=3 concurrent waiters is a contended lock whose
+     * owning OBJECT we can't name offline (ml443: S=0x7c530f0098, 13 SRW-style
+     * exclusive waiters, neighbor allocation of a GuestToHostMap).  Dump the
+     * 0x140 bytes around it once per cycle — vtables/pointers inside identify
+     * the object type offline. */
+    {
+        static int hot_dumps;
+        const void *done[2] = { NULL, NULL };
+        int d = 0;
+        for (i = 0; i < IOS_ALERT_WAITER_MAX && d < 2 && hot_dumps < 12; i++)
+        {
+            const void *a = ios_alert_waiters[i].addr;
+            int j, nsame = 0;
+            if (!a || (ULONG_PTR)a <= 0x10000 || a == done[0] || a == done[1]) continue;
+            for (j = 0; j < IOS_ALERT_WAITER_MAX; j++)
+                if (ios_alert_waiters[j].addr == a) nsame++;
+            if (nsame < 3) continue;
+            done[d++] = a;
+            hot_dumps++;
+            {
+                ULONG_PTR base = ((ULONG_PTR)a & ~0xfULL) - 0x100;
+                int line;
+                dprintf( 2, "[hot-lock] addr=%p waiters=%d dumping [%p,%p) rev=ml444\n",
+                         a, nsame, (void *)base, (void *)(base + 0x140) );
+                for (line = 0; line < 5; line++)
+                {
+                    ULONG_PTR row = base + line * 0x40;
+                    unsigned long long w[8] = { 0 };
+                    char *page = (char *)(row & ~0x3fffULL);
+                    if (msync( page, 0x4000, MS_ASYNC )) continue;
+                    if ((((row + 0x38) & ~0x3fffULL) != (ULONG_PTR)page) &&
+                        msync( (char *)((row + 0x38) & ~0x3fffULL), 0x4000, MS_ASYNC )) continue;
+                    memcpy( w, (void *)row, 0x40 );
+                    dprintf( 2, "[hot-lock]  %p: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                             (void *)row, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7] );
+                }
+            }
+        }
+    }
+    for (i = 0; i < IOS_ALERT_WAITER_MAX && shown < 32; i++)
+    {
+        const void *a = ios_alert_waiters[i].addr;
+        void *tid = ios_alert_waiters[i].tid;
+        LONGLONG age;
+        unsigned int w0 = 0xdeaddead, w1 = 0xdeaddead;
+        if (!a) continue;
+        age = (now.QuadPart - (LONGLONG)ios_alert_waiters[i].since) / 10000000;
+        if (age < 60) continue;
+        shown++;
+        /* safe-probe the lock word: msync rejects unmapped pages (Darwin
+         * returns ENOMEM).  ml442: read the CONTAINING aligned word — SRW and
+         * FEX WritePriorityMutex read-waits pass lock+2 (2-aligned), which the
+         * old 4-aligned-only guard refused (ml441's deaddead trio). */
+        if (!((ULONG_PTR)a & 1) && (ULONG_PTR)a > 0x10000 && (ULONG_PTR)a < 0x8000000000ULL)
+        {
+            ULONG_PTR al = (ULONG_PTR)a & ~3ULL;
+            char *page = (char *)(al & ~0x3fffULL);
+            if (!msync( page, 0x4000, MS_ASYNC ))
+            {
+                w0 = *(volatile unsigned int *)al;
+                if (((al + 4) & ~0x3fffULL) == (ULONG_PTR)page)
+                    w1 = *(volatile unsigned int *)(al + 4);
+            }
+        }
+        dprintf( 2, "[waiters]  tid=%04x addr=%p age=%ds %s w0=%08x w1=%08x\n",
+                 (int)(ULONG_PTR)tid, a, (int)age,
+                 ios_alert_waiters[i].inf ? "INF" : "TMO", w0, w1 );
+    }
+}
+
+/* ml447 (#74): ORPHAN-LOCK detector.  ml446 proved the dead S-owner vanishes
+ * entirely (registry row + TEB recycled) before the census can see the corpse
+ * — so detect the ORPHANED LOCK instead of the dead owner: an SRW-backed
+ * std::mutex that is (a) held-exclusive, (b) has >=3 parked exclusive waiters
+ * (2-misaligned wait addrs = lock+2), and (c) is stamped by NO LIVE thread's
+ * TEB Instrumentation[6] (every acquire stamps since ml446), for 3 consecutive
+ * monitor cycles, has a dead owner with certainty — reap it.  The live-stamp
+ * set is built by the monitor (registry + Mach liveness) and passed in. */
+void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
+{
+    static struct { unsigned long long lock; int strikes; } susp[8];
+    int i, j, k;
+    for (i = 0; i < IOS_ALERT_WAITER_MAX; i++)
+    {
+        const void *a = ios_alert_waiters[i].addr;
+        unsigned long long lock;
+        unsigned int word;
+        int nsame = 0, stamped = 0;
+        if (!a || ((ULONG_PTR)a & 3) != 2 || (ULONG_PTR)a < 0x10000 || (ULONG_PTR)a >= 0x8000000000ULL) continue;
+        lock = (unsigned long long)(ULONG_PTR)a - 2;
+        for (j = 0; j < IOS_ALERT_WAITER_MAX; j++)
+            if (ios_alert_waiters[j].addr == a) nsame++;
+        if (nsame < 3) continue;
+        {
+            char *page = (char *)((ULONG_PTR)lock & ~0x3fffULL);
+            if (msync( page, 0x4000, MS_ASYNC )) continue;
+            word = *(volatile unsigned int *)(ULONG_PTR)lock;
+        }
+        if (!(word & 1))
+        {
+            /* released legitimately — clear any stale suspicion */
+            for (j = 0; j < 8; j++)
+                if (susp[j].lock == lock) { susp[j].lock = 0; susp[j].strikes = 0; }
+            continue;
+        }
+        /* ml468: the word must be a COHERENT exclusively-held wine SRW before
+         * we may reap it as one.  RtlAcquireSRWLockExclusive sets owners
+         * (high 16) to exactly 1 and bit0 of exclusive_waiters; parked
+         * exclusive waiters occupy bits 15:1 in steps of 2, so >=3 parked
+         * threads imply a non-empty queue.  The ml467 run reaped 0x40010001
+         * here — not an SRW at all but a live shared-owned FEX
+         * WritePriorityMutex (read-owners=1, write-waiter=1; its read-waiters
+         * park at lock+2 too, the lock-ID-rule trap) held by a running sweep
+         * thread; zeroing it killed the run within a second. */
+        if ((word >> 16) != 1 || ((word & 0xffff) >> 1) == 0)
+        {
+            static int incoherent_logs;
+            if (incoherent_logs < 8)
+            {
+                incoherent_logs++;
+                dprintf( 2, "[lock-orphan] SKIP %#llx word=%08x waiters=%d incoherent-as-SRW (FEX lock?) rev=ml468\n",
+                         lock, word, nsame );
+            }
+            for (j = 0; j < 8; j++)
+                if (susp[j].lock == lock) { susp[j].lock = 0; susp[j].strikes = 0; }
+            continue;
+        }
+        for (k = 0; k < nstamps; k++) if (live_stamps[k] == lock) stamped = 1;
+        for (j = 0; j < 8; j++) if (susp[j].lock == lock) break;
+        if (stamped)
+        {
+            if (j < 8) { susp[j].lock = 0; susp[j].strikes = 0; }
+            continue;
+        }
+        if (j == 8)   /* new suspect: claim a free slot */
+        {
+            for (j = 0; j < 8 && susp[j].lock; j++) ;
+            if (j == 8) continue;
+            susp[j].lock = lock;
+            susp[j].strikes = 0;
+        }
+        susp[j].strikes++;
+        dprintf( 2, "[lock-orphan] SRW %#llx word=%08x waiters=%d no-live-stamp strike=%d/3 rev=ml447\n",
+                 lock, word, nsame, susp[j].strikes );
+        if (susp[j].strikes >= 3)
+        {
+            ios_srw_reap_exclusive( lock, 0xDEADull );
+            susp[j].lock = 0;
+            susp[j].strikes = 0;
+        }
+    }
+}
+
+
 /***********************************************************************
  *             NtAlertThreadByThreadId (NTDLL.@)
  */
@@ -3543,21 +3926,30 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
 #ifdef USE_FUTEX
     {
         LONG *futex = &entry->futex;
+        /* iOS-Mythic ml482 (#86): NtAlertThreadByThreadId itself needs no TEB —
+         * it wakes a TARGET tid — but the two probes below read
+         * NtCurrentTeb()->ClientId.UniqueThread, i.e. TEB+0x48. Threads created
+         * directly by CEF/FEX have no TEB, so on those the probe (not the
+         * function) null-dereferenced and killed the app at exactly the moment
+         * the login-window popup brought new threads into this path (ml481:
+         * [host-fault] sig=11 addr=0x48 at NtAlertThreadByThreadId+0x10c, the
+         * last line of the log). Read the tid defensively; 0 means "unknown
+         * sender", which is all the diagnostics ever needed. */
+        TEB *self_teb = NtCurrentTeb();
+        unsigned int self_tid = self_teb ? (unsigned int)(ULONG_PTR)self_teb->ClientId.UniqueThread : 0;
         /* iOS-Mythic ml400 (task #60): ring of recent alerts so a storming
          * waiter can name its pounder — see [alert-storm] in
          * NtWaitForAlertByThreadId. */
         LONG pos = InterlockedIncrement( &ios_alert_ring_pos );
         ios_alert_ring[pos & (IOS_ALERT_RING - 1)] =
-            ((unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread << 16) |
-            ((unsigned int)(ULONG_PTR)tid & 0xffff);
+            (self_tid << 16) | ((unsigned int)(ULONG_PTR)tid & 0xffff);
         /* ml407: did ANYONE (any ntdll copy) ever try to wake the parked pump? */
         if (tid && tid == ios_pump_alert_tid)
         {
             static LONG n;
             if (n < 40) { InterlockedIncrement( &n );
-                ERR( "[alert-unix] ALERT-SENT from=%04x -> pump tid=%04x futex=%p\n",
-                     (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
-                     (int)(ULONG_PTR)tid, entry ); }
+                ERR( "[alert-unix] ALERT-SENT from=%04x -> pump tid=%04x futex=%p rev=ml482\n",
+                     (int)self_tid, (int)(ULONG_PTR)tid, entry ); }
         }
         if (!InterlockedExchange( futex, 1 ))
             futex_wake_one( futex );
@@ -3645,6 +4037,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         LONG *futex = &entry->futex;
         ULONGLONG end;
         int ret;
+        int ios_wslot;
 
         if (timeout)
         {
@@ -3652,6 +4045,19 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
                 timeout = NULL;
             else
                 end = get_absolute_timeout( timeout );
+        }
+
+        /* ml440 (#74): register this park; addr NULL uses sentinel 0x1 so the
+         * park still counts.  Registered after INFINITE normalization so inf
+         * is accurate. */
+        ios_wslot = ios_alert_waiter_slot( NtCurrentTeb()->ClientId.UniqueThread );
+        if (ios_wslot >= 0)
+        {
+            LARGE_INTEGER ios_wnow;
+            NtQuerySystemTime( &ios_wnow );
+            ios_alert_waiters[ios_wslot].since = ios_wnow.QuadPart;
+            ios_alert_waiters[ios_wslot].inf = !timeout;
+            ios_alert_waiters[ios_wslot].addr = address ? address : (const void *)0x1;
         }
 
         while (!InterlockedExchange( futex, 0 ))
@@ -3670,12 +4076,14 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
             if (ret == -1 && errno == ETIMEDOUT)
             {
+                if (ios_wslot >= 0) ios_alert_waiters[ios_wslot].addr = NULL;
                 if (ios_marked && ios_alert_unix_n < 120) { InterlockedIncrement( &ios_alert_unix_n );
                     ERR( "[alert-unix] tid=%04x -> TIMEOUT\n",
                          (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread ); }
                 return STATUS_TIMEOUT;
             }
         }
+        if (ios_wslot >= 0) ios_alert_waiters[ios_wslot].addr = NULL;
         if (ios_marked && ios_alert_unix_n < 120) { InterlockedIncrement( &ios_alert_unix_n );
             ERR( "[alert-unix] tid=%04x -> ALERTED\n",
                  (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread ); }

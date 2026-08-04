@@ -124,6 +124,25 @@
 #endif
 
 #ifndef HAVE_NETINET_TCP_FSM_H
+#ifdef __APPLE__
+/* iOS-Mythic ml478 (#79 root cause): Darwin's TCP_CONNECTION_INFO reports
+ * BSD-numbered FSM states (LISTEN=1, ESTABLISHED=4), but the iOS SDK ships
+ * no netinet/tcp_fsm.h, so the Linux-numbered fallback below was used:
+ * every listener (1) matched TCPS_ESTABLISHED and every live connection (4)
+ * matched TCPS_FIN_WAIT_1, so the ESTAB TCP table held exactly the wrong
+ * rows and Steam's loopback peer authentication could never succeed. */
+#define TCPS_CLOSED       0
+#define TCPS_LISTEN       1
+#define TCPS_SYN_SENT     2
+#define TCPS_SYN_RECEIVED 3
+#define TCPS_ESTABLISHED  4
+#define TCPS_CLOSE_WAIT   5
+#define TCPS_FIN_WAIT_1   6
+#define TCPS_CLOSING      7
+#define TCPS_LAST_ACK     8
+#define TCPS_FIN_WAIT_2   9
+#define TCPS_TIME_WAIT   10
+#else
 #define TCPS_ESTABLISHED  1
 #define TCPS_SYN_SENT     2
 #define TCPS_SYN_RECEIVED 3
@@ -136,6 +155,22 @@
 #define TCPS_LISTEN      10
 #define TCPS_CLOSING     11
 #endif
+#endif
+
+/* iOS-Mythic ml480 (#84): accept-latency instrument. Steam's WebUITransport
+ * only drains its listen backlog every 2-3 minutes (11-13 connections logged
+ * in one second, then nothing), so CEF's ~12s websocket handshake always times
+ * out and the login window never appears. [acc-ready] stamps the moment the
+ * SERVER sees a pending connection on a listener; [acc-take] stamps the moment
+ * the GUEST actually accepts it. ready-prompt + take-late ⇒ Steam's thread is
+ * the laggard (frame stalls); no [acc-ready] at all ⇒ our poll registration is.
+ * Wall-clock ms, since mythic-log lines carry no timestamps after boot. */
+static unsigned long long ios_acc_now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday( &tv, NULL );
+    return (unsigned long long)tv.tv_sec * 1000ull + (unsigned long long)tv.tv_usec / 1000ull;
+}
 
 static const char magic_loopback_addr[] = {127, 12, 34, 56};
 
@@ -1440,6 +1475,19 @@ static void sock_poll_event( struct fd *fd, int event )
         break;
 
     case SOCK_LISTENING:
+        /* iOS-Mythic ml480 (#84): see accept_socket — stamp when the SERVER
+         * first sees a pending connection, so [acc-take] can be differenced
+         * against it. */
+        if (event & POLLIN)
+        {
+            static int acc_ready_logged;
+            if (acc_ready_logged < 48)
+            {
+                acc_ready_logged++;
+                fprintf( stderr, "[acc-ready] lport=%u t=%llums rev=ml480\n",
+                         (unsigned int)ntohs( sock->addr.in.sin_port ), ios_acc_now_ms() );
+            }
+        }
         break;
 
     case SOCK_CONNECTED:
@@ -2092,6 +2140,18 @@ static struct sock *accept_socket( struct sock *sock )
     int	acceptfd;
 
     if (get_unix_fd( sock->fd ) == -1) return NULL;
+
+    {
+        static int acc_take_logged;
+        if (acc_take_logged < 48)
+        {
+            acc_take_logged++;
+            fprintf( stderr, "[acc-take] lport=%u owner=%u t=%llums deferred=%d rev=ml480\n",
+                     (unsigned int)ntohs( sock->addr.in.sin_port ),
+                     current ? (unsigned int)current->process->id : 0,
+                     ios_acc_now_ms(), sock->deferred ? 1 : 0 );
+        }
+    }
 
     if ( sock->deferred )
     {
@@ -2790,6 +2850,28 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         getsockname( unix_fd, &unix_addr.addr, &unix_len );
         sock->addr_len = sockaddr_from_unix( &unix_addr, &sock->addr.addr, sizeof(sock->addr) );
         sock->peer_addr_len = sockaddr_from_unix( &peer_addr, &sock->peer_addr.addr, sizeof(sock->peer_addr));
+
+        /* iOS-Mythic ml474 (#79): connect census. The transport reject loop
+         * hinges on the connecting socket's row appearing in the AF_INET
+         * table SteamUI authenticates from — a dial that lands on the v6
+         * family can never appear there. One line per stream connect names
+         * the owner, both families, the ports, and whether peer_addr stuck. */
+        if (sock->type == WS_SOCK_STREAM)
+        {
+            static int conns_logged;
+            if (conns_logged < 64)
+            {
+                unsigned short lport = 0, dport = 0;
+                conns_logged++;
+                if (peer_addr.addr.sa_family == AF_INET) dport = ntohs( peer_addr.in.sin_port );
+                else if (peer_addr.addr.sa_family == AF_INET6) dport = ntohs( peer_addr.in6.sin6_port );
+                if (sock->addr.addr.sa_family == WS_AF_INET) lport = ntohs( sock->addr.in.sin_port );
+                else if (sock->addr.addr.sa_family == WS_AF_INET6) lport = ntohs( sock->addr.in6.sin6_port );
+                fprintf( stderr, "[srv-conn] owner=%u wsfam=%u ufam=%u lport=%u dport=%u nb=%d ret=%d plen=%u rev=ml478\n",
+                         current->process->id, sock->family, peer_addr.addr.sa_family,
+                         lport, dport, sock->nonblocking, ret, sock->peer_addr_len );
+            }
+        }
 
         sock->bound = 1;
 
@@ -4288,6 +4370,18 @@ static MIB_TCP_STATE get_tcp_socket_state( int fd )
     if (getsockopt( fd, IPPROTO_TCP, TCP_INFO, &info, &info_len ) == 0)
         return tcp_state_to_mib_state( info.tcpi_state );
 
+    /* iOS-Mythic ml474 (#79): the ESTAB fallback below can lie a listener
+     * into the ESTAB table (observed: port 27060 with no peer at state=5) —
+     * record why it fired so honest states can be told from fallbacks. */
+    {
+        static int fails_logged;
+        if (fails_logged < 32)
+        {
+            fails_logged++;
+            fprintf( stderr, "[tcp-state] TCP_INFO fd=%d errno=%d -> fallback ESTAB rev=ml478\n", fd, errno );
+        }
+    }
+
     if (debug_level)
         fprintf( stderr, "getsockopt TCP_INFO failed: %s\n", strerror( errno ) );
 
@@ -4314,6 +4408,32 @@ static int enum_tcp_connections( struct process *process, struct object *obj, vo
         return 0;
 
     socket_state = get_tcp_socket_state( get_unix_fd(sock->fd) );
+
+    /* iOS-Mythic ml474 (#79): census of every visited socket on the count
+     * pass — the ml473 run's table froze at 3 rows while the webhelper's
+     * dialing client socket (and steam's accepted peers) never appeared.
+     * This names every socket the walk actually reaches, pre-filter, so
+     * "visited but filtered" separates from "never visited". */
+    if (!info->conn)
+    {
+        static int visits_logged;
+        if (visits_logged < 96)
+        {
+            unsigned short lport = 0, pport = 0;
+            visits_logged++;
+            if (sock->addr.addr.sa_family == WS_AF_INET) lport = ntohs( sock->addr.in.sin_port );
+            else if (sock->addr.addr.sa_family == WS_AF_INET6) lport = ntohs( sock->addr.in6.sin6_port );
+            if (sock->peer_addr_len)
+            {
+                if (sock->peer_addr.addr.sa_family == WS_AF_INET) pport = ntohs( sock->peer_addr.in.sin_port );
+                else if (sock->peer_addr.addr.sa_family == WS_AF_INET6) pport = ntohs( sock->peer_addr.in6.sin6_port );
+            }
+            fprintf( stderr, "[tcp-enum] owner=%u wsfam=%u state=%u lport=%u pport=%u plen=%u filter=%u rev=ml478\n",
+                     process->id, sock->family, socket_state, lport, pport,
+                     sock->peer_addr_len, info->state_filter );
+        }
+    }
+
     if (info->state_filter && socket_state != info->state_filter)
         return 0;
 

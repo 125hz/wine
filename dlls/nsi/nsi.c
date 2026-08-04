@@ -17,6 +17,8 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "winsock2.h"
 #include "winternl.h"
 #include "ws2ipdef.h"
@@ -26,11 +28,28 @@
 #include "netiodef.h"
 #include "wine/nsi.h"
 #include "wine/debug.h"
+#include "wine/unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(nsi);
 
 static HANDLE nsi_device = INVALID_HANDLE_VALUE;
 static HANDLE nsi_device_async = INVALID_HANDLE_VALUE;
+
+/* iOS-Mythic 2026-08-03 rev=ml470 (#79 transport): nsiproxy.sys is not
+ * shipped on iOS, so \\.\Nsi never exists and every NSI table read
+ * fails — Steam's loopback peer authentication (GetExtendedTcpTable pid
+ * lookup) dies before any pid compare and each CEF connection is
+ * rejected as "unknown source". When the device is absent, service the
+ * enumerate from a statically linked unixlib (TCP connection tables via
+ * the in-process wineserver; see build/ntdll-unix/nsi_unixlib_ios.c).
+ * On platforms with a real nsiproxy the device opens and this path
+ * never runs. */
+static BOOL nsi_unix_fallback( void )
+{
+    static int available = -1;
+    if (available == -1) available = !__wine_init_unix_call();
+    return available == 1;
+}
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
 {
@@ -168,7 +187,23 @@ DWORD WINAPI NsiEnumerateObjectsAllParametersEx( struct nsi_enumerate_all_ex *pa
     struct nsiproxy_enumerate_all in;
     BYTE *out, *ptr;
 
-    if (device == INVALID_HANDLE_VALUE) return GetLastError();
+    if (device == INVALID_HANDLE_VALUE)
+    {
+        DWORD device_err = GetLastError();
+        NTSTATUS status;
+        static LONG logged;
+
+        if (!nsi_unix_fallback()) return device_err;
+        status = WINE_UNIX_CALL( 0, params );
+        if (!InterlockedExchange( &logged, 1 ))
+            ERR( "no \\\\.\\Nsi (err %lu); serviced in-process, status %#lx rev=ml472\n",
+                 device_err, status );
+        if (status == STATUS_BUFFER_OVERFLOW) return ERROR_MORE_DATA;
+        /* ml472: unserviced tables keep the exact pre-fallback error so callers
+         * see the same failure (2) they always did, not NOT_SUPPORTED (50) */
+        if (status == STATUS_NOT_SUPPORTED) return device_err;
+        return RtlNtStatusToDosError( status );
+    }
 
     out_size = sizeof(DWORD) +
         (params->key_size + params->rw_size + params->dynamic_size + params->static_size) * params->count;

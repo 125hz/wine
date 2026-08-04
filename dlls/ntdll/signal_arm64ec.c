@@ -2373,6 +2373,31 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         {
             TRACE( "calling handler %p (rec=%p, frame=%I64x context=%p, dispatch=%p)\n",
                    dispatch.LanguageHandler, rec, dispatch.EstablisherFrame, orig_context, &dispatch );
+            /* iOS-Mythic #81 (ml475 fix, REVERTED ml477 — do not re-land
+             * without gating).  LanguageHandler is ImageBase + unwind handler
+             * RVA, i.e. a PE VA, and PE .text is non-executable here, so
+             * call_seh_handler's `blr x11` faults on instruction fetch.  The
+             * Mach handler redirects it correctly every time, but the pointer
+             * is recomputed from unwind data on every dispatch, so the
+             * stale-VA healer can never fix it — one kernel round-trip per
+             * SEH handler call, forever.  Wrapping the handler in
+             * xlate_ios_jit() here provably eliminated that (ml475: 786k
+             * faults -> 0, [seh-xlate] verified live in 3 processes).
+             *
+             * REVERTED anyway, on evidence: the storm ONLY occurs with
+             * --js-flags=--jitless OFF (ml474e 186 storm samples; ml473d /
+             * ml474a / ml476 with jitless ON = 0), and jitless-off is itself
+             * convicted (it parks CrBrowserMain right after BrowserReady).
+             * So in the shipping config the fix buys nothing, while ml476
+             * (jitless ON + this wrap) crashed repeatedly ~3s after
+             * BrowserReady in the libcef/chrome_elf SEH path — the wrap was
+             * the only new variable.  Suspected mechanism: translating a
+             * handler that is x86-64 GUEST code defeats the
+             * __os_arm64x_dispatch_icall classification, which keys off PE
+             * space (see #52), so the emulator never gets it.  If this is
+             * ever re-landed, gate it on the target being EC/native code and
+             * log EVERY translation, not the first 4 per process — that cap
+             * is why the guest-handler case stayed invisible. */
             res = call_seh_handler( rec, dispatch.EstablisherFrame, orig_context,
                                     &dispatch, dispatch.LanguageHandler );
             rec->ExceptionFlags &= EXCEPTION_NONCONTINUABLE;
