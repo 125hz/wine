@@ -22,6 +22,7 @@
 #pragma makedep unix
 #endif
 
+#include <unistd.h>   /* iOS-Mythic ml506: dprintf for the blit census */
 #include <stdarg.h>
 #include <limits.h>
 #include <math.h>
@@ -619,6 +620,38 @@ BOOL WINAPI NtGdiStretchBlt( HDC hdcDst, INT xDst, INT yDst, INT widthDst, INT h
             rop &= ~NOMIRRORBITMAP;
         }
         ret = !get_vis_rectangles( dcDst, &dst, dcSrc, &src );
+
+        /* iOS-Mythic ml506: blit census.
+         *
+         * The Steam login surface contains DUPLICATED 256x256 tiles — the
+         * same tile content composited into two different slots, with other
+         * slots left black. Every write into that DIB is serialised under
+         * window_surface_lock and our read is too, so the duplication is
+         * genuinely IN the bitmap: either the blits carry wrong destination
+         * coordinates, or Chromium's own backing store already holds it.
+         *
+         * This separates those two. A blit whose dst lands in one tile slot
+         * while its src comes from a different one is the defect; blits whose
+         * src and dst agree mean the source bitmap was already wrong and the
+         * fault is upstream of GDI entirely.
+         *
+         * Filtered to >=64px blits so cursor/glyph traffic doesn't bury it. */
+        if (dst.width >= 64 && dst.height >= 64)
+        {
+            static unsigned blit_n;
+            unsigned n = ++blit_n;
+            if (n <= 300 || (n % 512) == 0)
+                dprintf( 2, "[blit] #%u rop=%06x  SRC phys=%d,%d %dx%d vis={%d,%d,%d,%d}"
+                         "  DST phys=%d,%d %dx%d vis={%d,%d,%d,%d}%s rev=ml506\n",
+                         n, (unsigned)rop,
+                         src.x, src.y, src.width, src.height,
+                         (int)src.visrect.left, (int)src.visrect.top,
+                         (int)src.visrect.right, (int)src.visrect.bottom,
+                         dst.x, dst.y, dst.width, dst.height,
+                         (int)dst.visrect.left, (int)dst.visrect.top,
+                         (int)dst.visrect.right, (int)dst.visrect.bottom,
+                         (src.x != dst.x || src.y != dst.y) ? "  <<< SRC!=DST OFFSET" : "" );
+        }
 
         TRACE("src %p log=%d,%d %dx%d phys=%d,%d %dx%d vis=%s  dst %p log=%d,%d %dx%d phys=%d,%d %dx%d vis=%s  rop=%06x\n",
               hdcSrc, src.log_x, src.log_y, src.log_width, src.log_height,

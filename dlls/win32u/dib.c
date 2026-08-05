@@ -63,6 +63,7 @@
 #pragma makedep unix
 #endif
 
+#include <unistd.h>   /* iOS-Mythic ml507 */
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -629,6 +630,21 @@ INT WINAPI NtGdiStretchDIBitsInternal( HDC hdc, INT xDst, INT yDst, INT widthDst
                                        const void *bits, const BITMAPINFO *bmi, UINT coloruse,
                                        DWORD rop, UINT max_info, UINT max_bits, HANDLE xform )
 {
+    /* iOS-Mythic ml507: the ml506 census watched NtGdiBitBlt/StretchBlt and
+     * caught only 480x400 VGUI sprite blits — not one full-window paint,
+     * though the CEF window presented hundreds of times. So Chromium reaches
+     * the window through a DIB-to-device path instead. Cover those too.
+     * The surface shows a whole panel MOVED by a constant offset with the
+     * source left black, so the destination coordinates are the thing to
+     * watch. */
+    {
+        static unsigned n_sdib;
+        unsigned n = ++n_sdib;
+        if (n <= 200 || (n % 512) == 0)
+            dprintf( 2, "[dib-blit] StretchDIBits #%u dst=%d,%d %dx%d  src=%d,%d %dx%d rev=ml507\n",
+                     n, xDst, yDst, widthDst, heightDst, xSrc, ySrc, widthSrc, heightSrc );
+    }
+
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *info = (BITMAPINFO *)buffer;
     PHYSDEV physdev;
@@ -889,6 +905,17 @@ INT WINAPI NtGdiSetDIBitsToDeviceInternal( HDC hdc, INT xDest, INT yDest, DWORD 
                                            UINT coloruse, UINT max_bits, UINT max_info,
                                            BOOL xform_coords, HANDLE xform )
 {
+    /* iOS-Mythic ml507: see StretchDIBits above. */
+    {
+        static unsigned n_setdib;
+        unsigned n = ++n_setdib;
+        if (n <= 200 || (n % 512) == 0)
+            dprintf( 2, "[dib-blit] SetDIBitsToDevice #%u dst=%d,%d %ux%u  src=%d,%d "
+                     "startscan=%u lines=%u rev=ml507\n",
+                     n, xDest, yDest, (unsigned)cx, (unsigned)cy, xSrc, ySrc,
+                     (unsigned)startscan, (unsigned)lines );
+    }
+
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *info = (BITMAPINFO *)buffer;
     PHYSDEV physdev;

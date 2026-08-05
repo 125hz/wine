@@ -22,6 +22,7 @@
 #pragma makedep unix
 #endif
 
+#include <unistd.h>   /* iOS-Mythic ml508 */
 #include <assert.h>
 
 #include "ntgdi_private.h"
@@ -992,6 +993,52 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
                        const struct gdi_image_bits *bits, struct bitblt_coords *src,
                        struct bitblt_coords *dst, DWORD rop )
 {
+    /* iOS-Mythic ml508: the real pixel-landing choke point.
+     *
+     * ml506/ml507 eliminated FOUR entry points — NtGdiBitBlt, StretchBlt,
+     * StretchDIBits and SetDIBitsToDevice never carry a window-sized paint
+     * for the CEF window (only 480x400 VGUI sprites and 32x32 icons). So
+     * probing NtGdi entries one at a time is the wrong strategy: this is
+     * where EVERY GDI path deposits image data into a DIB, whichever entry
+     * it came through.
+     *
+     * The surface shows a panel written at a constant wrong offset
+     * (~-550,-97) with its true location left black, and the halo moving
+     * independently of the QR it surrounds — a per-draw-op destination
+     * error. dst->visrect is that destination. Logging src alongside it
+     * shows whether the offset is introduced here or arrives already wrong. */
+    /* ml514: arm the source-bitmap watch on Chromium's full-window paint.
+     * `bits->ptr` is the buffer Chromium composited into and hands us — the
+     * one that already carries the displaced panel. Watching it names the
+     * GUEST code that wrote each region. Only the big paint qualifies; the
+     * watch itself is one-shot and env-gated (MYTHIC_SRCWATCH). */
+    if (dst && bits && bits->ptr && dst->visrect.right - dst->visrect.left >= 640
+        && dst->visrect.bottom - dst->visrect.top >= 400)
+    {
+        extern void ios_srcwatch_arm( const void *bits, unsigned long len );
+        ios_srcwatch_arm( bits->ptr,
+                          (unsigned long)info->bmiHeader.biSizeImage ?
+                              (unsigned long)info->bmiHeader.biSizeImage :
+                              (unsigned long)((dst->visrect.right - dst->visrect.left) * 4 *
+                                              (dst->visrect.bottom - dst->visrect.top)) );
+    }
+
+    if (dst && src && dst->visrect.right - dst->visrect.left >= 24)
+    {
+        static unsigned n_put;
+        unsigned n = ++n_put;
+        if (n <= 400 || (n % 512) == 0)
+            dprintf( 2, "[put-image] #%u SRC vis={%d,%d,%d,%d} %dx%d  DST vis={%d,%d,%d,%d} %dx%d"
+                     "  rop=%08x%s rev=ml508\n", n,
+                     (int)src->visrect.left, (int)src->visrect.top,
+                     (int)src->visrect.right, (int)src->visrect.bottom, src->width, src->height,
+                     (int)dst->visrect.left, (int)dst->visrect.top,
+                     (int)dst->visrect.right, (int)dst->visrect.bottom, dst->width, dst->height,
+                     (unsigned)rop,
+                     (src->visrect.left != dst->visrect.left ||
+                      src->visrect.top  != dst->visrect.top) ? "  <<< OFFSET" : "" );
+    }
+
     DC *dc = get_physdev_dc( dev );
     struct clipped_rects clipped_rects;
     DWORD ret = ERROR_SUCCESS;
