@@ -794,6 +794,101 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
  * A transfer that STOPS at a byte count without an error implicates the
  * file-read side of TransmitFile instead; an errno names the socket layer.
  * Racy counters are acceptable — fixed array, no pointers, probe-only. */
+/* iOS-Mythic ml578: TRACE THE FIRST BYTES ON EXTERNAL TCP SOCKETS.
+ *
+ * State of the hunt: the Shenzhen network is EXONERATED — from the same phone,
+ * Safari got 91 CM endpoints from the directory API, loaded /cmping/ on 443, and
+ * got a real 403 from cmp1-tyo3:27019 (so TCP+TLS+HTTP all complete on the odd CM
+ * ports too). Our own probe shows CM TCP connects genuinely complete
+ * (getpeername succeeds). Yet every PingWebSocketCM fails.
+ *
+ * The poll-cache theory is dead (0 stale in 18.4M classifications), but that only
+ * exonerated fd CLASSIFICATION — not readiness-mask translation, wake delivery,
+ * or async completion. And the single [schannel-ios] gnutls handshake is NOT a
+ * measure of Steam's TLS: steamclient64.dll carries Valve's own statically-linked
+ * OpenSSL, so its CM handshakes never touch Wine's SChannel at all. Counting
+ * record types on the wire is the only reliable way to see them. (Both points
+ * from Sol; the gnutls misreading was mine.)
+ *
+ * Five bytes is all we take — enough to classify a TLS record, not enough to log
+ * anything sensitive:
+ *     16 03 xx = handshake    15 03 xx = alert    17 03 xx = application data
+ *
+ * Per-socket budget, not one global counter: a chatty local socket must not be
+ * able to starve the CM sockets, which is the trap that has invalidated three
+ * probes in this investigation already. Loopback is skipped so the steamloopback
+ * traffic cannot drown the census. */
+static void ios_sock_wire( int fd, int is_send, const void *buf, long ret_bytes, int err )
+{
+    static struct { int fd; unsigned short port; int n; int wouldblock; } tab[64];
+    static int used, announced;
+    int i, slot = -1;
+    struct sockaddr_storage pa;
+    socklen_t pl = sizeof(pa);
+    unsigned short port = 0;
+    const unsigned char *b = (const unsigned char *)buf;
+
+    /* ml579: OFF for the timing run. Each call costs a getpeername(), and this
+     * fires on every send/recv — Steam's CM ping budget is 1000 ms total.
+     *
+     * Also note before re-enabling: the 0x17 classifier below is WRONG FOR TLS
+     * 1.3. Everything after ServerHello — EncryptedExtensions, Certificate,
+     * CertificateVerify, Finished, NewSessionTicket — uses record type 0x17, so
+     * "TLS-APPDATA" cannot distinguish handshake from payload. That is what led
+     * me to wrongly conclude Steam had received and rejected application data;
+     * the 606-byte read was in fact 2 x (5 + 298) = two NewSessionTickets, and
+     * Steam never sent its request at all. A useful version must track handshake
+     * state, not record type. (Caught by Sol.) */
+    { static int off = -1;
+      if (off < 0) { const char *e = getenv( "MYTHIC_SOCK_WIRE" ); off = !(e && *e && *e != '0'); }
+      if (off) return; }
+    if (getpeername( fd, (struct sockaddr *)&pa, &pl ) != 0) return;   /* not connected */
+    if (pa.ss_family == AF_INET)
+    {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)&pa;
+        if ((ntohl( s4->sin_addr.s_addr ) >> 24) == 127) return;        /* loopback */
+        port = ntohs( s4->sin_port );
+    }
+    else if (pa.ss_family == AF_INET6) port = ntohs( ((const struct sockaddr_in6 *)&pa)->sin6_port );
+    else return;                                                        /* not INET */
+
+    for (i = 0; i < used; i++) if (tab[i].fd == fd && tab[i].port == port) { slot = i; break; }
+    if (slot < 0)
+    {
+        if (used >= 64) return;
+        slot = used++;
+        tab[slot].fd = fd; tab[slot].port = port; tab[slot].n = 0; tab[slot].wouldblock = 0;
+    }
+    if (!announced++)
+        dprintf( 2, "[sock-wire] rev=ml578 armed (external TCP only, 5-byte peek, 12/socket)\n" );
+
+    if (err == EWOULDBLOCK || err == EAGAIN)
+    {
+        if (++tab[slot].wouldblock <= 3 || (tab[slot].wouldblock % 500) == 0)
+            dprintf( 2, "[sock-wire] fd=%d dport=%u %s EWOULDBLOCK #%d rev=ml578\n",
+                     fd, port, is_send ? "send" : "recv", tab[slot].wouldblock );
+        return;
+    }
+    if (tab[slot].n >= 12) return;
+    tab[slot].n++;
+    {
+        const char *kind = "-";
+        if (ret_bytes >= 3 && b)
+        {
+            if (b[0] == 0x16) kind = "TLS-HANDSHAKE";
+            else if (b[0] == 0x15) kind = "TLS-ALERT";
+            else if (b[0] == 0x17) kind = "TLS-APPDATA";
+            else if (b[0] == 0x14) kind = "TLS-CCS";
+            else if (b[0] == 'H' || b[0] == 'G' || b[0] == 'P') kind = "HTTP-ish";
+        }
+        dprintf( 2, "[sock-wire] fd=%d dport=%u %s ret=%ld errno=%d first5=%02x %02x %02x %02x %02x %s rev=ml578\n",
+                 fd, port, is_send ? "SEND" : "RECV", ret_bytes, err,
+                 (ret_bytes > 0 && b) ? b[0] : 0, (ret_bytes > 1 && b) ? b[1] : 0,
+                 (ret_bytes > 2 && b) ? b[2] : 0, (ret_bytes > 3 && b) ? b[3] : 0,
+                 (ret_bytes > 4 && b) ? b[4] : 0, kind );
+    }
+}
+
 static void ios_sock_big_note( int fd, int is_send, long ret_bytes, int err )
 {
     static struct { int fd; unsigned long long tot[2]; unsigned long long next[2]; } tab[64];
@@ -944,6 +1039,7 @@ done:
 
 #else
 #define ios_sock_big_note( fd, is_send, ret_bytes, err ) do { } while (0)
+#define ios_sock_wire( fd, is_send, buf, ret_bytes, err ) do { } while (0)
 #endif
 
 static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
@@ -976,9 +1072,11 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
 
         if (errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( errno ) );
         ios_sock_big_note( fd, 0, 0, errno );
+        ios_sock_wire( fd, 0, NULL, 0, errno );
         return sock_errno_to_status( errno );
     }
     ios_sock_big_note( fd, 0, ret, 0 );
+    ios_sock_wire( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
 
     status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
@@ -1275,12 +1373,14 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
             }
 
             ios_sock_big_note( fd, 1, 0, errno );
+            ios_sock_wire( fd, 1, NULL, 0, errno );
             return sock_errno_to_status( errno );
         }
     }
 
     async->sent_len += ret;
     ios_sock_big_note( fd, 1, ret, 0 );
+    ios_sock_wire( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
 
     while (async->iov_cursor < async->count && ret >= async->iov[async->iov_cursor].iov_len)
         ret -= async->iov[async->iov_cursor++].iov_len;

@@ -304,11 +304,70 @@ void free_async_queue( struct async_queue *queue )
 
     LIST_FOR_EACH_ENTRY_SAFE( async, next, &queue->queue, struct async, queue_entry )
     {
+        /* iOS-Mythic ml575: USE-AFTER-FREE FIX (upstream Wine bug).
+         *
+         * async_terminate() can free this async before it returns. It documents
+         * the hazard itself — it grabs a temporary reference because
+         * thread_queue_apc() may reach async_set_result(), which dequeues the
+         * async and drops the QUEUE-OWNED reference. When that happens,
+         * async_terminate's own release is the last one and the object dies
+         * inside the call. The original code then wrote `async->queue = NULL`
+         * and called release_object() on freed memory — decrementing the first
+         * word of a block already on libmalloc's freelist by exactly 1, which is
+         * the corruption ml573 measured (expected0 ...2942 vs actual0 ...2941)
+         * and ml574's [dead-release] caught in the act:
+         *     free_async_queue+0x3c -> async_terminate+0x114 -> release_object
+         *     free_async_queue+0x48 -> release_object   (same object, freed)
+         *
+         * A bare keepalive is NOT enough: it would LEAK a reference whenever APC
+         * delivery succeeds and the queue reference is still outstanding. The
+         * queue reference must be released explicitly, and only if it still
+         * exists. Diagnosis and this accounting by Sol.
+         *
+         * Historical fingerprint: Wine 1356afed5a2 added a keepalive here for
+         * exactly this reason; e4a2bca47b0 removed it in 2021 while moving the
+         * dequeue into async_set_result() — the reentrant path that now frees
+         * the object. Our async.c is otherwise unmodified upstream. */
+        grab_object( async );                   /* local keepalive across terminate */
+
         if (!async->completion) async->completion = fd_get_completion( async->fd, &async->comp_key );
         async->fd = NULL;
         async_terminate( async, STATUS_HANDLES_CLOSED );
-        async->queue = NULL;
-        release_object( &async->obj );
+
+        if (async->queue == queue)              /* still ours => queue ref outstanding */
+        {
+            /* ml581: unlink, then make the node a SINGLETON.
+             *
+             * Both of my previous attempts here were wrong, in opposite ways.
+             *
+             * Unlinking without re-initialising (ml575-ml580) leaves a node
+             * whose neighbours were already spliced out reachable for a second
+             * list_remove -- ml580 crashed in req_cancel_async walking the
+             * wreckage, first time in ten runs, once Start Menu directories
+             * gave explorer real ReadDirectoryChangesW watches.
+             *
+             * NOT unlinking at all (ml581) is worse. async_destroy() only
+             * unlinks when async->queue is set, and we clear it here, so any
+             * async that outlives this loop (someone else still holds a ref)
+             * stays linked into a list whose head lives inside the struct fd
+             * that fd_destroy() is about to free (fd.c:1598-1600). The next
+             * list_remove by a sibling writes two pointers into that freed --
+             * and by then recycled -- fd. ml581 is the first run in 227 logs
+             * to report STATUS_INVALID_FILE_FOR_SECTION: the server's pread of
+             * a PE header came up short because the struct fd's unix_fd had
+             * been overwritten. Steam died with "failed to load steamui.dll".
+             *
+             * list_init() after list_remove() satisfies both: the node leaves
+             * the queue exactly once, and every later unlink -- from
+             * async_destroy or anywhere else -- writes only to the node
+             * itself. */
+            list_remove( &async->queue_entry );
+            list_init( &async->queue_entry );
+            async->queue = NULL;
+            release_object( async );            /* queue-owned reference */
+        }
+
+        release_object( async );                /* local keepalive */
     }
 }
 

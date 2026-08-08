@@ -886,7 +886,14 @@ static void process_poll_event( struct fd *fd, int event )
     struct process *process = get_fd_user( fd );
     assert( process->obj.ops == &process_ops );
 
-    if (event & (POLLERR | POLLHUP)) kill_process( process, !process->is_terminating );
+    if (event & (POLLERR | POLLHUP))
+    {
+#ifdef WINE_IOS
+        fprintf( stderr, "[srv-kill] process_poll_event pid=%04x event=0x%x msg_unixfd=%d rev=ml586\n",
+                 process->id, event, get_unix_fd( fd ) );
+#endif
+        kill_process( process, !process->is_terminating );
+    }
     else if (event & POLLIN) receive_fd( process );
 }
 
@@ -1084,6 +1091,19 @@ void resume_process( struct process *process )
 /* kill a process on the spot */
 void kill_process( struct process *process, int violent_death )
 {
+#ifdef WINE_IOS
+    /* ml586: name every thread this kill will take down */
+    {
+        struct thread *fdt_t;
+        char fdt_buf[256];
+        int fdt_off = 0;
+        LIST_FOR_EACH_ENTRY( fdt_t, &process->thread_list, struct thread, proc_entry )
+            if (fdt_off < (int)sizeof(fdt_buf) - 8)
+                fdt_off += snprintf( fdt_buf + fdt_off, sizeof(fdt_buf) - fdt_off, " %04x", fdt_t->id );
+        fprintf( stderr, "[srv-kill] kill_process pid=%04x violent=%d threads:%s rev=ml586\n",
+                 process->id, violent_death, fdt_off ? fdt_buf : " none" );
+    }
+#endif
     if (!violent_death && process->msg_fd)  /* normal termination on pipe close */
     {
         release_object( process->msg_fd );

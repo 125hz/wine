@@ -1015,12 +1015,60 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
     if (dst && bits && bits->ptr && dst->visrect.right - dst->visrect.left >= 640
         && dst->visrect.bottom - dst->visrect.top >= 400)
     {
+        /* ml536: DUMP CHROMIUM'S SOURCE BITMAP ITSELF.
+         *
+         * This settles a question that has been circular since the start. The
+         * compositor was "exonerated" on the grounds that surfdump matches what
+         * is displayed — but winios_surface_present and winios_dump_surface_png
+         * take the SAME stride from the SAME caller, so they agree whether or not
+         * that stride is right. Nothing has ever compared Chromium's INPUT to our
+         * OUTPUT.
+         *
+         * ml535 makes the comparison worth making: every writer into this buffer
+         * used a correct, self-consistent geometry (stride 0xaf0=2800 across all
+         * three, destinations matching their own row/col arithmetic). If Chromium
+         * fills the bitmap correctly and the screen is still wrong, the defect is
+         * downstream — in this blit or in our present path — and that is OURS.
+         *
+         *   src PNG corrupted, surface PNG corrupted  => Chromium computed it wrong
+         *   src PNG CLEAN,     surface PNG corrupted  => the blit/present is wrong
+         *
+         * One variable, one comparison, no runs wasted on either answer. */
+        {
+            extern void winios_dump_srcbits( const void *bits, int w, int h, int stride )
+                __attribute__((weak));
+            if (winios_dump_srcbits)
+                winios_dump_srcbits( bits->ptr,
+                                     dst->visrect.right - dst->visrect.left,
+                                     dst->visrect.bottom - dst->visrect.top,
+                                     (dst->visrect.right - dst->visrect.left) * 4 );
+        }
+
+        /* ml548: hand srcwatch the image geometry so it can (a) restrict the
+         * watch to a row band via MYTHIC_SRCWATCH_ROWS and (b) report faults as
+         * (x,y,tile_col) instead of raw byte offsets. Falls back to the whole
+         * buffer when the env var is unset. */
+        extern void ios_srcwatch_arm_geom( const void *bits, unsigned long len,
+                                           unsigned w, unsigned h, unsigned stride )
+            __attribute__((weak));
+        if (ios_srcwatch_arm_geom)
+        {
+            unsigned gw = dst->visrect.right - dst->visrect.left;
+            unsigned gh = dst->visrect.bottom - dst->visrect.top;
+            ios_srcwatch_arm_geom( bits->ptr,
+                                   (unsigned long)info->bmiHeader.biSizeImage ?
+                                       (unsigned long)info->bmiHeader.biSizeImage :
+                                       (unsigned long)gw * gh * 4,
+                                   gw, gh, gw * 4 );
+        }
+        else {
         extern void ios_srcwatch_arm( const void *bits, unsigned long len );
         ios_srcwatch_arm( bits->ptr,
                           (unsigned long)info->bmiHeader.biSizeImage ?
                               (unsigned long)info->bmiHeader.biSizeImage :
                               (unsigned long)((dst->visrect.right - dst->visrect.left) * 4 *
                                               (dst->visrect.bottom - dst->visrect.top)) );
+        }
     }
 
     if (dst && src && dst->visrect.right - dst->visrect.left >= 24)

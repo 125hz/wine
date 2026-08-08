@@ -6057,7 +6057,13 @@ static unsigned int set_pending_write( HANDLE device )
  * with fstat() on the unix fd at read time, so a recycled handle can never be
  * mistaken for the file we meant to watch. */
 #define IOS_JSTRACK_MAX 64
-static struct { HANDLE handle; dev_t dev; ino_t ino; char name[40]; } ios_js_track[IOS_JSTRACK_MAX];
+/* ml530 (#78): + the fields needed to arm srcwatch on the ASSEMBLED buffer.
+ * Arming on a single read is useless — Steam reads this file in ~31 chunks, so
+ * the first chunk's buffer is either refilled (noise) or only covers 1/31 of the
+ * source. What we want is the whole thing, once the last byte has landed. */
+static struct { HANDLE handle; dev_t dev; ino_t ino; char name[40];
+                off_t size, got; uintptr_t lo, hi, last_end;
+                int gaps, armed; } ios_js_track[IOS_JSTRACK_MAX];
 static unsigned int ios_js_track_n;
 static int ios_js_track_any;
 static pthread_mutex_t ios_js_track_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -6083,6 +6089,10 @@ static void ios_js_track_add( HANDLE handle, const char *unix_name )
         ios_js_track[i].handle = handle;
         ios_js_track[i].dev = st.st_dev;
         ios_js_track[i].ino = st.st_ino;
+        ios_js_track[i].size = st.st_size;
+        ios_js_track[i].got = 0;
+        ios_js_track[i].gaps = 0;
+        ios_js_track[i].armed = 0;
         snprintf( ios_js_track[i].name, sizeof(ios_js_track[i].name), "%s", base );
         ios_js_track_n = i + 1;
         ios_js_track_any = 1;
@@ -6093,16 +6103,16 @@ static void ios_js_track_add( HANDLE handle, const char *unix_name )
 }
 
 /* Returns the tracked name only when the fd STILL refers to the same file. */
-static const char *ios_js_track_find( HANDLE handle, int unix_fd )
+static int ios_js_track_find( HANDLE handle, int unix_fd )
 {
     struct stat st;
     unsigned int i;
 
-    if (!ios_js_track_any) return NULL;   /* fast path: costs one load per read */
+    if (!ios_js_track_any) return -1;   /* fast path: costs one load per read */
     for (i = 0; i < ios_js_track_n; i++)
     {
         if (ios_js_track[i].handle != handle) continue;
-        if (unix_fd < 0 || fstat( unix_fd, &st ) == -1) return NULL;
+        if (unix_fd < 0 || fstat( unix_fd, &st ) == -1) return -1;
         if (st.st_dev != ios_js_track[i].dev || st.st_ino != ios_js_track[i].ino)
         {
             static int recycled_logged;
@@ -6112,11 +6122,11 @@ static const char *ios_js_track_find( HANDLE handle, int unix_fd )
                 dprintf( 2, "[js-recycle] handle=%p was %s, now ino=%llu — not logging (rev=ml488)\n",
                          handle, ios_js_track[i].name, (unsigned long long)st.st_ino );
             }
-            return NULL;
+            return -1;
         }
-        return ios_js_track[i].name;
+        return (int)i;
     }
-    return NULL;
+    return -1;
 }
 
 static void ios_js_read_note( HANDLE handle, int unix_fd, const void *buffer, ULONG want, UINT got,
@@ -6127,9 +6137,54 @@ static void ios_js_read_note( HANDLE handle, int unix_fd, const void *buffer, UL
     const char *name;
     unsigned int sum = 2166136261u;
     UINT i;
+    int idx;
 
     if (!got) return;
-    if (!(name = ios_js_track_find( handle, unix_fd ))) return;
+    if ((idx = ios_js_track_find( handle, unix_fd )) < 0) return;
+    name = ios_js_track[idx].name;
+
+    /* ml530 (#78): accumulate this file's reads and, once the last byte has
+     * landed, write-protect the assembled buffer so the next writer to it
+     * identifies itself. Our reads deliver this file byte-perfect (ml489:
+     * 73/73 MATCH, the failing file 100% verified) yet V8 reports
+     * `SyntaxError: Invalid or unexpected token` on it — so the damage happens
+     * after the read, and any write here is the corrupter.
+     *
+     * Only arm on a genuinely CONTIGUOUS assembly (gaps==0 and span==size):
+     * if Steam read into a reused chunk buffer, lo..hi would be a small window
+     * that later reads legitimately rewrite, and every fault would be noise. */
+    {
+        uintptr_t b0 = (uintptr_t)buffer, b1 = b0 + got;
+        if (!ios_js_track[idx].got) { ios_js_track[idx].lo = b0; ios_js_track[idx].hi = b1; }
+        else
+        {
+            if (b0 < ios_js_track[idx].lo) ios_js_track[idx].lo = b0;
+            if (b1 > ios_js_track[idx].hi) ios_js_track[idx].hi = b1;
+            if (b0 != ios_js_track[idx].last_end) ios_js_track[idx].gaps++;
+        }
+        ios_js_track[idx].last_end = b1;
+        ios_js_track[idx].got += got;
+
+        if (!ios_js_track[idx].armed && ios_js_track[idx].size &&
+            ios_js_track[idx].got >= ios_js_track[idx].size)
+        {
+            unsigned long long span = (unsigned long long)(ios_js_track[idx].hi - ios_js_track[idx].lo);
+            ios_js_track[idx].armed = 1;
+            if (!ios_js_track[idx].gaps && span == (unsigned long long)ios_js_track[idx].size)
+            {
+                extern void ios_srcwatch_arm_for( const void *bits, unsigned long len, const char *tag );
+                dprintf( 2, "[js-watch] %s fully read (%llu B, contiguous at %p) — arming srcwatch rev=ml530\n",
+                         name, span, (void *)ios_js_track[idx].lo );
+                ios_srcwatch_arm_for( (const void *)ios_js_track[idx].lo, (unsigned long)span, "js" );
+            }
+            else
+                dprintf( 2, "[js-watch] %s fully read but NOT contiguous (gaps=%d span=%llu size=%llu) "
+                            "— chunk buffer reused, not arming rev=ml530\n",
+                         name, ios_js_track[idx].gaps, span,
+                         (unsigned long long)ios_js_track[idx].size );
+        }
+    }
+
     if (reads_logged >= 512) return;
     reads_logged++;
 

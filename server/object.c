@@ -298,6 +298,141 @@ WCHAR *default_get_full_name( struct object *obj, data_size_t max, data_size_t *
     return (WCHAR *)ret;
 }
 
+/* iOS-Mythic ml574: DEAD-RELEASE DETECTOR (diagnostic, opt-in).
+ *
+ * ml573 proved something decrements the first 32-bit word of an already-freed
+ * 320-byte block by exactly 1 (expected0 0x...2942 vs actual0 0x...2941, byte 0
+ * only). struct object's first field is `refcount`, and release_object() compiles
+ * to ldr/subs/str on it — so an over-release here is the leading hypothesis. It
+ * is NOT proven: the malloc trap fires later, in an unrelated allocation, with no
+ * PC from the decrement itself.
+ *
+ * This catches the writer in the act. Two rules from Sol, both load-bearing:
+ *   - NEVER dereference the suspect before proving liveness. For a dead pointer
+ *     obj->ops / refcount are freed memory and may fault or lie. We compare
+ *     ADDRESSES only, walking list nodes that live inside known-live objects.
+ *   - Record free provenance, or a hit proves the over-release without naming the
+ *     ownership bug. ml573's ops=0x230 was allocator metadata; the object's real
+ *     identity was already gone.
+ *
+ * Everything here is allocation-free (fixed buffers, raw write) because the host
+ * allocator is exactly what is suspect. Enable with MYTHIC_DEAD_RELEASE=1. */
+#define IOS_FREE_RING 1024
+static struct ios_free_rec {
+    const void *obj;
+    const void *ops;
+    unsigned long size;
+    const void *freed_from;
+    const void *fp[5];
+    unsigned long seq;
+} ios_free_ring[IOS_FREE_RING];
+static unsigned long ios_free_seq;
+
+/* AArch64 frame: [fp]=caller fp, [fp+8]=saved LR. Hand-rolled because
+ * backtrace() is allocator-backed. */
+static void ios_grab_fp( const void **out, int n )
+{
+    void **fp = (void **)__builtin_frame_address(0);
+    int i = 0;
+    while (i < n && fp && !((unsigned long)fp & 7))
+    {
+        void **next;
+        out[i++] = fp[1];
+        next = (void **)fp[0];
+        if (next <= fp) break;
+        fp = next;
+    }
+    while (i < n) out[i++] = 0;
+}
+
+static int ios_dead_release_on(void)
+{
+    static int cached = -1;                 /* getenv once, not per release */
+    if (cached < 0)
+    {
+        const char *e = getenv( "MYTHIC_DEAD_RELEASE" );
+        cached = (e && *e && *e != '0') ? 1 : 0;
+        if (cached)
+        {
+            char b[96];
+            int n = snprintf( b, sizeof(b),
+                              "[dead-release] armed (ring=%d) rev=ml574\n", IOS_FREE_RING );
+            write( 2, b, n );
+        }
+    }
+    return cached;
+}
+
+static void ios_note_free( const struct object *obj )
+{
+    struct ios_free_rec *r = &ios_free_ring[ios_free_seq % IOS_FREE_RING];
+    r->obj = obj;
+    r->ops = obj->ops;
+    r->size = obj->ops ? (unsigned long)obj->ops->size : 0;
+    r->freed_from = __builtin_return_address(0);
+    ios_grab_fp( r->fp, 5 );
+    r->seq = ++ios_free_seq;
+}
+
+/* Address-only liveness test. Bounded so corrupt links cannot hang the server.
+ * Returns 1 live, 0 not found, -1 could not decide (traversal blew its bound). */
+static int ios_object_is_live( const struct object *obj )
+{
+    const struct list *it = object_list.next;
+    unsigned long n = 0;
+    while (it && it != &object_list)
+    {
+        if (LIST_ENTRY( it, struct object, obj_list ) == obj) return 1;
+        if (++n > 400000) return -1;        /* undecidable, fail OPEN */
+        it = it->next;
+    }
+    return 0;
+}
+
+static void ios_report_dead_release( const struct object *obj, const void *from )
+{
+    char b[1024];
+    const void *fp[8];
+    int n, i, k, found = 0;
+
+    ios_grab_fp( fp, 8 );
+    n = snprintf( b, sizeof(b),
+                  "\n[dead-release] *** RELEASE OF A NON-LIVE OBJECT *** obj=%p\n"
+                  "[dead-release] released_from=%p  release fpchain:", obj, from );
+    for (i = 0; i < 8 && n < (int)sizeof(b) - 24; i++)
+        n += snprintf( b + n, sizeof(b) - n, " %p", fp[i] );
+    n += snprintf( b + n, sizeof(b) - n, "\n" );
+    write( 2, b, n );
+
+    /* free provenance: who freed it, and what it was */
+    for (k = 0, found = 0; k < IOS_FREE_RING; k++)
+    {
+        const struct ios_free_rec *r = &ios_free_ring[k];
+        if (r->obj != obj || !r->seq) continue;
+        if (!found++ ) { /* newest record is the relevant one; older are address reuse */ }
+        n = snprintf( b, sizeof(b),
+                      "[dead-release]   PREVIOUSLY FREED seq=%lu ops=%p size=%lu freed_from=%p"
+                      "  free fpchain:", r->seq, r->ops, r->size, r->freed_from );
+        for (i = 0; i < 5 && n < (int)sizeof(b) - 24; i++)
+            n += snprintf( b + n, sizeof(b) - n, " %p", r->fp[i] );
+        n += snprintf( b + n, sizeof(b) - n, "\n" );
+        write( 2, b, n );
+    }
+    /* ml575: only claim "no record" when there genuinely was none — it used to
+     * print unconditionally, contradicting the records listed right above it.
+     * Multiple records for one address are ADDRESS REUSE; the highest seq is the
+     * relevant free. */
+    n = snprintf( b, sizeof(b),
+                  "[dead-release] %s\n"
+                  "[dead-release] terminating NOW so this stack is the last thing in the log; "
+                  "not using a breakpoint because the task exception path mishandles native "
+                  "BRK and manufactures a downstream UIKit crash. rev=ml575\n",
+                  found ? "(records above are address reuse; highest seq = the relevant free)"
+                        : "(NO free record => never freed by free_object, or aged out of the ring)" );
+    write( 2, b, n );
+    _exit( 0xDE );
+}
+
 /* allocate and initialize an object */
 void *alloc_object( const struct object_ops *ops )
 {
@@ -326,6 +461,8 @@ static void free_object( struct object *obj )
 {
     free( obj->sd );
     obj->ops->type->obj_count--;
+    /* ml574: capture identity BEFORE list_remove/memset erase it. */
+    if (ios_dead_release_on()) ios_note_free( obj );
 #ifdef DEBUG_OBJECTS
     list_remove( &obj->obj_list );
     memset( obj, 0xaa, obj->ops->size );
@@ -545,6 +682,21 @@ struct object *grab_object( void *ptr )
 void release_object( void *ptr )
 {
     struct object *obj = (struct object *)ptr;
+    /* ml574: is this pointer still a LIVE object, checked BEFORE we touch it?
+     *
+     * Address comparison only — no deref of `obj`. On a dead pointer the fields
+     * below (refcount, ops, handle_count) are freed memory: reading them can
+     * fault or return allocator metadata that lies. The one thing we can trust
+     * is whether this address is still linked into object_list.
+     *
+     * Fail OPEN by design: only a definite "not found" (0) traps. If the walk
+     * cannot decide (-1, blown bound => corrupt links) we let the release run.
+     * The previous attempt at a guard here failed CLOSED and bricked startup. */
+    if (ios_dead_release_on())
+    {
+        int live = ios_object_is_live( obj );
+        if (live == 0) ios_report_dead_release( obj, __builtin_return_address(0) );
+    }
     assert( obj->refcount );
     if (!--obj->refcount)
     {

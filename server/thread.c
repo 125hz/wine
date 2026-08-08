@@ -591,7 +591,16 @@ static void thread_poll_event( struct fd *fd, int event )
     assert( thread->obj.ops == &thread_ops );
 
     grab_object( thread );
-    if (event & (POLLERR | POLLHUP)) kill_thread( thread, 0 );
+    if (event & (POLLERR | POLLHUP))
+    {
+#ifdef WINE_IOS
+        /* ml586: single-thread kill on request-channel HUP — the exact shape
+         * of the 0060-family deaths; log which unix fd delivered the event */
+        fprintf( stderr, "[srv-kill] thread_poll_event tid=%04x event=0x%x request_unixfd=%d rev=ml586\n",
+                 thread->id, event, thread->request_fd ? get_unix_fd( thread->request_fd ) : -1 );
+#endif
+        kill_thread( thread, 0 );
+    }
     else if (event & POLLIN) read_request( thread );
     else if (event & POLLOUT) write_reply( thread );
     release_object( thread );
@@ -1627,6 +1636,10 @@ int thread_get_inflight_fd( struct thread *thread, int client )
 void kill_thread( struct thread *thread, int violent_death )
 {
     if (thread->state == TERMINATED) return;  /* already killed */
+#ifdef WINE_IOS
+    fprintf( stderr, "[srv-kill] kill_thread tid=%04x pid=%04x violent=%d rev=ml586\n",
+             thread->id, thread->process->id, violent_death );
+#endif
     thread->state = TERMINATED;
     thread->exit_time = current_time;
     if (current == thread) current = NULL;
@@ -1717,6 +1730,12 @@ DECL_HANDLER(new_thread)
 
     if ((thread = create_thread( request_fd, process, sd )))
     {
+#ifdef WINE_IOS
+        /* ml586: which process a new thread gets filed under, and by whom —
+         * a misfiled thread dies with its false parent's teardown */
+        fprintf( stderr, "[srv-own] new_thread tid=%04x pid=%04x requester=%04x request_unixfd=%d rev=ml586\n",
+                 thread->id, process->id, current->id, request_fd );
+#endif
         thread->system_regs = current->system_regs;
         if (req->flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
         thread->dbg_hidden = !!(req->flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
@@ -1736,6 +1755,9 @@ done:
 
 static int init_thread( struct thread *thread, int reply_fd, int wait_fd )
 {
+#ifdef WINE_IOS
+    int fdt_client_reply = reply_fd, fdt_client_wait = wait_fd;
+#endif
     if ((reply_fd = thread_get_inflight_fd( thread, reply_fd )) == -1)
     {
         set_error( STATUS_TOO_MANY_OPENED_FILES );
@@ -1755,6 +1777,11 @@ static int init_thread( struct thread *thread, int reply_fd, int wait_fd )
 
     if (fcntl( reply_fd, F_SETFL, O_NONBLOCK ) == -1) goto error;
 
+#ifdef WINE_IOS
+    /* ml586: client fd number -> server-side dup number mapping per thread */
+    fprintf( stderr, "[srv-own] init_thread tid=%04x pid=%04x reply=%d->srv%d wait=%d->srv%d rev=ml586\n",
+             thread->id, thread->process->id, fdt_client_reply, reply_fd, fdt_client_wait, wait_fd );
+#endif
     thread->reply_fd = create_anonymous_fd( &thread_fd_ops, reply_fd, &thread->obj, 0 );
     thread->wait_fd  = create_anonymous_fd( &thread_fd_ops, wait_fd, &thread->obj, 0 );
     return thread->reply_fd && thread->wait_fd;

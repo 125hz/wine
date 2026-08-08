@@ -1418,20 +1418,48 @@ static void sock_dispatch_events( struct sock *sock, enum connection_state prevs
          * (TLS/WebSocket) rejected it, or the handshake never landed at all.
          * One line per connecting socket's first event decides that. */
         {
-            static int done_logged;
-            if (done_logged < 96)
+            /* iOS-Mythic ml576: this probe had TWO defects that made ml575's data
+             * unusable, both fixed here.
+             *
+             * (1) ONE shared 96-event cap. Port-80 traffic consumed the entire
+             *     budget, so not a single CM socket (443/2701x) was ever recorded
+             *     and "only port 80 completes" was an artefact, not a finding.
+             *     Ports now get separate budgets.
+             * (2) It could not tell a REAL kernel completion from a FABRICATED
+             *     one. fd_ios.c's synthesis branch sets POLLOUT unconditionally
+             *     for anything it classifies non-INET, and a stale (user,fd)
+             *     cache entry misroutes live TCP sockets there. So an
+             *     "OUT err=0" line may never have been a completion at all.
+             *     getpeername() settles it: a socket the kernel actually
+             *     connected has a peer; one still in progress does not.
+             *
+             * Also skip zero-event calls entirely — they carry no information
+             * and were diluting the census. */
+            static int done_cm, done_other;
+            int is_cm;
+            unsigned short dport = 0;
+            if (sock->peer_addr.addr.sa_family == WS_AF_INET) dport = ntohs( sock->peer_addr.in.sin_port );
+            else if (sock->peer_addr.addr.sa_family == WS_AF_INET6) dport = ntohs( sock->peer_addr.in6.sin6_port );
+            is_cm = (dport == 443 || (dport >= 27015 && dport <= 27040));
+
+            if ((event & (POLLOUT | POLLERR | POLLHUP)) &&
+                (is_cm ? (done_cm < 64) : (done_other < 16)))
             {
-                unsigned short dport = 0;
-                if (sock->peer_addr.addr.sa_family == WS_AF_INET) dport = ntohs( sock->peer_addr.in.sin_port );
-                else if (sock->peer_addr.addr.sa_family == WS_AF_INET6) dport = ntohs( sock->peer_addr.in6.sin6_port );
-                done_logged++;
-                fprintf( stderr, "[srv-conn-done] dport=%u event=%s%s%s%s err=%d rev=ml493\n",
+                struct sockaddr_storage pa;
+                socklen_t pl = sizeof(pa);
+                int ufd = get_unix_fd( sock->fd );
+                int has_peer = (ufd != -1 && getpeername( ufd, (struct sockaddr *)&pa, &pl ) == 0);
+                if (is_cm) done_cm++; else done_other++;
+                fprintf( stderr, "[srv-conn-done] dport=%u event=%s%s%s%s err=%d fd=%d "
+                                 "peer=%s path=%s rev=ml576\n",
                          dport,
                          (event & POLLOUT) ? "OUT" : "",
                          (event & POLLERR) ? "|ERR" : "",
                          (event & POLLHUP) ? "|HUP" : "",
                          (event & POLLIN) ? "|IN" : "",
-                         sock->errors[AFD_POLL_BIT_CONNECT_ERR] );
+                         sock->errors[AFD_POLL_BIT_CONNECT_ERR], ufd,
+                         has_peer ? "YES" : "NO",
+                         has_peer ? "REAL-kernel-completion" : "SYNTHESIZED-or-still-connecting" );
             }
         }
         break;
