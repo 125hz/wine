@@ -48,6 +48,9 @@ static BOOLEAN  (WINAPI *pBTCpu64IsProcessorFeaturePresent)(UINT);
  * #ifdef guard because PE-side builds don't have an iOS-specific
  * macro (target is arm64ec-windows in all cases). */
 static void     (WINAPI *pBTCpu64IosAddAliasMapping)(unsigned long long, unsigned long long, unsigned long long);
+/* ml618: iOS-only. MUST be obtained via GET_PTR (arm64ec_redirect_ptr), never via a
+ * raw base+RVA lookup — see the registration comment below. */
+static unsigned int (WINAPI *pBTCpu64IosReleaseThreadHolds)(void*, unsigned long long*, unsigned int*, unsigned int*);
 static void     (WINAPI *pBTCpu64NotifyMemoryDirty)(void*,SIZE_T);
 static void     (WINAPI *pBTCpu64NotifyReadFile)(HANDLE,void*,SIZE_T,BOOL,NTSTATUS);
 static void     (WINAPI *pBeginSimulation)(void);
@@ -73,9 +76,98 @@ static inline CHPE_V2_CPU_AREA_INFO *get_arm64ec_cpu_area(void)
     return NtCurrentTeb()->ChpeV2CpuAreaInfo;
 }
 
+/* iOS-Mythic ml617: THE GUEST-STACK WINDOW FOR ONE UNWIND.
+ *
+ * ml616 fabricated 24,576 unwind frames and then terminated the process with
+ * exit code 0xdaa1f848 — which is not a status at all, it is the low half of
+ * 0x71daa1f848, a stack address from the very frame being walked. The real
+ * exception (an execute AV at 0x7e8946a680, private RW heap) was destroyed and
+ * replaced by garbage.
+ *
+ * Root cause is the third fallback below: it accepts ANY aligned, committed,
+ * writable private page as a valid frame. Thread 020c's stack ended at
+ * 0x71daa20000 and the walk happily accepted 0x71daa20008 and kept going.
+ *
+ * So bound the walk by the allocation the ORIGINAL guest RSP belongs to:
+ *   - use AllocationBase and enumerate every contiguous region of that same
+ *     allocation, because guard/committed regions carry different protections
+ *     and a single RegionSize would cut the stack short;
+ *   - the TEB stack is NOT usable for this — on this port Tib describes the
+ *     NATIVE pthread stack, not the guest x64 stack (task #34).
+ * Zeroed window = "not established", and the old permissive behaviour stands,
+ * so no path that never sets a window can regress. */
+struct ec_stack_window
+{
+    ULONG_PTR lo, hi;      /* validated guest-stack allocation */
+    ULONG_PTR emu_lo, emu_hi; /* emulator stack: a legitimate transition target */
+    ULONG_PTR last_frame;  /* monotonic baseline within the current segment */
+    ULONG_PTR last_pc;
+    ULONG     steps, budget;
+    ULONG     repeats;
+    BOOL      on_emu;      /* which segment the baseline refers to */
+};
+static __thread struct ec_stack_window ec_win;
+
+static void ec_stack_window_begin( ULONG_PTR rsp )
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T got;
+    ULONG_PTR base, probe, hi;
+    CHPE_V2_CPU_AREA_INFO *area;
+
+    memset( &ec_win, 0, sizeof(ec_win) );
+    if (!rsp) return;
+    if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)rsp, MemoryBasicInformation,
+                              &mbi, sizeof(mbi), &got )) return;
+    if (mbi.State != MEM_COMMIT) return;
+
+    base = (ULONG_PTR)mbi.AllocationBase;
+    if (!base) return;
+
+    /* Walk forward while the region still belongs to the same allocation. */
+    hi = base;
+    for (probe = base; ; )
+    {
+        if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)probe, MemoryBasicInformation,
+                                  &mbi, sizeof(mbi), &got )) break;
+        if ((ULONG_PTR)mbi.AllocationBase != base) break;
+        hi = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+        probe = hi;
+        if (hi <= base) break;   /* paranoia: never loop on a zero-size region */
+    }
+    if (hi <= base) return;
+
+    ec_win.lo = base;
+    ec_win.hi = hi;
+    area = get_arm64ec_cpu_area();
+    if (area)
+    {
+        ec_win.emu_lo = area->EmulatorStackLimit;
+        ec_win.emu_hi = area->EmulatorStackBase;
+    }
+    /* Budget proportional to the real range (one frame per 16 bytes is already
+     * generous for AAPCS64), with an absolute ceiling so a huge stack cannot buy
+     * an unbounded walk. Repeated (pc,frame) pairs are caught separately — a
+     * non-advancing walk is corrupt no matter how much budget remains. */
+    ec_win.budget = (ULONG)min( (hi - base) / 16, 65536 );
+    if (ec_win.budget < 256) ec_win.budget = 256;
+    ec_win.last_frame = 0;
+    ec_win.on_emu = FALSE;
+}
+
 static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
 {
     if (frame & (sizeof(void*) - 1)) return FALSE;
+
+    /* ml617: once a window is established it is authoritative — the permissive
+     * committed-RW fallback below is exactly what let the walk run away. */
+    if (ec_win.hi)
+    {
+        if (frame >= ec_win.lo && frame < ec_win.hi) return TRUE;
+        if (ec_win.emu_hi && frame >= ec_win.emu_lo && frame <= ec_win.emu_hi) return TRUE;
+        return FALSE;
+    }
+
     if (is_valid_frame( frame )) return TRUE;
     /* ml382: NULL-safe — this runs during exception dispatch, where a second
      * fault is far worse than a missed range check (see the enter/leave
@@ -109,6 +201,71 @@ static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
         }
     }
     return FALSE;
+}
+
+/* ml617: per-step unwind guard. Returns NULL to continue, else the reason.
+ *
+ * Monotonic progress is required WITHIN a segment only; a validated transition
+ * between the guest stack and the emulator stack legitimately moves the frame
+ * pointer anywhere, so the baseline is reset there — but only for a transition
+ * we recognise, so a corrupt frame cannot escape the check by pretending to
+ * switch stacks. */
+static const char *ec_stack_window_step( ULONG_PTR frame, ULONG_PTR pc )
+{
+    BOOL on_emu;
+
+    if (!ec_win.hi) return NULL;   /* no window established: legacy behaviour */
+
+    if (++ec_win.steps > ec_win.budget) return "budget exceeded";
+
+    if (frame == ec_win.last_frame && pc == ec_win.last_pc)
+    {
+        if (++ec_win.repeats >= 4) return "no progress (repeated pc/frame)";
+        return NULL;
+    }
+    ec_win.repeats = 0;
+
+    on_emu = (ec_win.emu_hi && frame >= ec_win.emu_lo && frame <= ec_win.emu_hi);
+    if (on_emu != ec_win.on_emu)
+    {
+        /* Recognised stack transition: re-baseline, do not compare across it. */
+        ec_win.on_emu = on_emu;
+        ec_win.last_frame = frame;
+        ec_win.last_pc = pc;
+        return NULL;
+    }
+    /* iOS-Mythic ml627: `<=` WAS A FALSE POSITIVE. `<` IS THE CORRECT TEST.
+     *
+     * Unwinding walks UP the stack, so a frame pointer must never move BACKWARDS
+     * -- but it may legitimately stay EQUAL across consecutive steps while
+     * ControlPc changes (several unwind steps can resolve within one frame). The
+     * genuinely-stuck case is already covered above by the identical
+     * (frame, pc) repeat counter, so `<=` bought nothing and cost correctness.
+     *
+     * It fired on ULTRAKILL/Mono's thread-naming exception: Mono raises
+     * EXCEPTION_WINE_NAME_THREAD (0x406D1388) from mono_native_thread_set_name and
+     * expects to resume at `add rsp,0x48; ret`. This guard aborted that unwind at
+     * steps=3 with the frame merely equal, flagged the stack invalid, and left the
+     * handler/unwind state inconsistent -- after which 0x406D1388+8 was read as a
+     * pointer, degrading into 0xC000000D, a 256-deep redelivery storm and a stack
+     * overflow. The guard was mine (ml617) and it was the bug. */
+    if (ec_win.last_frame && frame < ec_win.last_frame)
+        return "frame moved backwards";
+
+    if (ec_win.last_frame && frame == ec_win.last_frame)
+    {
+        /* Confirmation that this case is real and now allowed. Capped: this runs
+         * per unwind step, and formatting in an exception path is what killed
+         * ml620. One short line, bounded by construction. */
+        static int ml627_same_frame;
+        if (ml627_same_frame < 16)
+            ERR( "[unwind-guard] ml627 same-frame step #%d frame=%p pc %p -> %p (ALLOWED, was a false stop)\n",
+                 ++ml627_same_frame, (void *)frame, (void *)ec_win.last_pc, (void *)pc );
+    }
+
+    ec_win.last_frame = frame;
+    ec_win.last_pc = pc;
+    return NULL;
 }
 
 /* iOS-Mythic ml382: the CPU area can legitimately be NULL on this port.
@@ -454,6 +611,7 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
                                       RtlFindExportedRoutineByName( module, #name ), metadata )
     GET_PTR( BTCpu64FlushInstructionCache );
     GET_PTR( BTCpu64IosAddAliasMapping );  /* iOS-only; NULL on non-iOS hosts. */
+    GET_PTR( BTCpu64IosReleaseThreadHolds );  /* iOS-only; ml618 leaked-hold release. */
     GET_PTR( BTCpu64IsProcessorFeaturePresent );
     GET_PTR( BTCpu64NotifyMemoryDirty );
     GET_PTR( BTCpu64NotifyReadFile );
@@ -494,6 +652,50 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     }
     /* No else — on non-iOS hosts pBTCpu64IosAddAliasMapping is naturally NULL,
      * which is silent + correct: the bridge has nothing to do off-iOS. */
+
+    /* iOS-Mythic ml618: REGISTER THE LEAKED-HOLD RELEASE CALLBACK.
+     *
+     * ml611/ml616/ml617 all froze the whole app the same way: a thread dies in
+     * abnormal exit still owning one CodeInvalidationMutex reader, a writer
+     * queues behind it, write-priority blocks every later reader, and JIT
+     * compilation stops process-wide (ml617: callret-gen 312 -> 0 at the exact
+     * line the hold leaked).
+     *
+     * 🔑 PROVENANCE IS THE WHOLE FIX. ml613 resolved this same export with
+     * ios_pe_find_export() — plain module_base + export_rva — which yields the
+     * raw x64 ENTRY THUNK. Native ARM64 then executed `48 8b c4 48...` and every
+     * launch died. GET_PTR above goes through arm64ec_redirect_ptr(), which
+     * resolves the EC redirection entry and xlate_ios_jit()s it into an
+     * executable ARM64 alias in the JIT pool. That pointer IS natively callable
+     * — which is why pBTCpu64IosAddAliasMapping has always worked when called
+     * from unix code, including long after the original unix call returned.
+     *
+     * ⛔ NEVER register a pointer obtained any other way.
+     *
+     * The self-test below is the cheap insurance: invoke with a NULL TEB, which
+     * the callback answers with REL_SELFTEST and nothing else. If we ever bind a
+     * raw thunk again, this faults here at init instead of on a dying thread. */
+    if (pBTCpu64IosReleaseThreadHolds)
+    {
+        unsigned int probe = pBTCpu64IosReleaseThreadHolds( NULL, NULL, NULL, NULL );
+        if (probe != 0x10u)
+        {
+            ERR( "[hold-release] ml618 SELF-TEST FAILED (got %#x, want 0x10) — NOT registering; "
+                 "the bound pointer is not the redirected ARM64 alias\n", probe );
+        }
+        else
+        {
+            struct ios_register_hold_release_params params;
+            NTSTATUS reg_status;
+            params.size     = sizeof(params);
+            params.version  = 1;
+            params.peb      = RtlGetCurrentPeb();
+            params.callback = (void *)pBTCpu64IosReleaseThreadHolds;
+            reg_status = WINE_UNIX_CALL( unix_ios_register_hold_release, &params );
+            ERR( "[hold-release] ml618 self-test OK; registered cb=%p peb=%p -> %lx\n",
+                 (void *)pBTCpu64IosReleaseThreadHolds, params.peb, reg_status );
+        }
+    }
 
     return STATUS_SUCCESS;
 }
@@ -2054,6 +2256,63 @@ static DWORD __attribute__((naked)) call_seh_handler( EXCEPTION_RECORD *rec, ULO
 
 
 /**********************************************************************
+ *           ios_seh_xlate_note   (iOS-Mythic ml603)
+ *
+ * Report SEH language-handler translation ONCE PER DISTINCT HANDLER.
+ *
+ * The ml477 revert note asked for every translation to be logged, because a
+ * 4-per-process cap is what hid the x86-64-guest-handler case that broke ml476.
+ * Logging all of them literally would mean ~790k lines — the exact volume that
+ * drowned the log pipeline in ml602 — and would add no information, since the
+ * same handful of handlers repeat. Distinct-once gives the full set (which is
+ * what makes an unexpected guest handler visible) at negligible cost, and the
+ * census proves the probe stayed alive.
+ */
+static void ios_seh_xlate_note( PEXCEPTION_ROUTINE orig, PEXCEPTION_ROUTINE final, BOOLEAN is_ec )
+{
+    static void *seen[64];
+    static unsigned int seen_n;
+    static unsigned int overflow_logged;
+    static unsigned int n_ec, n_guest;
+    unsigned int i;
+
+    if (is_ec) n_ec++; else n_guest++;
+
+    /* Census on a power-of-two boundary: cheap, and proves the gate is live. */
+    if (((n_ec + n_guest) & 0xffff) == 0)
+        ERR( "[seh-xlate] ml603 census: ec_translated=%u guest_untouched=%u distinct=%u\n",
+             n_ec, n_guest, seen_n );
+
+    for (i = 0; i < seen_n; i++) if (seen[i] == (void *)orig) return;
+
+    if (seen_n >= ARRAY_SIZE(seen))
+    {
+        if (!overflow_logged++)
+            ERR( "[seh-xlate] ml603 distinct table FULL (%u) — further new handlers unlogged\n",
+                 (unsigned int)ARRAY_SIZE(seen) );
+        return;
+    }
+    seen[seen_n++] = (void *)orig;
+
+    {
+        void *mod = NULL;
+        const WCHAR *name = NULL;
+        LDR_DATA_TABLE_ENTRY *ldr;
+
+        if (!LdrFindEntryForAddress( (void *)orig, &ldr ))
+        {
+            mod = ldr->DllBase;
+            name = ldr->BaseDllName.Buffer;
+        }
+        ERR( "[seh-xlate] ml603 handler=%p %s -> %p  module=%s+0x%x\n",
+             orig, is_ec ? "EC/native TRANSLATED" : "GUEST left in PE space (icall -> FEX)",
+             final, name ? debugstr_w(name) : "?",
+             mod ? (unsigned int)((ULONG_PTR)orig - (ULONG_PTR)mod) : 0 );
+    }
+}
+
+
+/**********************************************************************
  *           call_seh_handlers
  *
  * Call the SEH handlers.
@@ -2078,6 +2337,12 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         if (sehent_n < 60 && InterlockedIncrement( &sehent_n ) <= 60)
             ERR( "[seh-entry] ctx=%p Rsp=%p Rip=%p\n", orig_context,
                  (void *)(ULONG_PTR)orig_context->Rsp, (void *)(ULONG_PTR)orig_context->Rip );
+
+    /* iOS-Mythic ml633: ESTABLISH THE GUEST-STACK WINDOW IN PHASE ONE TOO.
+     * ec_stack_window_begin() was only called on the phase-two unwind path, yet phase
+     * one consults ec_win — so a thread could validate frames against another
+     * exception's bounds, or none at all. Re-establish from the ORIGINAL Rsp here. */
+    ec_stack_window_begin( (ULONG_PTR)orig_context->Rsp );
     }
 
     /* iOS-Mythic 2026-07-04: [SEH_RATE] — the render worker burns ~75% of
@@ -2222,6 +2487,39 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         }
         prev_pc = dispatch.ControlPc;
         prev_frame = dispatch.EstablisherFrame;
+
+        /* iOS-Mythic ml633: THE TERMINAL ROOT FRAME IS LEGAL — DO NOT REJECT IT.
+         *
+         * Usable frames are [lo, hi), but the OUTERMOST frame of a thread sits exactly
+         * AT hi. In the ml632 ULTRAKILL run the walk reached
+         *   ControlPc = ntdll!RtlUserThreadStart+0x2c, EstablisherFrame = 0x703ec60000
+         * which is precisely StackBase, and its unwind record has ExceptionDataPresent
+         * with handler RVA 0x25388 = call_unhandled_exception_handler — i.e. THE frame
+         * whose whole job is to run Unity's unhandled-exception filter. Rejecting it
+         * produced "Exception frame is not in stack limits => unable to dispatch" and
+         * terminated before the game's own filter ever ran. Stock Wine accepts
+         * frame <= StackBase.
+         *
+         * ⛔ Do NOT relax every `< hi` to `<= hi` — that would bless any one-past-the-end
+         * address and re-open what ml617 closed. This predicate is deliberately narrow:
+         * the frame must be EXACTLY hi, the unwound Rsp must ALSO be exactly hi, and it
+         * is honoured at most once per walk, so a loop cannot exploit it. */
+        {
+            static __thread int ml633_root_used;
+            if (walk_steps <= 1) ml633_root_used = 0;   /* new walk */
+            if (ec_win.hi && !ml633_root_used &&
+                dispatch.EstablisherFrame == (ULONG64)ec_win.hi &&
+                context.AMD64_Context.Rsp == (ULONG64)ec_win.hi &&
+                !is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
+            {
+                ml633_root_used = 1;
+                ERR( "[unwind-root] ml633 ACCEPTING terminal root frame %I64x (== stack hi) "
+                     "ControlPc=%I64x handler=%p — this is the unhandled-exception filter frame\n",
+                     dispatch.EstablisherFrame, (ULONG64)dispatch.ControlPc,
+                     dispatch.LanguageHandler );
+                goto ml633_frame_ok;
+            }
+        }
 
         if (!is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
         {
@@ -2369,37 +2667,70 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
             break;
         }
 
+    ml633_frame_ok:
         if (dispatch.LanguageHandler)
         {
             TRACE( "calling handler %p (rec=%p, frame=%I64x context=%p, dispatch=%p)\n",
                    dispatch.LanguageHandler, rec, dispatch.EstablisherFrame, orig_context, &dispatch );
-            /* iOS-Mythic #81 (ml475 fix, REVERTED ml477 — do not re-land
-             * without gating).  LanguageHandler is ImageBase + unwind handler
-             * RVA, i.e. a PE VA, and PE .text is non-executable here, so
+            /* iOS-Mythic #81 — RE-LANDED ml603, GATED, exactly as the ml477
+             * revert note below instructed.
+             *
+             * The problem: LanguageHandler is ImageBase + unwind handler RVA,
+             * i.e. a PE VA, and PE .text is non-executable here, so
              * call_seh_handler's `blr x11` faults on instruction fetch.  The
              * Mach handler redirects it correctly every time, but the pointer
-             * is recomputed from unwind data on every dispatch, so the
-             * stale-VA healer can never fix it — one kernel round-trip per
-             * SEH handler call, forever.  Wrapping the handler in
-             * xlate_ios_jit() here provably eliminated that (ml475: 786k
-             * faults -> 0, [seh-xlate] verified live in 3 processes).
+             * is recomputed from unwind data on EVERY dispatch, so the
+             * stale-VA healer can never make it stick — one kernel round-trip
+             * per SEH handler call, forever.  ml475 proved wrapping it in
+             * xlate_ios_jit() eliminates that: 786k faults -> 0.
              *
-             * REVERTED anyway, on evidence: the storm ONLY occurs with
-             * --js-flags=--jitless OFF (ml474e 186 storm samples; ml473d /
-             * ml474a / ml476 with jitless ON = 0), and jitless-off is itself
-             * convicted (it parks CrBrowserMain right after BrowserReady).
-             * So in the shipping config the fix buys nothing, while ml476
-             * (jitless ON + this wrap) crashed repeatedly ~3s after
-             * BrowserReady in the libcef/chrome_elf SEH path — the wrap was
-             * the only new variable.  Suspected mechanism: translating a
-             * handler that is x86-64 GUEST code defeats the
-             * __os_arm64x_dispatch_icall classification, which keys off PE
-             * space (see #52), so the emulator never gets it.  If this is
-             * ever re-landed, gate it on the target being EC/native code and
-             * log EVERY translation, not the first 4 per process — that cap
-             * is why the guest-handler case stayed invisible. */
-            res = call_seh_handler( rec, dispatch.EstablisherFrame, orig_context,
-                                    &dispatch, dispatch.LanguageHandler );
+             * ml477 reverted it for two reasons, ONE OF WHICH IS NOW FALSE:
+             *
+             *  (a) "the storm ONLY occurs with --js-flags=--jitless OFF, and
+             *      jitless-off is convicted anyway, so the fix buys nothing."
+             *      >>> FALSIFIED by ml602 (db 7252): jitless was ON
+             *      ([proc-gate] V8 JITLESS (interpreted) MYTHIC_JITLESS=1,
+             *      cmdline-tail shows --js-flags=--jitless) and the storm still
+             *      reached 791,552 exec faults, 749/1029 sampled at this exact
+             *      handler.  The dominant site is ntdll's own
+             *      nested_exception_handler (RVA 0x5b3c0) — installed by
+             *      call_seh_handler's own .seh_handler directive, so every SEH
+             *      dispatch pays it.  It spiralled: chrome_elf fast-fail ->
+             *      exception -> nested handler exec-fault -> exception, until
+             *      thread 00cc took c00000fd STATUS_STACK_OVERFLOW
+             *      ([stack-ovf] showed libcef.dll+0x690ca2c x15) and the whole
+             *      Steam UI froze with ~12 threads parked ~95s on events.
+             *
+             *  (b) "translating a handler that is x86-64 GUEST code defeats the
+             *      __os_arm64x_dispatch_icall classification (see #52), so the
+             *      emulator never gets it" — STILL TRUE, and is why the gate
+             *      below is mandatory.  RtlIsEcCode() is the classifier's own
+             *      predicate: translate only what is genuinely EC/native and
+             *      leave guest handlers at their PE address so the icall thunk
+             *      can route them into FEX.
+             *
+             * The revert note also said to log EVERY translation rather than
+             * the first 4 per process, because that cap is what hid the guest
+             * handler case.  Logging all ~790k would drown the log (and our own
+             * Swift log pipeline), so instead every DISTINCT handler is logged
+             * exactly once with its EC verdict — which is what actually makes an
+             * unexpected guest handler visible — plus a periodic census.  If the
+             * distinct table fills, that is logged too, so we are never
+             * silently blind. */
+            {
+                PEXCEPTION_ROUTINE handler = dispatch.LanguageHandler;
+                BOOLEAN is_ec = RtlIsEcCode( (ULONG_PTR)handler );
+
+                if (is_ec)
+                {
+                    void *xl = xlate_ios_jit( handler );
+                    if (xl) handler = (PEXCEPTION_ROUTINE)xl;
+                }
+                ios_seh_xlate_note( dispatch.LanguageHandler, handler, is_ec );
+
+                res = call_seh_handler( rec, dispatch.EstablisherFrame, orig_context,
+                                        &dispatch, handler );
+            }
             rec->ExceptionFlags &= EXCEPTION_NONCONTINUABLE;
             TRACE( "handler at %p returned %lu\n", dispatch.LanguageHandler, res );
 
@@ -2610,9 +2941,225 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                                  " cannot name the caller\n", grsp );
                     }
 
-                    else
-                        ERR( "[guest-rip] 0x%I64x -> NtQueryVirtualMemory FAILED"
-                             " (address is not in this address space at all)\n", grip );
+                    /* iOS-Mythic ml631: THIS `else` WAS DANGLING.
+                     *
+                     * It hangs off the INNER committed-but-non-executable test, not off
+                     * the `else if (!qst)` chain, so ANY executable page printed
+                     * "NtQueryVirtualMemory FAILED" immediately after the successful
+                     * query had already printed valid attributes. That read as the VM
+                     * layer contradicting itself and cost a whole wrong hypothesis about
+                     * why Mono declined the ULTRAKILL null fault. (The comment further up
+                     * records ml274 fixing a DIFFERENT spurious "FAILED" on the same line
+                     * — this is the second bug in one diagnostic.) Report the failure only
+                     * when the query genuinely failed. */
+                    else if (qst)
+                        ERR( "[guest-rip] 0x%I64x -> NtQueryVirtualMemory FAILED status=%08x"
+                             " (address is not in this address space at all)\n",
+                             grip, (unsigned int)qst );
+
+                    /* ml631: GUEST BYTES FROM BOTH VIEWS, at the RECONSTRUCTED guest RIP.
+                     *
+                     * ULTRAKILL dies on `ldaprb w6,[x8]` with x8=0, and FEX computed that
+                     * zero twelve bytes earlier (`movz w7,#0` + `madd w8,w6,w7,wzr`). Only
+                     * the guest x86 can say whether that is faithful. Print 32 bytes either
+                     * side, and — because the page is a Mono JIT buffer with an RW alias —
+                     * the SAME range through the alias, so a disagreement between the two
+                     * views is visible immediately.
+                     *
+                     * Bounded and read-only: capped firings, no allocation, no locks; the
+                     * unix probe is a pure table walk. */
+                    /* iOS-Mythic ml636: DO NOT GATE ON "the page is executable".
+                     *
+                     * The ml635 gate required NtQueryVirtualMemory to classify the
+                     * reconstructed RIP as executable — which CANNOT hold for the very case
+                     * this telemetry exists for: a RIP exactly one-past a Mono alias. The
+                     * probe now also matches an alias ENDING at the RIP, so let it decide. */
+                    if (rec->ExceptionCode == 0xc0000005)
+                    {
+                        static int gb_n;
+                        if (gb_n < 4)
+                        {
+                            struct ios_jit_alias_probe_params pp;
+                            const unsigned char *rx = (const unsigned char *)(ULONG_PTR)(grip - 32);
+                            char line[3 * 64 + 8];
+                            unsigned i, off = 0;
+                            gb_n++;
+
+                            /* ml635: ask FIRST, so the byte dump can be clipped to the
+                             * mapping. The ml634 fatal RIP was EXACTLY one-past the alias
+                             * end, so reading RIP+31 would fault inside the handler. */
+                            memset( &pp, 0, sizeof(pp) );
+                            pp.size = sizeof(pp); pp.version = 1; pp.addr = grip;
+                            WINE_UNIX_CALL( unix_ios_jit_alias_probe, &pp );
+                            if (!pp.base)   /* not an end match — ask about the byte window */
+                            {
+                                memset( &pp, 0, sizeof(pp) );
+                                pp.size = sizeof(pp); pp.version = 1; pp.addr = grip - 32;
+                                WINE_UNIX_CALL( unix_ios_jit_alias_probe, &pp );
+                            }
+                            {
+                                unsigned lim = 64;
+                                if (pp.end && grip - 32 < pp.end && pp.end - (grip - 32) < 64)
+                                    lim = (unsigned)(pp.end - (grip - 32));
+                                for (i = 0; i < lim; i++)
+                                    off += sprintf( line + off, "%02x ", rx[i] );
+                                /* ml637: `lim - 32 - 1` wrapped when lim==32 and printed
+                                 * "+4294967295". Print the byte count, not a signed range. */
+                                ERR( "[guest-bytes] ml631 #%d RIP=0x%I64x RX from -32, %u bytes: %s%s\n",
+                                     gb_n, grip, lim, line,
+                                     lim < 64 ? "   (clipped at mapping end)" : "" );
+                            }
+                            if (pp.base)
+                            {
+                                ERR( "[smc-gen] ml636 #%d alias=[0x%I64x,0x%I64x) size=0x%I64x write_gen=%u "
+                                     "written16k=%08x highest=0x%I64x RIP_off=0x%I64x %s\n",
+                                     gb_n, pp.base, pp.end, pp.end - pp.base, pp.write_gen, pp.written,
+                                     pp.highest, grip - pp.base,
+                                     pp.at_end ? "<== RIP IS EXACTLY THE ALIAS END (one past)" : "" );
+                                /* ml637: `highest` is the highest store START seen (+1), not the
+                                 * highest byte written — note_write() only receives the address,
+                                 * so a 2/4/8/16/32-byte store understates the extent by up to 31.
+                                 * The tail verdict's 256-byte tolerance absorbs that, but do not
+                                 * read it as byte-exact. */
+                                ERR( "[smc-gen] ml637 #%d NOTE: highest = highest store START +1 "
+                                     "(understates by up to 31 bytes; width not plumbed through)\n", gb_n );
+                                ERR( "[smc-gen] ml636 #%d TAIL VERDICT: highest written 0x%I64x of 0x%I64x — %s\n",
+                                     gb_n, pp.highest, pp.end - pp.base,
+                                     !pp.highest ? "**NEVER WRITTEN AT ALL**" :
+                                     pp.highest + 256 >= pp.end - pp.base
+                                         ? "tail WAS written (reaches the very end)"
+                                         : "**TAIL NEVER WRITTEN** — control ran past the real code" );
+                                /* iOS-Mythic ml639: WHICH OF THE THREE VIEWS DETACHED?
+                                 *
+                                 * guest = user_va+off, poolRX = jit_rx_alias+off,
+                                 * poolRW = jit_rw_alias+off. All three are the SAME physical
+                                 * pages when the dual-map and the vm_remap are both intact.
+                                 * Hashing the first 16KB -- the only chunk ever written, and
+                                 * where the divergence lives -- localises the break:
+                                 *   guest==RX != RW  -> the pool's RX/RW pair detached
+                                 *   guest != RX==RW  -> the guest vm_remap detached
+                                 *   guest==RW != RX  -> the pool RX mapping alone detached
+                                 *   all three differ -> stale slot / multiple remaps
+                                 * dup_end also settles the "matched a duplicate entry" theory. */
+                                if (pp.rw_base && pp.rx_base)
+                                {
+                                    const unsigned char *g  = (const unsigned char *)(ULONG_PTR)pp.base;
+                                    const unsigned char *px = (const unsigned char *)(ULONG_PTR)pp.rx_base;
+                                    const unsigned char *pw = (const unsigned char *)(ULONG_PTR)pp.rw_base;
+                                    ULONG64 hg = 1469598103934665603ull, hx = hg, hw = hg;
+                                    unsigned k;
+                                    for (k = 0; k < 0x4000; k++)
+                                    {
+                                        hg = (hg ^ g[k])  * 1099511628211ull;
+                                        hx = (hx ^ px[k]) * 1099511628211ull;
+                                        hw = (hw ^ pw[k]) * 1099511628211ull;
+                                    }
+                                    ERR( "[3view] ml639 #%d slot=%u dup_end=%u guest=%p poolRX=%p poolRW=%p\n",
+                                         gb_n, pp.slot, pp.dup_end, (void *)(ULONG_PTR)pp.base,
+                                         (void *)(ULONG_PTR)pp.rx_base, (void *)(ULONG_PTR)pp.rw_base );
+                                    ERR( "[3view] ml639 #%d HASH16K guest=%016I64x poolRX=%016I64x poolRW=%016I64x => %s\n",
+                                         gb_n, hg, hx, hw,
+                                         (hg == hx && hx == hw) ? "ALL THREE AGREE" :
+                                         (hg == hx)             ? "guest==poolRX, poolRW DETACHED" :
+                                         (hx == hw)             ? "poolRX==poolRW, GUEST vm_remap DETACHED" :
+                                         (hg == hw)             ? "guest==poolRW, poolRX DETACHED" :
+                                                                  "ALL THREE DIFFER (stale slot / multiple remaps)" );
+                                    {
+                                        ULONG64 offs[2];
+                                        unsigned oi;
+                                        offs[0] = 0x1368;                                   /* verified coherent earlier */
+                                        offs[1] = pp.highest >= 32 ? pp.highest - 32 : 0;   /* the divergence */
+                                        for (oi = 0; oi < 2; oi++)
+                                        {
+                                            char a[3*32+4], b[3*32+4], c[3*32+4];
+                                            unsigned q = 0, r = 0, t = 0;
+                                            ULONG64 o = offs[oi];
+                                            for (k = 0; k < 32; k++)
+                                            {
+                                                q += sprintf( a + q, "%02x ", g[o+k] );
+                                                r += sprintf( b + r, "%02x ", px[o+k] );
+                                                t += sprintf( c + t, "%02x ", pw[o+k] );
+                                            }
+                                            ERR( "[3view] ml639 #%d @+0x%I64x  guest: %s\n", gb_n, o, a );
+                                            ERR( "[3view] ml639 #%d @+0x%I64x poolRX: %s\n", gb_n, o, b );
+                                            ERR( "[3view] ml639 #%d @+0x%I64x poolRW: %s\n", gb_n, o, c );
+                                        }
+                                    }
+                                }
+
+                                /* ml637: dump the LAST WRITTEN bytes, not the last bytes of the
+                                 * buffer. ml636 printed [end-128,end) — all zeros by definition when
+                                 * the tail was never written, which told us nothing. The bytes that
+                                 * matter are just below `highest`: in the ml636 run that is
+                                 * 0x33e0..0x33fd, i.e. the block FEX started at and the last code
+                                 * Mono ever emitted. This is what shows whether that block is a
+                                 * complete, correctly terminated sequence. */
+                                if (pp.highest >= 128 && pp.rw)
+                                {
+                                    const unsigned char *wrx = (const unsigned char *)(ULONG_PTR)
+                                                               (pp.base + pp.highest - 128);
+                                    const unsigned char *wrw = (const unsigned char *)(ULONG_PTR)
+                                                               (pp.rw + pp.highest - 128);
+                                    char w1[3*128+8], w2[3*128+8];
+                                    unsigned k, q1 = 0, q2 = 0, wdiff = 0;
+                                    for (k = 0; k < 128; k++)
+                                    {
+                                        q1 += sprintf( w1 + q1, "%02x ", wrx[k] );
+                                        q2 += sprintf( w2 + q2, "%02x ", wrw[k] );
+                                        if (wrx[k] != wrw[k]) wdiff = 1;
+                                    }
+                                    ERR( "[smc-gen] ml637 #%d LASTWRITTEN[0x%I64x-128,0x%I64x) RX: %s\n",
+                                         gb_n, pp.highest, pp.highest, w1 );
+                                    ERR( "[smc-gen] ml637 #%d LASTWRITTEN RW: %s (%s)\n", gb_n, w2,
+                                         wdiff ? "**RX/RW DIFFER**" : "RX/RW match" );
+                                }
+                                if (pp.end - pp.base >= 128 && pp.rw)
+                                {
+                                    const unsigned char *trx = (const unsigned char *)(ULONG_PTR)(pp.end - 128);
+                                    const unsigned char *trw = (const unsigned char *)(ULONG_PTR)
+                                                               (pp.rw + (pp.end - 128 - pp.base));
+                                    char t1[3*128+8], t2[3*128+8];
+                                    unsigned k, o1 = 0, o2 = 0, diff = 0;
+                                    for (k = 0; k < 128; k++)
+                                    {
+                                        o1 += sprintf( t1 + o1, "%02x ", trx[k] );
+                                        o2 += sprintf( t2 + o2, "%02x ", trw[k] );
+                                        if (trx[k] != trw[k]) diff = 1;
+                                    }
+                                    ERR( "[smc-gen] ml636 #%d TAIL RX -128: %s\n", gb_n, t1 );
+                                    ERR( "[smc-gen] ml636 #%d TAIL RW -128: %s (%s)\n", gb_n, t2,
+                                         diff ? "**RX/RW DIFFER**" : "RX/RW match" );
+                                }
+                            }
+                            /* ml637: SKIP the generic dump at an end match. It compares
+                             * pp.rw[0..63] — the START of the RW buffer — against rx[0..63]
+                             * where rx = RIP-32, so rx[32..63] lies OUTSIDE the mapping. That
+                             * is both a mismatched comparison and a potential fault INSIDE the
+                             * exception handler. The tail/last-written dumps above supersede it. */
+                            if (pp.at_end)
+                                ERR( "[guest-bytes] ml637 #%d generic RX/RW compare SKIPPED (end match — "
+                                     "would read past the mapping)\n", gb_n );
+                            else if (pp.rw)
+                            {
+                                const unsigned char *rw = (const unsigned char *)(ULONG_PTR)pp.rw;
+                                int differ = 0;
+                                off = 0;
+                                for (i = 0; i < 64; i++)
+                                {
+                                    off += sprintf( line + off, "%02x ", rw[i] );
+                                    if (rw[i] != rx[i]) differ = 1;
+                                }
+                                ERR( "[guest-bytes] ml631 #%d rw=0x%I64x alias=[0x%I64x,0x%I64x) RW  -32..+31: %s\n",
+                                     gb_n, pp.rw, pp.base, pp.end, line );
+                                ERR( "[guest-bytes] ml631 #%d VERDICT: RX and RW %s\n",
+                                     gb_n, differ ? "**DIFFER** — alias coherency/finalisation"
+                                                  : "MATCH — the guest bytes are what FEX compiled" );
+                            }
+                            else
+                                ERR( "[guest-bytes] ml631 #%d no RW alias for 0x%I64x"
+                                     " (not an anon-JIT page)\n", gb_n, grip );
+                        }
+                    }
                 }
             }
             ERR( "[rtcs] pre: code=%08x addr=%p armPc=%p ecRip=%p rtcs=%p insim=%u\n",
@@ -3127,6 +3674,11 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
     dispatch.HistoryTable     = table;
     dispatch.NonVolatileRegisters = nonvol_regs.Buffer;
 
+    /* ml617: establish the guest-stack window from the ORIGINAL RSP before the
+     * first step, so every frame below is bounded by the allocation the thread
+     * was actually running on. */
+    ec_stack_window_begin( (ULONG_PTR)context->Rsp );
+
     for (;;)
     {
         status = virtual_unwind( UNW_FLAG_UHANDLER, &dispatch, &new_context );
@@ -3134,6 +3686,28 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 
     unwind_done:
         if (!dispatch.EstablisherFrame) break;
+
+        {
+            const char *why = ec_stack_window_step( dispatch.EstablisherFrame,
+                                                    (ULONG_PTR)dispatch.ControlPc );
+            if (why)
+            {
+                /* ⛔ Do NOT synthesize a replacement exception. ml616 lost the real
+                 * fault (execute AV at private RW heap) and reported a stack
+                 * fragment as the status. Report everything needed to trust this
+                 * rejection, then stop unwinding and let the ORIGINAL record go. */
+                ERR( "[unwind-guard] ml617 STOPPING unwind: %s | orig_code=%08x orig_addr=%p "
+                     "orig_rsp=%I64x stack=[%I64x..%I64x) emu=[%I64x..%I64x] "
+                     "rejected_frame=%I64x prev_frame=%I64x ControlPc=%I64x steps=%u budget=%u\n",
+                     why, (int)rec->ExceptionCode, rec->ExceptionAddress,
+                     (ULONG64)context->Rsp, (ULONG64)ec_win.lo, (ULONG64)ec_win.hi,
+                     (ULONG64)ec_win.emu_lo, (ULONG64)ec_win.emu_hi,
+                     (ULONG64)dispatch.EstablisherFrame, (ULONG64)ec_win.last_frame,
+                     (ULONG64)dispatch.ControlPc, ec_win.steps, ec_win.budget );
+                rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+                break;
+            }
+        }
 
         if (!is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
         {

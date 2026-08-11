@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <time.h>   /* ml591: CLOCK_MONOTONIC for the per-socket TLS timeline */
 #ifdef HAVE_IFADDRS_H
 # include <ifaddrs.h>
 #endif
@@ -818,6 +819,181 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
  * able to starve the CM sockets, which is the trap that has invalidated three
  * probes in this investigation already. Loopback is skipped so the steamloopback
  * traffic cannot drown the census. */
+/* iOS-Mythic ml591: PER-SOCKET TLS TIMELINE — the timing half of the CM hunt.
+ *
+ * ml590 settled the PHASE question: on every CM socket we caught, the handshake ran
+ * to completion (ClientHello -> server flight -> CCS+Finished -> encrypted
+ * post-handshake records) and Steam then sent NOTHING — no WebSocket Upgrade. What
+ * it could NOT answer is WHEN, because ios_sock_wire above has no clock. It also
+ * cannot simply be extended: it calls getpeername() before EVERY send/recv and
+ * dprintf()s inline, on a path whose entire CM ping budget is 1000 ms. Instrumenting
+ * per event is how you manufacture the timeout you are trying to measure — which is
+ * exactly why ml579 gated it off.
+ *
+ * So here every milestone is a STORE, never I/O, and getpeername() runs once per
+ * connection rather than per call. One summary line is emitted only when the socket's
+ * fate is already decided: fd reuse (abandoned), an Upgrade actually going out, or a
+ * stale sweep so a socket that closes and is never reused still reports.
+ *
+ * Reading it: `flight->fin` is the milestone that matters. first-recv only marks when
+ * ServerHello arrived; the flight->fin gap is where certificate verification and the
+ * client's own crypto run, which is the work we suspect blows the budget. (Sol's
+ * point, and the reason a first-send/first-recv-only probe would have proved nothing.)
+ *   total well under 1000ms, no post  => healthy session Steam abandoned => client state
+ *   total at/over 1000ms              => deadline expiry => hunt local crypto/JIT cost
+ *
+ * Caveat kept from ml590: TLS 1.3 puts EncryptedExtensions/Certificate/
+ * CertificateVerify/Finished/NewSessionTicket ALL under record type 0x17, so the tail
+ * read is "post-handshake", not provably application data. */
+#define IOS_TL_SLOTS 128
+struct ios_tl_ent
+{
+    int                fd;          /* <=0 = free slot */
+    unsigned short     port;
+    unsigned int       gen;
+    unsigned long long t0, t_ch, t_flight, t_fin, t_tail, t_post, t_last;
+    unsigned int       n_send, n_recv, alerts;
+    unsigned long      b_send, b_recv;
+    int                post_len;
+    unsigned char      post5[5];
+};
+static struct ios_tl_ent ios_tl_tab[IOS_TL_SLOTS];
+static unsigned int ios_tl_gen;
+
+static unsigned long long ios_tl_now(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+/* milestone delta in ms, or -1 when either end never happened */
+static double ios_tl_d( unsigned long long a, unsigned long long b )
+{
+    return (a && b && b >= a) ? (double)(b - a) / 1e6 : -1.0;
+}
+
+static void ios_tl_flush( struct ios_tl_ent *e, const char *fate )
+{
+    char post[32];
+
+    if (e->fd <= 0) return;
+    if (e->t_post)
+        snprintf( post, sizeof(post), "%d:%02x %02x", e->post_len, e->post5[0], e->post5[1] );
+    else
+        strcpy( post, "NONE" );
+
+    dprintf( 2, "[sock-tl] fd=%d gen=%u port=%u open->CH=%.1f CH->flight=%.1f "
+                "flight->fin=%.1f fin->tail=%.1f tail->post=%.1f total=%.1fms "
+                "tx=%u/%luB rx=%u/%luB alerts=%u post=%s fate=%s rev=ml591\n",
+             e->fd, e->gen, e->port,
+             ios_tl_d( e->t0, e->t_ch ), ios_tl_d( e->t_ch, e->t_flight ),
+             ios_tl_d( e->t_flight, e->t_fin ), ios_tl_d( e->t_fin, e->t_tail ),
+             ios_tl_d( e->t_tail, e->t_post ), ios_tl_d( e->t0, e->t_last ),
+             e->n_send, e->b_send, e->n_recv, e->b_recv, e->alerts, post, fate );
+    e->fd = -1;
+}
+
+static void ios_sock_tl( int fd, int is_send, const void *buf, long ret_bytes, int err )
+{
+    const unsigned char *b = (const unsigned char *)buf;
+    unsigned char rec = (ret_bytes >= 3 && b) ? b[0] : 0;
+    struct ios_tl_ent *e = NULL;
+    unsigned long long now;
+    int i, freeslot = -1;
+
+    if (fd <= 0 || err || ret_bytes <= 0) return;   /* errors carry no wire bytes */
+    now = ios_tl_now();
+
+    for (i = 0; i < IOS_TL_SLOTS; i++)
+    {
+        if (ios_tl_tab[i].fd == fd) { e = &ios_tl_tab[i]; break; }
+        if (ios_tl_tab[i].fd <= 0 && freeslot < 0) freeslot = i;
+    }
+
+    /* Retire the old timeline when the fd number has been recycled onto a new
+     * connection. ml591 shipped this test as "a fresh ClientHello arrived", which
+     * MISSED every reuse by a non-TLS protocol: fd 1628's CM entry silently
+     * absorbed a later port-80 connection and reported rx=26/133465B for what
+     * should have been one ~4KB handshake, making its timings worthless. (Caught
+     * by Sol.) A recycled fd always involves a fresh connect, so any gap since the
+     * last event is the cheap, protocol-agnostic place to re-check identity —
+     * bursts within a single connection skip the syscall entirely. */
+    if (e && (rec == 0x16 || now - e->t_last > 20000000ull))
+    {
+        struct sockaddr_storage pa2;
+        socklen_t pl2 = sizeof(pa2);
+        unsigned short now_port = 0;
+
+        if (!getpeername( fd, (struct sockaddr *)&pa2, &pl2 ))
+        {
+            if (pa2.ss_family == AF_INET) now_port = ntohs( ((const struct sockaddr_in *)&pa2)->sin_port );
+            else if (pa2.ss_family == AF_INET6) now_port = ntohs( ((const struct sockaddr_in6 *)&pa2)->sin6_port );
+        }
+        if (now_port != e->port || (is_send && rec == 0x16 && e->t_ch))
+        {
+            freeslot = (int)(e - ios_tl_tab);
+            ios_tl_flush( e, "abandoned" );
+            e = NULL;
+        }
+    }
+
+    if (!e)
+    {
+        struct sockaddr_storage pa;
+        socklen_t pl = sizeof(pa);
+        unsigned short port = 0;
+
+        if (getpeername( fd, (struct sockaddr *)&pa, &pl ) != 0) return;  /* not connected */
+        if (pa.ss_family == AF_INET)
+        {
+            const struct sockaddr_in *s4 = (const struct sockaddr_in *)&pa;
+            if ((ntohl( s4->sin_addr.s_addr ) >> 24) == 127) return;      /* loopback */
+            port = ntohs( s4->sin_port );
+        }
+        else if (pa.ss_family == AF_INET6) port = ntohs( ((const struct sockaddr_in6 *)&pa)->sin6_port );
+        else return;
+
+        /* Sweep on creation instead of running a timer: a socket that is closed and
+         * never reused would otherwise never report its timeline. */
+        for (i = 0; i < IOS_TL_SLOTS; i++)
+            if (ios_tl_tab[i].fd > 0 && now - ios_tl_tab[i].t_last > 5000000000ull)
+            {
+                ios_tl_flush( &ios_tl_tab[i], "idle" );
+                if (freeslot < 0) freeslot = i;
+            }
+        if (freeslot < 0) return;                                        /* table full */
+        e = &ios_tl_tab[freeslot];
+        memset( e, 0, sizeof(*e) );
+        e->fd = fd; e->port = port; e->gen = ++ios_tl_gen; e->t0 = now;
+    }
+
+    e->t_last = now;
+    if (is_send) { e->n_send++; e->b_send += (unsigned long)ret_bytes; }
+    else         { e->n_recv++; e->b_recv += (unsigned long)ret_bytes; }
+    if (rec == 0x15) e->alerts++;
+
+    if (is_send)
+    {
+        if (rec == 0x16 && !e->t_ch) e->t_ch = now;
+        else if (rec == 0x14 && !e->t_fin) e->t_fin = now;
+        else if (e->t_tail && !e->t_post)
+        {
+            /* ANY client send after the handshake tail is the thing we have never
+             * seen: the WebSocket Upgrade. Fate decided — report immediately. */
+            e->t_post = now;
+            e->post_len = (int)ret_bytes;
+            if (b && ret_bytes >= 5) memcpy( e->post5, b, 5 );
+            ios_tl_flush( e, "upgrade-sent" );
+        }
+    }
+    else
+    {
+        if (rec == 0x16 && !e->t_flight) e->t_flight = now;
+        else if (rec == 0x17 && !e->t_tail) e->t_tail = now;
+    }
+}
+
 static void ios_sock_wire( int fd, int is_send, const void *buf, long ret_bytes, int err )
 {
     static struct { int fd; unsigned short port; int n; int wouldblock; } tab[64];
@@ -1040,6 +1216,7 @@ done:
 #else
 #define ios_sock_big_note( fd, is_send, ret_bytes, err ) do { } while (0)
 #define ios_sock_wire( fd, is_send, buf, ret_bytes, err ) do { } while (0)
+#define ios_sock_tl( fd, is_send, buf, ret_bytes, err ) do { } while (0)
 #endif
 
 static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
@@ -1073,10 +1250,12 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
         if (errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( errno ) );
         ios_sock_big_note( fd, 0, 0, errno );
         ios_sock_wire( fd, 0, NULL, 0, errno );
+        ios_sock_tl( fd, 0, NULL, 0, errno );
         return sock_errno_to_status( errno );
     }
     ios_sock_big_note( fd, 0, ret, 0 );
     ios_sock_wire( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+    ios_sock_tl( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
 
     status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
@@ -1374,6 +1553,7 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
 
             ios_sock_big_note( fd, 1, 0, errno );
             ios_sock_wire( fd, 1, NULL, 0, errno );
+            ios_sock_tl( fd, 1, NULL, 0, errno );
             return sock_errno_to_status( errno );
         }
     }
@@ -1381,6 +1561,7 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
     async->sent_len += ret;
     ios_sock_big_note( fd, 1, ret, 0 );
     ios_sock_wire( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+    ios_sock_tl( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
 
     while (async->iov_cursor < async->count && ret >= async->iov[async->iov_cursor].iov_len)
         ret -= async->iov[async->iov_cursor++].iov_len;

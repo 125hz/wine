@@ -656,7 +656,14 @@ static BOOL CRYPT_DownloadObject(DWORD dwRetrievalFlags, HINTERNET hHttp,
                     if (!(ret = InternetReadFileExA(hHttp, &buffer, IRF_NO_WAIT,
                      (DWORD_PTR)context)))
                     {
-                        if (GetLastError() == ERROR_IO_PENDING)
+                        if (GetLastError() == ERROR_IO_PENDING && !context)
+                        {
+                            /* iOS-Mythic ml592: see CRYPT_DownloadObject below --
+                             * a SYNCHRONOUS session must never report pending. */
+                            ERR("read: ERROR_IO_PENDING on a synchronous session (context=NULL)\n");
+                            SetLastError(ERROR_TIMEOUT);
+                        }
+                        else if (GetLastError() == ERROR_IO_PENDING)
                         {
                             if (WaitForSingleObject(context->event,
                              context->timeout) == WAIT_TIMEOUT)
@@ -676,6 +683,26 @@ static BOOL CRYPT_DownloadObject(DWORD dwRetrievalFlags, HINTERNET hHttp,
                     ret = FALSE;
                 }
             }
+        }
+        else if (GetLastError() == ERROR_IO_PENDING && !context)
+        {
+            /* iOS-Mythic ml592: THIS LINE CRASHED THE WHOLE APP (ml591, db 7156).
+             * context is NULL for a synchronous retrieval (dwTimeout == 0), so
+             * context->timeout faulted at address 0x8 -- cryptnet+0x137fc,
+             * `ldr w1,[x22,#8]` with x22 == NULL -- and since every Windows
+             * process here is a thread in ONE Mach task, that killed Steam
+             * seconds after the QR code finally rendered.
+             *
+             * The NULL deref is only the messenger: InternetQueryDataAvailable()
+             * must NOT return ERROR_IO_PENDING on a session cryptnet opened
+             * synchronously. Suspected origin is set_socket_blocking() in
+             * wininet/netconnection.c discarding the ioctlsocket(FIONBIO) result
+             * (fixed alongside this), which leaves a "blocking" socket actually
+             * non-blocking -> WSAEWOULDBLOCK -> ERROR_IO_PENDING. Fail the
+             * retrieval loudly rather than wait on an event that cannot exist. */
+            ERR("query-data: ERROR_IO_PENDING on a synchronous session (context=NULL)\n");
+            SetLastError(ERROR_TIMEOUT);
+            ret = FALSE;
         }
         else if (GetLastError() == ERROR_IO_PENDING)
         {
@@ -912,7 +939,12 @@ static BOOL WINAPI HTTP_RetrieveEncodedObjectW(LPCWSTR pszURL,
                     }
                     ret = HttpSendRequestExW(hHttp, NULL, NULL, 0,
                      (DWORD_PTR)context);
-                    if (!ret && GetLastError() == ERROR_IO_PENDING)
+                    if (!ret && GetLastError() == ERROR_IO_PENDING && !context)
+                    {
+                        ERR("send-request: ERROR_IO_PENDING on a synchronous session (context=NULL)\n");
+                        SetLastError(ERROR_TIMEOUT);
+                    }
+                    else if (!ret && GetLastError() == ERROR_IO_PENDING)
                     {
                         if (WaitForSingleObject(context->event,
                          context->timeout) == WAIT_TIMEOUT)
@@ -922,7 +954,12 @@ static BOOL WINAPI HTTP_RetrieveEncodedObjectW(LPCWSTR pszURL,
                     }
                     if (ret &&
                      !(ret = HttpEndRequestW(hHttp, NULL, 0, (DWORD_PTR)context)) &&
-                     GetLastError() == ERROR_IO_PENDING)
+                     GetLastError() == ERROR_IO_PENDING && !context)
+                    {
+                        ERR("end-request: ERROR_IO_PENDING on a synchronous session (context=NULL)\n");
+                        SetLastError(ERROR_TIMEOUT);
+                    }
+                    else if (!ret && GetLastError() == ERROR_IO_PENDING)
                     {
                         if (WaitForSingleObject(context->event,
                          context->timeout) == WAIT_TIMEOUT)

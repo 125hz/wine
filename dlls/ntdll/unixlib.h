@@ -79,6 +79,47 @@ struct ios_push_jit_aliases_params
                      unsigned long long size);
 };
 
+/* iOS-Mythic ml618: register the per-pseudo-process leaked-hold release callback.
+ *
+ * A NEW ordinal with its own size/version, deliberately NOT an extension of
+ * ios_push_jit_aliases_params: an old one-field caller gives the callee no way
+ * to discover whether trailing bytes exist, so retrofitting a version field onto
+ * that struct would itself be an out-of-bounds read (that bug shipped once —
+ * ml549's rip_from_hostpc — and was removed in ml613).
+ *
+ * callback MUST be the arm64ec_redirect_ptr()-resolved pointer. */
+struct ios_register_hold_release_params
+{
+    unsigned int size;      /* sizeof(struct) — set by caller, checked by callee */
+    unsigned int version;   /* 1 */
+    void *peb;              /* selects the pseudo-process this callback serves */
+    void *callback;         /* uint32_t (*)(void *teb, uint64_t*, uint32_t*, uint32_t*) */
+};
+
+/* iOS-Mythic ml631: read-only probe of the anon-JIT alias table.
+ *
+ * Given a guest address inside a Mono JIT buffer, hand back the RW alias so the
+ * PE side can read the SAME bytes through both views and compare them. That
+ * separates "the guest x86 really is this" from "the RX and RW views disagree"
+ * (alias coherency / finalisation) without another device run. */
+struct ios_jit_alias_probe_params
+{
+    unsigned int size;        /* sizeof(struct) — set by caller, checked by callee */
+    unsigned int version;     /* 1 */
+    unsigned long long addr;  /* IN:  guest address to resolve */
+    unsigned long long rw;    /* OUT: RW alias for addr, or 0 if not aliased */
+    unsigned long long base;  /* OUT: alias user_va base, or 0 */
+    unsigned long long end;   /* OUT: alias user_va end, or 0 */
+    unsigned int write_gen;   /* OUT: ml635 emulated-write count for this alias */
+    unsigned int written;     /* OUT: ml635 bit per 16KB chunk ever written */
+    unsigned long long highest;/* OUT: ml636 highest offset ever written, +1 */
+    unsigned int at_end;      /* OUT: ml636 1 = addr is exactly this alias's END */
+    unsigned long long rw_base;/* OUT: ml639 alias jit_rw_alias BASE (never offset) */
+    unsigned long long rx_base;/* OUT: ml639 alias jit_rx_alias BASE (never offset) */
+    unsigned int slot;        /* OUT: ml639 matched table slot index */
+    unsigned int dup_end;     /* OUT: ml639 live entries sharing this end */
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -90,6 +131,10 @@ enum ntdll_unix_funcs
     unix_wine_spawnvp,
     unix_system_time_precise,
     unix_ios_push_jit_aliases,
+    /* ml618: APPEND ONLY — inserting anywhere above renumbers every existing
+     * ordinal and silently mismatches the PE and unix halves. */
+    unix_ios_register_hold_release,
+    unix_ios_jit_alias_probe,   /* ml631 — APPEND ONLY (see note above) */
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

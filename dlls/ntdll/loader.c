@@ -1148,32 +1148,30 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
  * The loader_section must be locked while calling this function.
  */
 #ifdef __arm64ec__
-/* ml233: slots recorded by the [ec-bind] probe, re-read after process init — see there. */
-static void *ec_recheck_slot[8];
-static void *ec_recheck_want[8];
-static unsigned int ec_recheck_n;
-static unsigned int ec_recheck_prints;
-void ios_ec_recheck_iat( const char *when );
-
-void ios_ec_recheck_iat( const char *when )
-{
-    extern void *xlate_ios_jit( void *ptr );
-    unsigned int i;
-
-    for (i = 0; i < ec_recheck_n; i++)
-    {
-        void *pslot = xlate_ios_jit( ec_recheck_slot[i] );
-        void *peval = *(void **)ec_recheck_slot[i];
-        void *pval = (pslot && pslot != ec_recheck_slot[i]) ? *(void **)pslot : (void *)-1;
-
-        if (ec_recheck_prints++ >= 24) return;
-        ERR( "[ec-recheck:%s] slot=%p pe_val=%p pool_val=%p want=%p %s\n",
-             when, ec_recheck_slot[i], peval, pval, ec_recheck_want[i],
-             pval == ec_recheck_want[i] ? "POOL OK"
-             : peval != ec_recheck_want[i] ? "PE ALSO CHANGED (rebound?)"
-             : "POOL STILL STALE  <== calls use the unbound entry" );
-    }
-}
+/* ml601: THE ec-recheck PROBE IS DELETED. It was an ml233/ml234 investigation
+ * aid with no functional role in IAT synchronisation — and it was killing runs.
+ *
+ * It cached up to 8 raw IAT slot pointers in file-static arrays and re-read them
+ * on every later bind and every LdrLoadDll attach, FOREVER. Nothing ever removed
+ * a slot when its importing module unloaded, so a single unload turned every
+ * later call into a wild read. That is exactly how the run at db 7244 died:
+ *
+ *   t+94.487s  Steam spawns hardwareupdater.exe --check-for-updates
+ *              (a PyInstaller app: unpacks _MEI6362, loads python314.dll)
+ *   line 27599 combase.dll maps at 0x71d4f90000-0x71d5040000
+ *   line 27617 [ec-bind] records slot=0x71d4fe0160, importer=combase
+ *   line 28196 [iOS-xrem] combase UNMAPPED
+ *   line 28643 SEGV reading 0x71d4fe0160 -- "NO wine view ... FEX/foreign mmap"
+ *
+ * Note the print cap could not have saved it: `*(void **)ec_recheck_slot[i]` was
+ * dereferenced BEFORE `if (ec_recheck_prints++ >= 24) return;`, so the reads
+ * continued silently long after the logging stopped. Capping or moving the cap
+ * would only have made the crash quieter, not rarer.
+ *
+ * If this ever needs revisiting, do NOT cache raw slot pointers across module
+ * lifetimes — resolve the module by base address at read time and skip it if it
+ * is no longer mapped.
+ */
 
 /* iOS-Mythic ml318: EAGER delay-import resolution for ARM64EC modules.
  *
@@ -1473,16 +1471,10 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
                      * vs ec-bind line >1519), so of course it still holds the unbound entry
                      * here. If that were also true at CALL time nothing would work at all,
                      * so the question is what the slot holds once init completes. */
-                    /* ml234: also re-read what was recorded earlier. This is guaranteed to
-                     * execute (unlike a hand-picked attach site) and each later bind gives a
-                     * progressively later reading of the earlier slots. */
-                    if (ec_recheck_n) ios_ec_recheck_iat( "later-bind" );
-                    if (ec_recheck_n < 8)
-                    {
-                        ec_recheck_slot[ec_recheck_n] = slot;
-                        ec_recheck_want[ec_recheck_n] = (void *)thunk_list->u1.Function;
-                        ec_recheck_n++;
-                    }
+                    /* ml601: slot recording removed — see the ec-recheck note above.
+                     * Caching these pointers across module lifetimes is what made an
+                     * unloaded combase.dll fatal. The [ec-bind] line below is a pure
+                     * point-in-time print and holds nothing past this call. */
                     ERR( "[ec-bind] %s.%s pre=%p post=%p redirected=%d IsEcCode(post)=%d importer=%p"
                          " | slot=%p poolslot=%p poolval=%p %s (BIND TIME)\n",
                          name, pe_name->Name, pre, (void *)thunk_list->u1.Function,
@@ -3790,11 +3782,8 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
     if (nts == STATUS_SUCCESS)
     {
 #ifdef __arm64ec__
-        /* ml234: re-read recorded IAT slots here — this attach runs AFTER the module's
-         * imports are bound, so it is representative of call time. (The earlier call site
-         * was inside load_arm64ec_module(), which runs before sechost/rpcrt4 even load, so
-         * the list was empty and the probe printed nothing.) */
-        { void ios_ec_recheck_iat( const char * ); ios_ec_recheck_iat( "ldrload-attach" ); }
+        /* ml601: the ec-recheck re-read that used to run here is gone — it dereferenced
+         * cached IAT slots belonging to modules that may since have unloaded. */
         /* ml318: eager-resolve delay imports for already-loaded targets BEFORE any code
          * in the new module tree runs -- the first call through a lazy slot is
          * unsalvageable (see ios_eager_delay_resolve). */

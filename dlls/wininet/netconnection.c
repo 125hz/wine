@@ -281,7 +281,20 @@ static void set_socket_blocking(netconn_t *conn, BOOL is_blocking)
 {
     if(conn->is_blocking != is_blocking) {
         ULONG arg = !is_blocking;
-        ioctlsocket(conn->socket, FIONBIO, &arg);
+        /* iOS-Mythic ml592: the ioctlsocket() result used to be DISCARDED while
+         * conn->is_blocking was updated unconditionally, so a failed FIONBIO left
+         * wininet believing a socket was blocking when the kernel still had it
+         * non-blocking. Every later recv then returns WSAEWOULDBLOCK, wininet
+         * reports ERROR_IO_PENDING on a session the caller opened SYNCHRONOUSLY,
+         * and cryptnet's sync path dereferences its NULL context -- the
+         * cryptnet+0x137fc crash that killed the app moments after the QR code
+         * first rendered (ml591). Keep the shadow state honest: only record the
+         * mode we actually achieved. */
+        if(ioctlsocket(conn->socket, FIONBIO, &arg)) {
+            ERR("ioctlsocket(FIONBIO, %lu) failed, err %d -- socket stays %s\n",
+                arg, WSAGetLastError(), conn->is_blocking ? "blocking" : "non-blocking");
+            return;
+        }
     }
     conn->is_blocking = is_blocking;
 }

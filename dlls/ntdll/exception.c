@@ -334,6 +334,53 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         TRACE( " info[%ld]=%p\n", i, (void *)rec->ExceptionInformation[i] );
     TRACE_CONTEXT( context );
 
+    /* iOS-Mythic ml604: FAST-FAIL MUST KILL THE PROCESS, NOT UNWIND.
+     *
+     * STATUS_STACK_BUFFER_OVERRUN is what `int 0x29` (__fastfail) and the /GS
+     * cookie check raise.  On real Windows this NEVER runs VEH or frame-based
+     * SEH — with no debugger attached the process is terminated on the spot.
+     * We were treating it as an ordinary exception and unwinding through guest
+     * SEH, which is simply wrong, and here it is catastrophic:
+     *
+     *   ml603 (db 7268): chrome_elf+0x93ba5 does `mov ecx,7; int 0x29`
+     *   (FAST_FAIL_FATAL_APP_EXIT).  Webhelper thread 00d4 alternated 1,277
+     *   c0000409 fast-fails with AVs inside FEX, each unwinding through SEH,
+     *   until it exhausted its 8MB stack (c00000fd) and died — WHILE OWNING
+     *   ntdll's global fls_section.  Then:
+     *       029c holds loader_section, waits forever on fls_section (owner dead)
+     *       CrBrowserMain 00b0 waits on loader_section
+     *   and Steam's UI stopped presenting for good.  Every Windows "process"
+     *   here is a pseudo-process in ONE Mach task, so a thread that dies
+     *   holding a process-global lock strands it permanently.
+     *
+     * Terminating the whole pseudo-process is both correct Windows semantics
+     * and the only safe option in this architecture: killing just the faulting
+     * thread is exactly what stranded the lock.  Steam restarts webhelper.
+     *
+     * NOT gated to webhelper on purpose — fast-fail is process-fatal for every
+     * Windows process, so gating it per-app would be a per-app hack AND would
+     * leave the same stranded-lock bug live everywhere else.
+     */
+    if (rec->ExceptionCode == STATUS_STACK_BUFFER_OVERRUN)
+    {
+        static LONG ff_reentry;
+        ULONG_PTR ff_code = rec->NumberParameters ? rec->ExceptionInformation[0] : ~(ULONG_PTR)0;
+
+        ERR( "[fast-fail] ml604 code=%Iu addr=%p — terminating this pseudo-process "
+             "(fast-fail bypasses VEH/SEH on Windows; unwinding it stranded fls_section in ml603)\n",
+             ff_code, rec->ExceptionAddress );
+
+        /* If we are ever back here, termination did not take — say so loudly
+         * rather than silently falling through into the unwind that broke us. */
+        if (InterlockedIncrement( &ff_reentry ) > 1)
+            ERR( "[fast-fail] ml604 RE-ENTERED (%ld) — NtTerminateProcess did not take effect\n",
+                 ff_reentry );
+
+        NtTerminateProcess( NtCurrentProcess(), STATUS_STACK_BUFFER_OVERRUN );
+        /* Must never return to the faulting thread: its stack/locks are suspect. */
+        for (;;) NtTerminateThread( GetCurrentThread(), STATUS_STACK_BUFFER_OVERRUN );
+    }
+
     if (call_vectored_handlers( rec, context ) == EXCEPTION_CONTINUE_EXECUTION)
         NtContinue( context, FALSE );
 
