@@ -48,6 +48,7 @@ static BOOLEAN  (WINAPI *pBTCpu64IsProcessorFeaturePresent)(UINT);
  * #ifdef guard because PE-side builds don't have an iOS-specific
  * macro (target is arm64ec-windows in all cases). */
 static void     (WINAPI *pBTCpu64IosAddAliasMapping)(unsigned long long, unsigned long long, unsigned long long);
+static void     (WINAPI *pBTCpu64IosSetMonoBridge)(unsigned long long);  /* ml648 */
 /* ml618: iOS-only. MUST be obtained via GET_PTR (arm64ec_redirect_ptr), never via a
  * raw base+RVA lookup — see the registration comment below. */
 static unsigned int (WINAPI *pBTCpu64IosReleaseThreadHolds)(void*, unsigned long long*, unsigned int*, unsigned int*);
@@ -612,6 +613,7 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     GET_PTR( BTCpu64FlushInstructionCache );
     GET_PTR( BTCpu64IosAddAliasMapping );  /* iOS-only; NULL on non-iOS hosts. */
     GET_PTR( BTCpu64IosReleaseThreadHolds );  /* iOS-only; ml618 leaked-hold release. */
+    GET_PTR( BTCpu64IosSetMonoBridge );  /* iOS-only; ml648 Mono backpatcher bridge. */
     GET_PTR( BTCpu64IsProcessorFeaturePresent );
     GET_PTR( BTCpu64NotifyMemoryDirty );
     GET_PTR( BTCpu64NotifyReadFile );
@@ -652,6 +654,28 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     }
     /* No else — on non-iOS hosts pBTCpu64IosAddAliasMapping is naturally NULL,
      * which is silent + correct: the bridge has nothing to do off-iOS. */
+
+    /* iOS-Mythic ml648: HAND FEX THE MONO-BACKPATCHER BRIDGE.
+     *
+     * Two hops, both in safe directions. PE -> unix via WINE_UNIX_CALL gets the
+     * shared struct's address; PE -> PE via the arm64ec_redirect_ptr'd export
+     * hands it to FEX. Nothing here calls an ARM64EC export from native Mach-O
+     * code, which is what crashed every ml613 launch.
+     *
+     * FEX publishes its struct offsets on receipt but leaves mono_base at 0, so
+     * the native Mach handler stays inert until InvalidationTracker recognises
+     * the Mono module. Off iOS the export is absent, the pointer is NULL, and
+     * this is silently skipped. */
+    if (pBTCpu64IosSetMonoBridge)
+    {
+        ULONG64 bridge = 0;
+        NTSTATUS st = WINE_UNIX_CALL( unix_ios_mono_bridge_ptr, &bridge );
+        if (!st && bridge)
+            pBTCpu64IosSetMonoBridge( bridge );
+        else
+            ERR( "ml648: mono bridge unavailable (status %lx, ptr %s)\n",
+                 st, bridge ? "set" : "NULL" );
+    }
 
     /* iOS-Mythic ml618: REGISTER THE LEAKED-HOLD RELEASE CALLBACK.
      *

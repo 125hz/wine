@@ -135,6 +135,7 @@ enum ntdll_unix_funcs
      * ordinal and silently mismatches the PE and unix halves. */
     unix_ios_register_hold_release,
     unix_ios_jit_alias_probe,   /* ml631 — APPEND ONLY (see note above) */
+    unix_ios_mono_bridge_ptr,   /* ml648 — APPEND ONLY: inserting renumbers every later ordinal */
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;
