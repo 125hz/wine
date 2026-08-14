@@ -4630,6 +4630,12 @@ NTSTATUS open_unix_file( HANDLE *handle, const char *unix_name, ACCESS_MASK acce
 static void ios_js_track_add( HANDLE handle, const char *unix_name );
 #endif
 
+#ifdef WINE_IOS
+/* ml665: bounded counter for the [file-fail] probe below. */
+static int ios_file_fail_logged;
+static int ios_file_wfail_logged;   /* ml669: separate budget for write/create opens */
+#endif
+
 NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
                               IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size,
                               ULONG attributes, ULONG sharing, ULONG disposition,
@@ -4731,6 +4737,62 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     }
 
  done:
+#ifdef WINE_IOS
+    /* iOS-Mythic ml665: [file-fail] — we have NEVER logged a failing guest file
+     * open, and that blind spot cost several runs on Book of the Dead.
+     *
+     * Book of the Dead's stdout stream is left at _flags=0,_file=-1 -- the exact
+     * state freopen() leaves when it closes a stream and the REOPEN then fails.
+     * stderr next to it is a healthy -2 from UCRT's own no-handle path, which
+     * proves CRT init and our standard-handle setup are both correct. So the
+     * failure is a file that would not open. This names it.
+     *
+     * Bounded and failure-only: successful opens are the overwhelming majority
+     * and logging them would drown the run (and change its timing). */
+    /* ml669: SPLIT THE BUDGET. ml665's single 64-entry cap was consumed entirely
+     * by ordinary loader search-path misses (winemac.drv, winex11.drv, uxtheme,
+     * Common-Controls manifests) 1,600 lines before the game even started, so it
+     * never observed a single game file operation. Those read-only probes are
+     * expected behaviour, not failures.
+     *
+     * Writes and creates are what we actually need: Unity's _wfreopen of its log
+     * is a write-open, and its failure is what leaves stdout closed at _file=-1.
+     * Give them their own generous budget that read-only misses cannot touch. */
+    {
+        int is_write = (access & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) != 0
+                       || disposition != FILE_OPEN;
+        if (status && is_write && ios_file_wfail_logged < 192)
+        {
+            const WCHAR *w = nt_name.Buffer ? nt_name.Buffer : (attr && attr->ObjectName ? attr->ObjectName->Buffer : NULL);
+            unsigned int wl = nt_name.Buffer ? nt_name.Length / 2
+                                             : (attr && attr->ObjectName ? attr->ObjectName->Length / 2 : 0);
+            char nb[300];
+            unsigned int k = 0;
+            if (w) while (k < wl && k < sizeof(nb) - 1) { nb[k] = (w[k] < 32 || w[k] > 126) ? '?' : (char)w[k]; k++; }
+            nb[k] = 0;
+            ios_file_wfail_logged++;
+            dprintf( 2, "[file-wfail] ml669 #%d status=0x%08x disp=%u access=0x%08x options=0x%08x "
+                     "unix=%s name=%s\n",
+                     ios_file_wfail_logged, status, disposition, access, options,
+                     unix_name ? unix_name : "(none)", nb );
+        }
+    }
+    if (status && ios_file_fail_logged < 64)
+    {
+        const WCHAR *w = nt_name.Buffer ? nt_name.Buffer : (attr && attr->ObjectName ? attr->ObjectName->Buffer : NULL);
+        unsigned int wl = nt_name.Buffer ? nt_name.Length / 2
+                                         : (attr && attr->ObjectName ? attr->ObjectName->Length / 2 : 0);
+        char nb[300];
+        unsigned int k = 0;
+        if (w) while (k < wl && k < sizeof(nb) - 1) { nb[k] = (w[k] < 32 || w[k] > 126) ? '?' : (char)w[k]; k++; }
+        nb[k] = 0;
+        ios_file_fail_logged++;
+        dprintf( 2, "[file-fail] ml665 #%d NtCreateFile status=0x%08x disp=%u access=0x%08x "
+                 "options=0x%08x unix=%s name=%s\n",
+                 ios_file_fail_logged, status, disposition, access, options,
+                 unix_name ? unix_name : "(none)", nb );
+    }
+#endif
     free( unix_name );
     free( nt_name.Buffer );
     return io->Status = status;
