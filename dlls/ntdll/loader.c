@@ -1699,6 +1699,27 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
 
     *(DWORD *)dir->AddressOfIndex = i;
     tls_dirs[i] = *dir;
+    {
+        /* iOS-Mythic ml704 [tls-life]: which TLS slot each module actually got.
+         *
+         * Compiler-emitted magic statics in main EXEs commonly hardcode TLS[0]
+         * on the Windows convention that the EXE owns slot 0.  If xtajit64 (or
+         * anything else) takes slot 0 first, those reads land in the wrong
+         * module's TLS block and the guest concludes its registries are already
+         * initialised, leaving them zero -- which is exactly what a NULL table
+         * pointer in a settings registry looks like.  Print the assignment so
+         * the ordering is a measured fact rather than an assumption. */
+        static int n_slot;
+        if (n_slot < 24)
+        {
+            n_slot++;
+            ERR( "[tls-life] ml704 slot=%lu module=%s base=%p callbacks=%p rawsize=%lu zerofill=%lu\n",
+                 i, debugstr_w(mod->BaseDllName.Buffer), mod->DllBase,
+                 (void *)dir->AddressOfCallBacks,
+                 (ULONG)(dir->EndAddressOfRawData - dir->StartAddressOfRawData),
+                 dir->SizeOfZeroFill );
+        }
+    }
     return TRUE;
 }
 
@@ -1965,6 +1986,22 @@ static void call_tls_callbacks( HMODULE module, UINT reason )
 
     dir = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_TLS, &dirsize );
     if (!dir || !dir->AddressOfCallBacks) return;
+
+    {   /* ml704 [tls-life]: prove the callbacks actually run, and how many.
+         * MSVC images register dynamic initialisers here; if these never fire,
+         * globals stay zero and the failure surfaces far away. */
+        static int n_cb;
+        if (n_cb < 24)
+        {
+            const PIMAGE_TLS_CALLBACK *c = (const PIMAGE_TLS_CALLBACK *)dir->AddressOfCallBacks;
+            int cnt = 0;
+
+            while (c[cnt]) cnt++;
+            n_cb++;
+            ERR( "[tls-life] ml704 RUN callbacks module=%p reason=%u count=%d first=%p\n",
+                 module, reason, cnt, cnt ? (void *)c[0] : NULL );
+        }
+    }
 
     for (callback = (const PIMAGE_TLS_CALLBACK *)dir->AddressOfCallBacks; *callback; callback++)
     {
