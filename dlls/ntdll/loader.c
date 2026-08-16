@@ -77,6 +77,13 @@ static DWORD (WINAPI *pCtrlRoutine)(void *);
 SYSTEM_DLL_INIT_BLOCK LdrSystemDllInitBlock = { 0xf0 };
 
 void *__wine_syscall_dispatcher = NULL;
+
+/* iOS-Mythic: byte offset from (TPIDRRO_EL0 & ~7) to the raw Apple TSD slot
+ * backing ios_teb_tls_key, discovered at process init by the unix loader and
+ * published here so ARM64EC modules (FEX) can import one authoritative value
+ * instead of hardcoding a slot they do not own. Zero means "not yet
+ * discovered" and must never be used as an offset. */
+unsigned int ios_teb_tsd_offset = 0;
 unixlib_handle_t __wine_unixlib_handle = 0;
 
 /* windows directory */
