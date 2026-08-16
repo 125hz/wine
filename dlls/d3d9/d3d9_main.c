@@ -26,6 +26,24 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d9);
 
+/* iOS-Mythic (rev ml700): several titles hard-import d3d9.dll purely to satisfy
+ * their import table and then render through D3D11.  Report once per entry point
+ * whether a guest actually creates a d3d9 object, and whether wined3d can come up
+ * at all on a host with no GL/Vulkan driver, so one device log answers both.
+ * `entry` is always a string literal, so the pointer identifies the call site. */
+static void d3d9_ios_probe( const char *entry, BOOL ok )
+{
+    static const char *seen[4];
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(seen); i++)
+    {
+        if (seen[i] == entry) return;
+        if (!seen[i]) { seen[i] = entry; break; }
+    }
+    ERR( "[d3d9-probe] rev=ml700 %s called -> d3d9_init %s\n", entry, ok ? "OK" : "FAILED" );
+}
+
 static int D3DPERF_event_level = 0;
 
 void WINAPI DebugSetMute(void) {
@@ -44,9 +62,11 @@ IDirect3D9 * WINAPI DECLSPEC_HOTPATCH Direct3DCreate9(UINT sdk_version)
     if (!d3d9_init(object, FALSE, FALSE))
     {
         WARN("Failed to initialize d3d9.\n");
+        d3d9_ios_probe( "Direct3DCreate9", FALSE );
         free(object);
         return NULL;
     }
+    d3d9_ios_probe( "Direct3DCreate9", TRUE );
 
     TRACE("Created d3d9 object %p.\n", object);
 
@@ -65,9 +85,11 @@ HRESULT WINAPI DECLSPEC_HOTPATCH Direct3DCreate9Ex(UINT sdk_version, IDirect3D9E
     if (!d3d9_init(object, TRUE, FALSE))
     {
         WARN("Failed to initialize d3d9.\n");
+        d3d9_ios_probe( "Direct3DCreate9Ex", FALSE );
         free(object);
         return D3DERR_NOTAVAILABLE;
     }
+    d3d9_ios_probe( "Direct3DCreate9Ex", TRUE );
 
     TRACE("Created d3d9 object %p.\n", object);
     *d3d9ex = &object->IDirect3D9Ex_iface;
@@ -91,9 +113,11 @@ IDirect3D9 * WINAPI DECLSPEC_HOTPATCH Direct3DCreate9On12(UINT sdk_version, D3D9
     if (!d3d9_init(object, TRUE, d3d9on12))
     {
         WARN("Failed to initialize d3d9.\n");
+        d3d9_ios_probe( "Direct3DCreate9On12", FALSE );
         free(object);
         return NULL;
     }
+    d3d9_ios_probe( "Direct3DCreate9On12", TRUE );
 
     TRACE("Created d3d9 object %p.\n", object);
     return (IDirect3D9 *)&object->IDirect3D9Ex_iface;

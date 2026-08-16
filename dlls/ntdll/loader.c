@@ -509,7 +509,39 @@ static ULONG_PTR allocate_stub( const char *dll, const char *name )
 
 #else  /* __i386__ */
 static inline ULONG_PTR allocate_stub( const char *dll, const char *name ) { return 0xdeadbeef; }
+
+
 #endif  /* __i386__ */
+
+/*************************************************************************
+ *  iOS-Mythic ml701 [iat-life] — stage 1 of the IAT slot-lifecycle probe.
+ *
+ * An IAT slot must NEVER end up NULL.  An unresolved import becomes
+ * allocate_stub()'s 0xdeadbeef, and every arm64ec_redirect_ptr path is
+ * NULL-safe (it only returns NULL for NULL input), so a zero slot after
+ * binding is a real defect rather than a normal "not implemented".
+ *
+ * Found via LibreMines/Qt5: Qt5Gui.dll's VCRUNTIME140!longjmp slot held 0 at
+ * runtime and the guest branched to address 0.  This reports the offender by
+ * importer + dll + symbol + slot RVA — never the ASLR address — so it is
+ * comparable across runs, and prints the pre-redirect value so a redirect
+ * that zeroes a good pointer is distinguishable from an export that resolved
+ * to zero in the first place.  Capped; costs one compare per import.
+ */
+static void iat_life_bind_check( const char *dll, const char *sym, int ordinal,
+                                 const WINE_MODREF *wm, const void *module,
+                                 const void *slot, ULONG_PTR pre, ULONG_PTR post )
+{
+    static int reported;
+
+    if (post) return;                      /* the overwhelmingly common case */
+    if (reported >= 48) return;
+    reported++;
+    ERR( "[iat-life] ml701 BIND-ZERO importer=%s imp=%s.%s ord=%d slotRVA=0x%lx pre=%p post=NULL\n",
+         wm ? debugstr_w(wm->ldr.BaseDllName.Buffer) : "?", dll,
+         sym ? sym : "(by-ordinal)", ordinal,
+         (unsigned long)((const char *)slot - (const char *)module), (void *)pre );
+}
 
 /* call ldr notifications */
 static void call_ldr_notifications( ULONG reason, LDR_DATA_TABLE_ENTRY *module )
@@ -1383,12 +1415,15 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
 
     while (import_list->u1.Ordinal)
     {
+        ULONG_PTR iat_life_pre = 0;   /* ml701 [iat-life]: value before EC redirect */
+
         if (IMAGE_SNAP_BY_ORDINAL(import_list->u1.Ordinal))
         {
             int ordinal = IMAGE_ORDINAL(import_list->u1.Ordinal);
 
             thunk_list->u1.Function = (ULONG_PTR)find_ordinal_export( imp_mod, exports, exp_size,
                                                                       ordinal - exports->Base, load_path, wm, FALSE );
+            iat_life_pre = thunk_list->u1.Function;   /* ml701 [iat-life] */
             if (!thunk_list->u1.Function)
             {
                 thunk_list->u1.Function = allocate_stub( name, IntToPtr(ordinal) );
@@ -1411,6 +1446,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
             thunk_list->u1.Function = (ULONG_PTR)find_named_export( imp_mod, exports, exp_size,
                                                                     (const char*)pe_name->Name,
                                                                     pe_name->Hint, load_path, wm, FALSE );
+            iat_life_pre = thunk_list->u1.Function;   /* ml701 [iat-life] */
             if (!thunk_list->u1.Function)
             {
                 thunk_list->u1.Function = allocate_stub( name, (const char*)pe_name->Name );
@@ -1490,6 +1526,22 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
 #endif
             TRACE_(imports)("--- %s %s.%d = %p\n",
                             pe_name->Name, name, pe_name->Hint, (void *)thunk_list->u1.Function);
+        }
+        /* ml701 [iat-life] stage 1: covers BOTH branches after every rewrite. */
+        if (!thunk_list->u1.Function)
+        {
+            const char *sym = NULL;
+            int ord = 0;
+
+            if (IMAGE_SNAP_BY_ORDINAL(import_list->u1.Ordinal))
+                ord = IMAGE_ORDINAL(import_list->u1.Ordinal);
+            else
+            {
+                IMAGE_IMPORT_BY_NAME *pn = get_rva( module, (DWORD)import_list->u1.AddressOfData );
+                sym = (const char *)pn->Name;
+            }
+            iat_life_bind_check( name, sym, ord, wm, module, thunk_list,
+                                 iat_life_pre, thunk_list->u1.Function );
         }
         import_list++;
         thunk_list++;
@@ -3755,6 +3807,110 @@ NTSTATUS CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int access, int
 /******************************************************************
  *		LdrLoadDll (NTDLL.@)
  */
+/*************************************************************************
+ *  iOS-Mythic ml701 [iat-life] - stage 2 of the IAT slot-lifecycle probe.
+ *
+ * Stage 1 reports a slot that was never bound to anything.  This one reports
+ * a slot that is NULL *right now*, sweeping every loaded module after each
+ * successful LdrLoadDll, so a slot that bound fine and was zeroed later is
+ * both caught and bracketed in time (the `when` tag names the load that had
+ * just completed).  Together they separate: never bound / bound then zeroed.
+ *
+ * Only descriptors carrying an OriginalFirstThunk are walked - without an ILT
+ * there is no way to tell a zeroed slot from the table terminator, and
+ * inventing one would manufacture false positives.  Deduped per (module,
+ * slot) so one persistent zero cannot flood the cap.
+ */
+static void iat_life_sweep( const char *when )
+{
+    extern void *xlate_ios_jit( void *ptr );
+    static struct { const void *base; ULONG rva; } seen[64];
+    static int nseen, sweeps, reports;
+    LIST_ENTRY *list, *entry;
+    int n_mod = 0, n_slot = 0, n_pool = 0, n_pezero = 0, n_poolzero = 0;
+
+    if (sweeps >= 512 || reports >= 48) return;
+    sweeps++;
+
+    list = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
+    for (entry = list->Flink; entry != list && reports < 48; entry = entry->Flink)
+    {
+        LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
+        const IMAGE_IMPORT_DESCRIPTOR *descr;
+        ULONG size;
+
+        if (!mod->DllBase) continue;
+        descr = RtlImageDirectoryEntryToData( mod->DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_IMPORT, &size );
+        if (!descr) continue;
+
+        for (; descr->Name && descr->FirstThunk && reports < 48; descr++)
+        {
+            const char *dll = get_rva( mod->DllBase, descr->Name );
+            const IMAGE_THUNK_DATA *ilt;
+            IMAGE_THUNK_DATA *iat;
+            int i;
+
+            if (!descr->OriginalFirstThunk) continue;
+            ilt = get_rva( mod->DllBase, descr->OriginalFirstThunk );
+            iat = get_rva( mod->DllBase, descr->FirstThunk );
+
+            for (i = 0; ilt[i].u1.Ordinal && reports < 48; i++)
+            {
+                void *slot = &iat[i].u1.Function, *pslot;
+                ULONG_PTR pe_val = iat[i].u1.Function, pool_val = pe_val;
+                ULONG slot_rva;
+                int j, dup = 0, has_pool = 0;
+                const char *kind;
+
+                n_slot++;
+
+                /* ml233's note applies here: the pool copy is taken at MAP time,
+                 * before imports bind, so it is only meaningful AFTER init — which
+                 * is exactly when this sweep runs.  The guest executes one of these
+                 * two views; a zero in EITHER is a branch-to-zero waiting to happen,
+                 * and checking only the PE side (as the first cut of this probe did)
+                 * cannot see a stale pool slot at all. */
+                pslot = xlate_ios_jit( slot );
+                if (pslot && pslot != slot) { has_pool = 1; n_pool++; pool_val = *(ULONG_PTR *)pslot; }
+
+                if (pe_val && !(has_pool && !pool_val)) continue;   /* both views fine */
+                if (!pe_val) n_pezero++;
+                if (has_pool && !pool_val) n_poolzero++;
+
+                slot_rva = (ULONG)((const char *)&iat[i] - (const char *)mod->DllBase);
+                for (j = 0; j < nseen; j++)
+                    if (seen[j].base == mod->DllBase && seen[j].rva == slot_rva) { dup = 1; break; }
+                if (dup) continue;
+                if (nseen < 64) { seen[nseen].base = mod->DllBase; seen[nseen].rva = slot_rva; nseen++; }
+
+                kind = !pe_val ? (has_pool && !pool_val ? "BOTH-ZERO" : "PE-ZERO") : "POOL-ZERO";
+                reports++;
+                if (IMAGE_SNAP_BY_ORDINAL(ilt[i].u1.Ordinal))
+                    ERR( "[iat-life] ml701 %s after=%s importer=%s imp=%s.#%d slotRVA=0x%lx pe=%p pool=%p(%s)\n",
+                         kind, when, debugstr_w(mod->BaseDllName.Buffer), dll,
+                         (int)IMAGE_ORDINAL(ilt[i].u1.Ordinal), (unsigned long)slot_rva,
+                         (void *)pe_val, (void *)pool_val, has_pool ? "live" : "no-pool-copy" );
+                else
+                {
+                    const IMAGE_IMPORT_BY_NAME *pn = get_rva( mod->DllBase, (DWORD)ilt[i].u1.AddressOfData );
+                    ERR( "[iat-life] ml701 %s after=%s importer=%s imp=%s.%s slotRVA=0x%lx pe=%p pool=%p(%s)\n",
+                         kind, when, debugstr_w(mod->BaseDllName.Buffer), dll,
+                         (const char *)pn->Name, (unsigned long)slot_rva,
+                         (void *)pe_val, (void *)pool_val, has_pool ? "live" : "no-pool-copy" );
+                }
+            }
+        }
+        n_mod++;
+    }
+
+    /* Self-calibration beacon: without this, "no [iat-life] lines" is
+     * indistinguishable from "the probe never ran".  Printed for the first few
+     * sweeps and then every 32nd, so coverage is provable without flooding. */
+    if (sweeps <= 3 || !(sweeps % 32))
+        ERR( "[iat-life] ml701 sweep#%d after=%s modules=%d slots=%d pooled=%d pe0=%d pool0=%d\n",
+             sweeps, when, n_mod, n_slot, n_pool, n_pezero, n_poolzero );
+}
+
 NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_flags,
                                              const UNICODE_STRING *libname, HMODULE* hModule)
 {
@@ -3794,6 +3950,16 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrLoadDll(LPCWSTR search_path, DWORD *load_fl
         {
             LdrUnloadDll(wm->ldr.DllBase);
             wm = NULL;
+        }
+        else
+        {
+            char tag[64];
+            const WCHAR *bn = wm->ldr.BaseDllName.Buffer;
+            unsigned int k = 0;
+
+            while (bn && bn[k] && k < sizeof(tag) - 1) { tag[k] = (char)bn[k]; k++; }
+            tag[k] = 0;
+            iat_life_sweep( tag );   /* ml701 [iat-life] stage 2 */
         }
     }
     if (wm) *hModule = wm->ldr.DllBase;

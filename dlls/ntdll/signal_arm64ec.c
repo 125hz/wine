@@ -3411,13 +3411,29 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 
 
 /* unwind context by one call frame */
-static void unwind_one_frame( CONTEXT *context )
+/* iOS-Mythic ml703: returns whether a real function entry was found and used.
+ *
+ * Unwind info is registered for PE VAs, but code physically executes from the
+ * JIT-pool alias, so context->Rip is a POOL VA here.  RtlLookupFunctionEntry
+ * then finds nothing, RtlVirtualUnwind treats the frame as a leaf, pops a zero
+ * return address off the stack and yields Rip=0 -- which do_setjmpex used to
+ * copy over a perfectly good jump buffer (LibreMines/Qt5: libjpeg's longjmp
+ * error path unwound to RIP 0 and the guest branched to address zero).
+ * virtual_unwind() already reverse-translates for exactly this reason; mirror
+ * it.  xlate_ios_jit_rev() resolves by REGISTERED ALIAS IDENTITY and returns
+ * its input unchanged when there is no PE counterpart, so addresses that were
+ * never pool-mapped are unaffected -- it is not guessing from address ranges. */
+static BOOL unwind_one_frame( CONTEXT *context )
 {
+    extern void *xlate_ios_jit_rev( void *ptr );
     void *data;
     ULONG_PTR base, frame, pc = context->Rip - 4;
-    RUNTIME_FUNCTION *func = RtlLookupFunctionEntry( pc, &base, NULL );
+    ULONG_PTR lookup_pc = (ULONG_PTR)xlate_ios_jit_rev( (void *)pc );
+    RUNTIME_FUNCTION *func = RtlLookupFunctionEntry( lookup_pc, &base, NULL );
 
-    RtlVirtualUnwind( UNW_FLAG_NHANDLER, base, pc, func, context, &data, &frame, NULL );
+    if (!func) return FALSE;
+    RtlVirtualUnwind( UNW_FLAG_NHANDLER, base, lookup_pc, func, context, &data, &frame, NULL );
+    return TRUE;
 }
 
 /* capture context information; helper for RtlCaptureContext */
@@ -3505,8 +3521,31 @@ static int __attribute__((used)) do_setjmpex( _JUMP_BUFFER *buf, UINT fpcr, UINT
     context.R15 = buf->R15;
     context.Rip = buf->Rip;
     memcpy( &context.Xmm6, &buf->Xmm6, 10 * sizeof(context.Xmm6) );
-    unwind_one_frame( &context );
-    if (!RtlIsEcCode( context.Rip ))  /* caller is x64, use its context instead of the ARM one */
+
+    /* ml703: the copy-back below replaces the registers NTDLL__setjmpex just
+     * stored with the unwound caller's.  That is only correct when the unwind
+     * ACTUALLY SUCCEEDED and landed on x64 code.  A failed unwind yields
+     * Rip=0, which RtlIsEcCode() reports as "not EC" -- i.e. it used to be
+     * misread as "the caller is x64", zeroing a valid buffer.  Require all
+     * three: the lookup found a function entry, the result is plausible, and
+     * it really is x64 code. */
+    {
+        BOOL unwound = unwind_one_frame( &context );
+        static int n_sj;
+
+        if (n_sj < 24)   /* [setjmp-life] ml702 probe, retained */
+        {
+            n_sj++;
+            ERR( "[setjmp-life] ml702 setjmp#%d buf=%p | STORED Frame=%p Rip=%p Rsp=%p Rbx=%p"
+                 " | UNWOUND ok=%d Rip=%p Rsp=%p | isEc(post)=%d -> %s\n",
+                 n_sj, buf, (void *)buf->Frame, (void *)buf->Rip, (void *)buf->Rsp, (void *)buf->Rbx,
+                 unwound, (void *)context.Rip, (void *)context.Rsp,
+                 (int)RtlIsEcCode( context.Rip ),
+                 (unwound && context.Rip && !RtlIsEcCode( context.Rip ))
+                     ? "COPY-BACK (real x64 caller)" : "KEEP stores" );
+        }
+
+        if (unwound && context.Rip && !RtlIsEcCode( context.Rip ))
     {
         buf->Rbx = context.Rbx;
         buf->Rsp = context.Rsp;
@@ -3519,6 +3558,16 @@ static int __attribute__((used)) do_setjmpex( _JUMP_BUFFER *buf, UINT fpcr, UINT
         buf->R15 = context.R15;
         buf->Rip = context.Rip;
         memcpy( &buf->Xmm6, &context.Xmm6, 10 * sizeof(context.Xmm6) );
+        }
+    }
+    {
+        static int n_out;
+        if (n_out < 24)
+        {
+            n_out++;
+            ERR( "[setjmp-life] ml702 setjmp-exit#%d buf=%p FINAL Frame=%p Rip=%p Rsp=%p Rbx=%p\n",
+                 n_out, buf, (void *)buf->Frame, (void *)buf->Rip, (void *)buf->Rsp, (void *)buf->Rbx );
+        }
     }
     return 0;
 }
@@ -4169,6 +4218,18 @@ void __cdecl NTDLL_longjmp( _JUMP_BUFFER *buf, int retval )
     EXCEPTION_RECORD rec;
 
     if (!retval) retval = 1;
+
+    {   /* ml702 [setjmp-life]: what the buffer holds at the moment of use.  If
+         * this is zero the unwind target is zero and the guest branches to 0. */
+        static int n_lj;
+        if (n_lj < 24)
+        {
+            n_lj++;
+            ERR( "[setjmp-life] ml702 longjmp#%d buf=%p retval=%d Frame=%p Rip=%p Rsp=%p Rbx=%p Rsi=%p Rdi=%p\n",
+                 n_lj, buf, retval, (void *)buf->Frame, (void *)buf->Rip, (void *)buf->Rsp,
+                 (void *)buf->Rbx, (void *)buf->Rsi, (void *)buf->Rdi );
+        }
+    }
 
     rec.ExceptionCode = STATUS_LONGJUMP;
     rec.ExceptionFlags = 0;
