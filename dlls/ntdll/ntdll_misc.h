@@ -170,6 +170,8 @@ extern void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64E
 extern void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
                                             const IMAGE_ARM64EC_METADATA *metadata );
 extern void invoke_arm64ec_syscall(void);
+extern void arm64ec_notify_image_map( void *base );
+extern void arm64ec_notify_image_unmap( void *base );
 
 extern void *__os_arm64x_check_call;
 extern void *__os_arm64x_check_icall;

@@ -57,6 +57,7 @@ static void     (WINAPI *pBTCpu64NotifyReadFile)(HANDLE,void*,SIZE_T,BOOL,NTSTAT
 static void     (WINAPI *pBeginSimulation)(void);
 static void     (WINAPI *pFlushInstructionCacheHeavy)(const void*,SIZE_T);
 static NTSTATUS (WINAPI *pNotifyMapViewOfSection)(void*,void*,void*,SIZE_T,ULONG,ULONG);
+static void     (WINAPI *pNotifyImageMap)(void*);
 static void     (WINAPI *pNotifyMemoryAlloc)(void*,SIZE_T,ULONG,ULONG,BOOL,NTSTATUS);
 static void     (WINAPI *pNotifyMemoryFree)(void*,SIZE_T,ULONG,BOOL,NTSTATUS);
 static void     (WINAPI *pNotifyMemoryProtect)(void*,SIZE_T,ULONG,BOOL,NTSTATUS);
@@ -619,6 +620,7 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     GET_PTR( BTCpu64NotifyReadFile );
     GET_PTR( BeginSimulation );
     GET_PTR( FlushInstructionCacheHeavy );
+    GET_PTR( NotifyImageMap );  /* iOS-only loader-safe fallback; NULL on other hosts. */
     GET_PTR( NotifyMapViewOfSection );
     GET_PTR( NotifyMemoryAlloc );
     GET_PTR( NotifyMemoryFree );
@@ -1741,6 +1743,98 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, 
     *ret_status = status;
 }
 
+/* iOS-Mythic ml709: WHICH GATE DROPS THE IMAGE NOTIFICATION?
+ *
+ * FEX only treats a guest range as executable if InvalidationTracker::XIntervals
+ * covers it, and that is populated ONLY from HandleImageMap(), which runs off
+ * notify_map_view_of_section(). In the GTA V run the child pseudo-process
+ * registered just two images -- the main exe and ntdll, both of which FEX's own
+ * ProcessInit inserts directly -- and every native x64 dependency was absent, so
+ * the first one whose code was executed (d3dx9_43) decoded as NOEXEC, raised
+ * NoExecOp, and took the GuestSignal_SIGSEGV trampoline that deliberately reads
+ * address 0. That synthetic fault is what surfaced as c0000005; it is NOT a bad
+ * pointer in the guest.
+ *
+ * The existing [map-notify] probe sits INSIDE the helper, which is only entered
+ * after three outer gates, so its silence was ambiguous between four causes:
+ *   (a) this wrapper is never called (images mapped by unix code directly),
+ *   (b) the map failed,
+ *   (c) RtlIsCurrentProcess() is false for a pseudo-process,
+ *   (d) enter_syscall_callback() refused -- InSyscallCallback already set, which
+ *       once stuck stays stuck and silently drops every later notification.
+ * Log outside every gate so one run separates them. Zero [map-gate] lines
+ * alongside the [jit-pool] image lines means (a) and nothing else. */
+
+/* iOS-Mythic ml709: REGISTER IMAGES AT THE LOADER BOUNDARY, NOT THE SYSCALL BOUNDARY.
+ *
+ * FEX only treats a guest range as executable if InvalidationTracker::XIntervals covers
+ * it, and that is populated from HandleImageMap(), which until now ran ONLY off
+ * NtMapViewOfSection's notification. In a child pseudo-process that notification never
+ * arrived: the GTA V run registered just two images -- the main exe and ntdll, both
+ * inserted directly by FEX's own ProcessInit -- while every native x64 dependency was
+ * absent, so the first one whose code was executed (d3dx9_43) decoded as NOEXEC, raised
+ * NoExecOp, and took the GuestSignal_SIGSEGV trampoline that deliberately reads address
+ * zero. The resulting c0000005 looked exactly like a bad pointer in the guest and is not
+ * one. The direct-launch case registers 14 images and works, which is the control.
+ *
+ * The syscall notification stays (applications may map executable images without ever
+ * loading them as modules), but it is no longer the only path. This one fires from the
+ * loader's semantic "module is mapped, relocated and imported, no DllMain has run yet"
+ * boundary, which is in safe PE/ARM64EC context, is keyed to the correct pseudo-process
+ * by construction, and does not depend on any of the four syscall-path gates.
+ *
+ * Symmetry matters as much as the map: if registration bypasses the broken gate but
+ * removal still depends on it, FEX keeps stale executable intervals across a DLL unload
+ * and a later address reuse inherits them. So the unload boundary is wired too.
+ *
+ * Duplicate registration is harmless -- HandleImageMap re-inserts the same intervals --
+ * so the direct-launch path can and does notify twice for the same image. */
+void arm64ec_notify_image_map( void *base )
+{
+    static unsigned int n_map;
+
+    /* ml710: must be the intervals-only entry point, NEVER NotifyMapViewOfSection.
+     * The latter also drives ImageTracker, which takes FEX's CodeInvalidationMutex
+     * EXCLUSIVELY; we are called from the loader on a thread that may already hold it
+     * SHARED from executing translated code, and there is no read-to-write upgrade. That
+     * combination froze Marvel Cosmic Invasion on cryptbase.dll for 88s with wine's
+     * loader lock held. If pNotifyImageMap is absent, do nothing: the syscall path is
+     * still authoritative, and a wedge is far worse than a missed registration. */
+    if (!base || !pNotifyImageMap) return;
+    n_map++;
+    if (n_map <= 64)
+        ERR( "[ldr-image] ml710 MAP #%u base=%p peb=%p\n", n_map, base, RtlGetCurrentPeb() );
+    pNotifyImageMap( base );
+}
+
+/* ml709b: UNUSED, deliberately. The loader must not call this -- see the long comment
+ * at the removed call site in loader.c free_modref(). Kept only so the reasoning has a
+ * home next to its map counterpart; wiring it up again re-freezes the process. */
+void arm64ec_notify_image_unmap( void *base )
+{
+    static unsigned int n_unmap;
+
+    if (!base || !pNotifyUnmapViewOfSection) return;
+    n_unmap++;
+    if (n_unmap <= 64)
+        ERR( "[ldr-image] ml709 UNMAP #%u base=%p peb=%p\n", n_unmap, base, RtlGetCurrentPeb() );
+    pNotifyUnmapViewOfSection( base, FALSE, 0 );
+    pNotifyUnmapViewOfSection( base, TRUE, STATUS_SUCCESS );
+}
+
+static void ios_map_gate_probe( const char *who, HANDLE handle, HANDLE process, NTSTATUS status,
+                                void *base, SIZE_T size, int is_cur, void *area,
+                                int insc_before, int entered )
+{
+    static int n;
+    if (n >= 48) return;
+    n++;
+    ERR( "[map-gate] ml709 %s handle=%p process=%p status=%x ok=%d cur=%d area=%p "
+         "insc_before=%d entered=%d base=%p size=%p\n",
+         who, handle, process, (unsigned int)status, NT_SUCCESS(status) ? 1 : 0, is_cur,
+         area, insc_before, entered, base, (void *)size );
+}
+
 NTSTATUS SYSCALL_API NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_ptr,
                                          ULONG_PTR zero_bits, SIZE_T commit_size,
                                          const LARGE_INTEGER *offset, SIZE_T *size_ptr,
@@ -1751,10 +1845,22 @@ NTSTATUS SYSCALL_API NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *a
 
     if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && ios_chrome_lookup( handle ))
         ios_chrome_set_view( handle, *addr_ptr );
-    if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
     {
-        notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
-        leave_syscall_callback();
+        CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
+        int is_cur = RtlIsCurrentProcess( process ) ? 1 : 0;
+        int insc_before = area ? !!area->InSyscallCallback : 0;
+        int entered = 0;
+
+        if (NT_SUCCESS(status) && is_cur) entered = enter_syscall_callback() ? 1 : 0;
+        ios_map_gate_probe( "NtMapViewOfSection", handle, process, status,
+                            NT_SUCCESS(status) ? *addr_ptr : NULL,
+                            NT_SUCCESS(status) ? *size_ptr : 0,
+                            is_cur, area, insc_before, entered );
+        if (entered)
+        {
+            notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
+            leave_syscall_callback();
+        }
     }
     return status;
 }
@@ -1768,10 +1874,22 @@ NTSTATUS SYSCALL_API NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID 
 
     if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && ios_chrome_lookup( handle ))
         ios_chrome_set_view( handle, *addr_ptr );
-    if (NT_SUCCESS(status) && RtlIsCurrentProcess( process ) && enter_syscall_callback())
     {
-        notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
-        leave_syscall_callback();
+        CHPE_V2_CPU_AREA_INFO *area = get_arm64ec_cpu_area();
+        int is_cur = RtlIsCurrentProcess( process ) ? 1 : 0;
+        int insc_before = area ? !!area->InSyscallCallback : 0;
+        int entered = 0;
+
+        if (NT_SUCCESS(status) && is_cur) entered = enter_syscall_callback() ? 1 : 0;
+        ios_map_gate_probe( "NtMapViewOfSectionEx", handle, process, status,
+                            NT_SUCCESS(status) ? *addr_ptr : NULL,
+                            NT_SUCCESS(status) ? *size_ptr : 0,
+                            is_cur, area, insc_before, entered );
+        if (entered)
+        {
+            notify_map_view_of_section( handle, *addr_ptr, *size_ptr, alloc_type, protect, &status );
+            leave_syscall_callback();
+        }
     }
     return status;
 }

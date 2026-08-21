@@ -3181,6 +3181,15 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
 #endif
     if (NT_SUCCESS(status)) status = build_module( load_path, nt_name, &module, image_info, id,
                                                    flags, system, redirected, pwm );
+#ifdef __arm64ec__
+    /* iOS-Mythic ml709: tell the emulator this image's code is executable, here rather
+     * than relying on NtMapViewOfSection's notification -- that one never fires in a
+     * child pseudo-process, leaving every native x64 dependency unregistered until the
+     * first one FEX is asked to execute dies on a synthetic NOEXEC SIGSEGV. This is the
+     * point where mapping, relocation and imports have all succeeded and no DllMain has
+     * run yet. See arm64ec_notify_image_map(). */
+    if (NT_SUCCESS(status) && *pwm) arm64ec_notify_image_map( (*pwm)->ldr.DllBase );
+#endif
     if (status && module) NtUnmapViewOfSection( NtCurrentProcess(), module );
     return status;
 }
@@ -4674,6 +4683,28 @@ static void free_modref( WINE_MODREF *wm )
 
     free_tls_slot( &wm->ldr );
     RtlReleaseActivationContext( wm->ldr.ActivationContext );
+    /* ml709b: DO NOT notify the emulator of the unload from here.
+     *
+     * The symmetric call belongs here in principle -- registering images at the loader
+     * boundary while removing them only at the syscall boundary can strand executable
+     * intervals over a freed image, which a later allocation reusing that address would
+     * inherit. It cannot be done with NotifyUnmapViewOfSection, and doing so froze Book
+     * of the Dead deterministically on its second module unload (avrt.dll):
+     *
+     *   - that API is split-phase. After=false locks and invalidates, the caller then
+     *     performs the real NtUnmapViewOfSection, and After=true unlocks. Calling both
+     *     halves back to back from here inverts the contract.
+     *   - worse, InvalidateContainingSection() takes FEX's CodeInvalidationMutex
+     *     EXCLUSIVELY, and free_modref runs on a thread that is executing translated code
+     *     and therefore already holds that mutex SHARED -- 831 deep in the observed case.
+     *     There is no read-to-write upgrade, so the thread waits on itself forever while
+     *     holding loader_section, and every other thread wedges behind it.
+     *
+     * If loader-driven symmetry is wanted, it needs a dedicated non-blocking API that
+     * queues {tracker, base, generation} here and drains it at a point where the thread
+     * holds no shared code-invalidation lock -- not a reuse of the syscall pair. Do not
+     * "fix" this by making that mutex recursive or by upgrading a read hold in place;
+     * both trade a visible freeze for stale code and corrupt lock accounting. */
     NtUnmapViewOfSection( NtCurrentProcess(), wm->ldr.DllBase );
     if (cached_modref == wm) cached_modref = NULL;
     RtlFreeUnicodeString( &wm->ldr.FullDllName );
