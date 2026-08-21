@@ -998,6 +998,28 @@ int suspend_thread( struct thread *thread )
         thread->suspend++;
     }
     else set_error( STATUS_SUSPEND_COUNT_EXCEEDED );
+#ifdef WINE_IOS
+    /* ml714: does anything actually suspend threads here, and does the count come back down?
+     *
+     * This matters more on iOS than elsewhere because stop_thread() does NOT stop anything:
+     * POSIX signal suspend is dead (task #32), so it takes a Mach context SNAPSHOT and lets
+     * the target keep running. The server's suspend counter is still incremented though, and
+     * that counter gates two things -- wake_thread() returns -1 and lock acquisition returns 0
+     * for a thread that is_thread_suspended(). So a thread that is "suspended" in bookkeeping
+     * but still running can never be woken or granted a critical section, which is exactly the
+     * shape of the Marvel Cosmic Invasion stall: one thread owning a Mono critical section
+     * while six queue behind it and the owner polls for a thread-info record forever.
+     *
+     * Log-only, capped. If a suspend of one of the blocked tids appears here with no matching
+     * resume, that is the deadlock; if nothing appears at all, suspension is not involved and
+     * the theory is dead. */
+    {
+        static int n_susp;
+        if (n_susp++ < 64)
+            fprintf( stderr, "[srv-suspend] ml714 SUSPEND tid=%04x by=%04x count %d->%d rev=ml714\n",
+                     thread->id, current ? current->id : 0, old_count, thread->suspend );
+    }
+#endif
     return old_count;
 }
 
@@ -1005,6 +1027,15 @@ int suspend_thread( struct thread *thread )
 int resume_thread( struct thread *thread )
 {
     int old_count = thread->suspend;
+#ifdef WINE_IOS
+    {   /* ml714: pair with [srv-suspend] so an unmatched suspend is visible */
+        static int n_res;
+        if (n_res++ < 64)
+            fprintf( stderr, "[srv-suspend] ml714 RESUME  tid=%04x by=%04x count %d->%d rev=ml714\n",
+                     thread->id, current ? current->id : 0, old_count,
+                     old_count > 0 ? old_count - 1 : 0 );
+    }
+#endif
     if (thread->suspend > 0)
     {
         if (!(--thread->suspend)) resume_delayed_debug_events( thread );

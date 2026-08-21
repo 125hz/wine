@@ -1649,6 +1649,38 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
     NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
 
     if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
+
+    /* ml715: WHAT THE CALLER ACTUALLY RECEIVES.
+     *
+     * This wrapper unconditionally asks for the NATIVE ARM context and converts it, and
+     * context_arm_to_x64() maps Pc directly into Rip. That is right only while the target
+     * is executing genuine ARM64EC code. If it is parked in FEX JIT, the dispatcher, or
+     * plain Mach-O (libsystem_kernel __ulock_wait2), the "x64 RIP" handed back is not an
+     * x64 address at all and the integer registers are ARM ABI values reinterpreted --
+     * even though the server captured a perfectly good saved AMD64 context at the same
+     * instant (see [srv-getctx]).
+     *
+     * RtlIsEcCode(native_pc) is logged because it is the likely selector for the fix:
+     * EC code -> convert the native context; JIT/dispatcher/Mach-O -> return the saved
+     * AMD64 context; neither available -> fail rather than manufacture one. InSimulation
+     * alone is NOT sufficient, since a translated thread inside a Wine/Mach syscall can
+     * have it clear while its correct Windows context is still the saved AMD64 one.
+     *
+     * Correlate with [srv-getctx] on native_pc (and tid), not on ordering. Capped. */
+    {
+        static LONG ec_getctx_n;
+        LONG n = InterlockedIncrement( &ec_getctx_n );
+        if (n <= 48)
+        {
+            ARM64EC_NT_CONTEXT *ec = (ARM64EC_NT_CONTEXT *)context;
+            ERR( "[ec-getctx] ml715 #%d handle=%p status=%08x native_pc=%p is_ec=%d -> "
+                 "returned rip=%p rsp=%p flags=%08x\n",
+                 (int)n, handle, (unsigned int)status, (void *)arm_ctx.Pc,
+                 status ? -1 : (RtlIsEcCode( arm_ctx.Pc ) ? 1 : 0),
+                 status ? NULL : (void *)ec->Pc, status ? NULL : (void *)ec->Sp,
+                 status ? 0 : (unsigned int)ec->ContextFlags );
+        }
+    }
     return status;
 }
 

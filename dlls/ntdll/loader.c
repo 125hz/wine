@@ -3791,6 +3791,40 @@ done:
          * Capped: apps probe optional DLLs constantly, so this is noisy by nature -- but
          * the fatal one is whatever appears last before the crash. */
         static int ldrfail_n;
+        /* ml718: the 60-line cap is process-wide and hid a fatal dependency.
+         *
+         * Marvel Cosmic Invasion exits cleanly at startup because steam_api64.dll never
+         * loads -- it statically imports XINPUT1_4.dll (ordinals 2/3, XInputGetState and
+         * XInputSetState) and no xinput was shipped. That failure happens well after the
+         * cap is reached, so nothing was logged and the absence looked like "never
+         * attempted" rather than "suppressed". Silence from a capped probe is not
+         * evidence; that mistake has now cost more than one run.
+         *
+         * Names that carry a whole subsystem get an uncapped line. Keep the list small
+         * and specific -- this is a funnel every LoadLibrary passes through. */
+        {
+            const WCHAR *base = libname;
+            const WCHAR *p2;
+            int always = 0;
+            for (p2 = libname; *p2; p2++) if (*p2 == '\\' || *p2 == '/') base = p2 + 1;
+            /* ml721: graphics names added. Marvel Cosmic Invasion dies with FNA3D's own
+             * "No supported FNA3D driver found!", i.e. every backend failed its probe --
+             * but no find_dll_file line for d3d11/dxgi appears, so we cannot tell "never
+             * requested" from "requested and failed". The 60-line cap has already
+             * destroyed that distinction twice, and both times I read the silence as
+             * absence. The .drv names matter too: if SDL's video subsystem never comes up,
+             * EVERY FNA3D driver fails its PrepareWindowAttributes, which fits the
+             * evidence better than D3D11 specifically being rejected. */
+            if (!wcsnicmp( base, L"xinput", 6 ) || !wcsnicmp( base, L"steam_api", 9 ) ||
+                !wcsnicmp( base, L"d3d11", 5 )  || !wcsnicmp( base, L"dxgi", 4 ) ||
+                !wcsnicmp( base, L"winemetal", 9 ) || !wcsnicmp( base, L"d3d10", 5 ) ||
+                !wcsnicmp( base, L"opengl32", 8 ) || !wcsnicmp( base, L"d3dcompiler", 11 ) ||
+                wcsstr( base, L".drv" ))
+                always = 1;
+            if (always)
+                ERR( "[dll-missing] ml718 UNCAPPED %s status=%08x (subsystem dependency)\n",
+                     debugstr_w(libname), (unsigned)nts );
+        }
         if (ldrfail_n++ < 60)
             ERR( "[dll-missing] rev=ml336 #%d %s status=%08x -- if the webhelper dies right"
                  " after this, it is the delay-load Chromium kills the process over\n",
