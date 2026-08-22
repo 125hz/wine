@@ -99,7 +99,42 @@ struct thread
     data_size_t            desc_len;      /* thread description length in bytes */
     WCHAR                 *desc;          /* thread description string */
     struct completion_wait *completion_wait; /* completion port wait object the thread is associated with */
+#ifdef WINE_IOS
+    /* ml730c: MUST STAY LAST. libwineserver.a carries 27 prebuilt objects that
+     * are never recompiled by build.sh (completion.o, event.o, mutex.o, timer.o,
+     * handle.o, token.o, ...). They read struct thread at the offsets they were
+     * compiled with, so inserting a field ANYWHERE above shifts every later field
+     * out from under them -- ml730 put this after ->suspend and cleanup_thread_completion()
+     * immediately began dereferencing garbage (fault addr 0x110e5e0007b5, 19 and 17
+     * native faults in the two runs, zero before). Appending preserves every existing
+     * offset; only sizeof() grows, and the sole allocator of this struct (thread.c)
+     * is rebuilt. New iOS fields go HERE, at the end, never in the middle.
+     *
+     * Whether this thread is currently held by a PERSISTENT Mach thread_suspend().
+     * Deliberately NOT derived from ->suspend: suspend_thread() calls stop_thread()
+     * BEFORE incrementing that counter, and stop_thread() also serves snapshot-only
+     * GetThreadContext/debug paths, so the counter cannot distinguish "capture and
+     * let it run" from "capture and keep it stopped". */
+    int                    ios_mach_suspended;
+#endif
 };
+
+#ifdef WINE_IOS
+/* ml730c: PIN THE PREBUILT-ARCHIVE ABI.
+ *
+ * libwineserver.a ships 27 objects that build.sh never recompiles, so struct
+ * thread's layout is a frozen contract with them, not an implementation detail.
+ * ml730 inserted a field mid-struct, moved completion_wait 640 -> 648, and
+ * cleanup_thread_completion() started dereferencing garbage on every thread
+ * teardown. Nothing caught it: the objcopy repack refreshes each member's
+ * mtime, so the archive looked freshly built.
+ *
+ * If this fires, do NOT just bump the number -- either move your new field to
+ * the end of the struct, or rebuild every object in the archive from these
+ * headers and then update it. */
+C_ASSERT( offsetof(struct thread, completion_wait) == 640 );
+C_ASSERT( offsetof(struct thread, token)           == 600 );
+#endif
 
 extern struct thread *current;
 

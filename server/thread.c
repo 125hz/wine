@@ -421,6 +421,15 @@ static inline void init_thread_structure( struct thread *thread )
     thread->base_priority   = 0;
     thread->disable_boost   = 0;
     thread->suspend         = 0;
+#ifdef WINE_IOS
+    /* ml730b: MUST be initialized. mem_alloc() poisons the object with 0x55, so
+     * leaving this field alone gave every new thread ios_mach_suspended =
+     * 0x55555555 -- ios_thread_mach_hold() then took its "already held" early
+     * return and NEVER issued a real thread_suspend(), while release() called
+     * thread_resume() on threads that were never suspended (KERN_FAILURE 5).
+     * The ml730 run silently measured nothing because of this line's absence. */
+    thread->ios_mach_suspended = 0;
+#endif
     thread->dbg_hidden      = 0;
     thread->bypass_proc_suspend = 0;
     thread->desktop_users   = 0;
@@ -994,8 +1003,26 @@ int suspend_thread( struct thread *thread )
     int old_count = thread->suspend;
     if (thread->suspend < MAXIMUM_SUSPEND_COUNT)
     {
+#ifdef WINE_IOS
+        /* ml730: tell the capture that this halt is meant to LAST, so it can keep
+         * the thread_suspend() it already took rather than resuming and leaving a
+         * window in which the target exits its blocking region. */
+        extern struct thread *ios_pending_persistent_hold;
+        extern int ios_thread_mach_hold( struct thread * );
+        extern int ios_real_suspend_enabled(void);
+        if (ios_real_suspend_enabled() && !thread->suspend)
+            ios_pending_persistent_hold = thread;
+#endif
         if (!is_thread_suspended( thread )) stop_thread( thread );
         thread->suspend++;
+#ifdef WINE_IOS
+        ios_pending_persistent_hold = NULL;
+        /* stop_thread() can bail out early (context already captured, or process
+         * init not finished), in which case no hold was established. Take it here.
+         * Idempotent: a no-op when the capture already claimed one. */
+        if (ios_real_suspend_enabled() && thread->suspend == 1)
+            ios_thread_mach_hold( thread );
+#endif
     }
     else set_error( STATUS_SUSPEND_COUNT_EXCEEDED );
 #ifdef WINE_IOS
@@ -1013,11 +1040,16 @@ int suspend_thread( struct thread *thread )
      * Log-only, capped. If a suspend of one of the blocked tids appears here with no matching
      * resume, that is the deadlock; if nothing appears at all, suspension is not involved and
      * the theory is dead. */
+    /* ml730: ml714 capped this at 64 lines and BOTH directions hit the cap, so a
+     * per-tid balance computed from the log was truncation, not data. Aggregate
+     * instead -- and keep it cheap, because this code path is what we are timing. */
     {
-        static int n_susp;
-        if (n_susp++ < 64)
-            fprintf( stderr, "[srv-suspend] ml714 SUSPEND tid=%04x by=%04x count %d->%d rev=ml714\n",
-                     thread->id, current ? current->id : 0, old_count, thread->suspend );
+        static unsigned int n_susp;
+        n_susp++;
+        if (n_susp <= 8 || n_susp % 256 == 0)
+            fprintf( stderr, "[srv-suspend] ml730 SUSPEND #%u tid=%04x by=%04x count %d->%d held=%d\n",
+                     n_susp, thread->id, current ? current->id : 0, old_count, thread->suspend,
+                     thread->ios_mach_suspended );
     }
 #endif
     return old_count;
@@ -1028,17 +1060,27 @@ int resume_thread( struct thread *thread )
 {
     int old_count = thread->suspend;
 #ifdef WINE_IOS
-    {   /* ml714: pair with [srv-suspend] so an unmatched suspend is visible */
-        static int n_res;
-        if (n_res++ < 64)
-            fprintf( stderr, "[srv-suspend] ml714 RESUME  tid=%04x by=%04x count %d->%d rev=ml714\n",
-                     thread->id, current ? current->id : 0, old_count,
-                     old_count > 0 ? old_count - 1 : 0 );
+    {   /* ml730: aggregate, same reasoning as the suspend side */
+        static unsigned int n_res;
+        n_res++;
+        if (n_res <= 8 || n_res % 256 == 0)
+            fprintf( stderr, "[srv-suspend] ml730 RESUME  #%u tid=%04x by=%04x count %d->%d held=%d\n",
+                     n_res, thread->id, current ? current->id : 0, old_count,
+                     old_count > 0 ? old_count - 1 : 0, thread->ios_mach_suspended );
     }
 #endif
     if (thread->suspend > 0)
     {
-        if (!(--thread->suspend)) resume_delayed_debug_events( thread );
+        if (!(--thread->suspend))
+        {
+            resume_delayed_debug_events( thread );
+#ifdef WINE_IOS
+            {   /* ml730: final logical resume releases exactly one physical hold */
+                extern int ios_thread_mach_release( struct thread * );
+                ios_thread_mach_release( thread );
+            }
+#endif
+        }
         if (!is_thread_suspended( thread )) wake_thread( thread );
     }
     return old_count;
@@ -1688,6 +1730,14 @@ void kill_thread( struct thread *thread, int violent_death )
 #ifdef WINE_IOS
     fprintf( stderr, "[srv-kill] kill_thread tid=%04x pid=%04x violent=%d rev=ml586\n",
              thread->id, thread->process->id, violent_death );
+#endif
+#ifdef WINE_IOS
+    {   /* ml730: never leave a dying thread frozen by one of our persistent Mach
+         * holds -- it would never run its own teardown. Releasing is safe even if
+         * the thread is already gone; the port lookup simply fails. */
+        extern int ios_thread_mach_release( struct thread * );
+        ios_thread_mach_release( thread );
+    }
 #endif
     thread->state = TERMINATED;
     thread->exit_time = current_time;
