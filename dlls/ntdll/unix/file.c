@@ -4636,6 +4636,48 @@ static int ios_file_fail_logged;
 static int ios_file_wfail_logged;   /* ml669: separate budget for write/create opens */
 #endif
 
+#ifdef WINE_IOS
+/* ml733: video-stream read tracking. See the call site in NtCreateFile. */
+static HANDLE ios_video_handles[4];
+static unsigned int ios_video_reads[4], ios_video_bytes[4];
+
+static void ios_video_track_open( HANDLE h, const WCHAR *name, int len )
+{
+    int i;
+    char nm[160];
+    for (i = 0; i < 4; i++) if (!ios_video_handles[i]) break;
+    if (i == 4) return;                       /* only ever a few streams */
+    ios_video_handles[i] = h;
+    ios_video_reads[i] = ios_video_bytes[i] = 0;
+    {
+        int k, o = 0;
+        for (k = (len > 60 ? len - 60 : 0); k < len && o < (int)sizeof(nm) - 1; k++)
+            nm[o++] = (name[k] >= 0x20 && name[k] < 0x7f) ? (char)name[k] : '?';
+        nm[o] = 0;
+    }
+    ERR( "[video-io] ml733 OPEN slot=%d handle=%p ...%s\n", i, h, nm );
+}
+
+/* Called from the single read choke point for EVERY status, because end of
+ * stream and a stalled decoder are exactly the cases we need to tell apart. */
+static void ios_video_read_note( HANDLE h, unsigned int status, UINT got, LARGE_INTEGER *offset )
+{
+    int i;
+    for (i = 0; i < 4; i++) if (ios_video_handles[i] == h) break;
+    if (i == 4) return;
+    ios_video_reads[i]++;
+    ios_video_bytes[i] += got;
+    /* Log the first few, then only every 512th, but ALWAYS log a short read,
+     * a zero-byte read or a non-success status -- those are the end-of-stream
+     * signals, and sampling them away would defeat the whole probe. */
+    if (ios_video_reads[i] <= 8 || !(ios_video_reads[i] % 512) || !got || status)
+        ERR( "[video-io] ml733 slot=%d read#%u got=%u total=%uKB off=%lld status=%08x%s\n",
+             i, ios_video_reads[i], got, ios_video_bytes[i] / 1024,
+             offset ? (long long)offset->QuadPart : -1LL, status,
+             (!got || status) ? "  <-- END/ERROR" : "" );
+}
+#endif
+
 NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
                               IO_STATUS_BLOCK *io, LARGE_INTEGER *alloc_size,
                               ULONG attributes, ULONG sharing, ULONG disposition,
@@ -4738,6 +4780,31 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
  done:
 #ifdef WINE_IOS
+    /* ml733: track the video stream the cutscene decoder reads.
+     *
+     * The game plays its intro and then sits on a black screen at 60 FPS
+     * without ever loading the next context. The decoder is a native x86-64
+     * library reached by P/Invoke, so we cannot see its return values without
+     * building call-level tracing -- but every byte it consumes comes through
+     * this file layer, which we already own. Whether reads continue forever,
+     * stop at end of stream, or stop early separates "the decoder never
+     * finishes" from "it finished and the transition never ran", and that is
+     * the split worth one run.
+     *
+     * Name match only, so nothing else pays for it. */
+    if (!status && handle && *handle && attr && attr->ObjectName && attr->ObjectName->Buffer)
+    {
+        const WCHAR *b = attr->ObjectName->Buffer;
+        int n = attr->ObjectName->Length / (int)sizeof(WCHAR);
+        if (n >= 4)
+        {
+            WCHAR e3 = b[n-3] | 0x20, e2 = b[n-2] | 0x20, e1 = b[n-1] | 0x20;
+            if (b[n-4] == '.' && e3 == 'o' && e2 == 'g' && (e1 == 'v' || e1 == 'g'))
+            {
+                ios_video_track_open( *handle, b, n );
+            }
+        }
+    }
     /* iOS-Mythic ml665: [file-fail] — we have NEVER logged a failing guest file
      * open, and that blind spot cost several runs on Book of the Dead.
      *
@@ -6438,6 +6505,7 @@ done:
     /* ml487 (#78): single choke point — every read path above reaches here. */
     if (status == STATUS_SUCCESS && total)
         ios_js_read_note( handle, unix_handle, buffer, length, total, offset );
+    ios_video_read_note( handle, status, total, offset );
 #endif
     send_completion = cvalue != 0;
 

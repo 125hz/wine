@@ -2419,6 +2419,97 @@ NTSTATUS WINAPI LdrUnlockLoaderLock( ULONG flags, ULONG_PTR magic )
 /******************************************************************
  *		LdrGetProcedureAddress  (NTDLL.@)
  */
+#ifdef __arm64ec__
+/* ml734: Theorafile call tracer.
+ *
+ * The intro decodes and plays, the stream reaches a clean end of file after
+ * 37,530 reads and the decoder stops reading -- yet the game never leaves
+ * VideoContext. File EOF is not decoder EOS, so the open question is whether
+ * tf_eos() is called at all, and what it returns. A call counter cannot answer
+ * that: "called 900 times" fits both "returns false forever" and "returns true
+ * and the managed side ignores it". Only the return value separates them, so
+ * the wrappers in tftrace-x64.dll call through and capture RAX.
+ *
+ * Interception happens here rather than by rewriting libtheorafile's export
+ * address table, because an EAT entry is a UINT32 RVA resolved as base+rva and
+ * therefore cannot address a wrapper that lives in another module below it.
+ * Here the substitution is an absolute pointer with no such constraint, needs
+ * no hand-built stubs, and no raw executable allocation that FEX never
+ * registered.
+ *
+ * Opt-in. With MYTHIC_TF_TRACE unset this file behaves exactly as before. */
+static const char * const tft_names[5] =
+    { "tf_fopen", "tf_readvideo", "tf_readaudio", "tf_eos", "tf_close" };
+static const char * const tft_wrap_names[5] =
+    { "tft_tf_fopen", "tft_tf_readvideo", "tft_tf_readaudio", "tft_tf_eos", "tft_tf_close" };
+
+static HMODULE tft_target;             /* libtheorafile.dll base, 0 until seen */
+static void  **tft_real_slots;         /* tracer's tft_real[] */
+static void   *tft_wrappers[5];
+static int     tft_ready, tft_beaconed[5];
+
+static int tft_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MYTHIC_TF_TRACE" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length && buf[0] == '1');
+    }
+    return on;
+}
+
+/* Called once libtheorafile has finished loading -- never from inside
+ * LdrGetProcedureAddress, so the loader is not re-entered while resolving. */
+static void tft_attach( HMODULE tf_base )
+{
+    UNICODE_STRING dll;
+    HMODULE tracer = NULL;
+    unsigned int st;
+    int i;
+
+    if (!tft_enabled() || tft_ready) return;
+    tft_target = tf_base;
+
+    RtlInitUnicodeString( &dll, L"tftrace-x64.dll" );
+    if ((st = LdrLoadDll( NULL, 0, &dll, &tracer )) || !tracer)
+    {
+        ERR( "[tf-trace] ml734 tracer FAILED to load: %08x -- tracing OFF\n", st );
+        return;
+    }
+    /* Pinned for the life of the process: the wrappers hold pointers into it. */
+    LdrAddRefDll( LDR_ADDREF_DLL_PIN, tracer );
+
+    for (i = 0; i < 5; i++)
+    {
+        ANSI_STRING an;
+        RtlInitAnsiString( &an, tft_wrap_names[i] );
+        if (LdrGetProcedureAddress( tracer, &an, 0, &tft_wrappers[i] ))
+        {
+            ERR( "[tf-trace] ml734 missing wrapper %s -- tracing OFF\n", tft_wrap_names[i] );
+            return;
+        }
+    }
+    {
+        ANSI_STRING an;
+        void *p = NULL;
+        RtlInitAnsiString( &an, "tft_real" );
+        if (LdrGetProcedureAddress( tracer, &an, 0, &p ) || !p)
+        {
+            ERR( "[tf-trace] ml734 missing tft_real -- tracing OFF\n" );
+            return;
+        }
+        tft_real_slots = p;
+    }
+    tft_ready = 1;
+    ERR( "[tf-trace] ml734 ARMED target=%p tracer=%p tft_real=%p\n",
+         tf_base, tracer, tft_real_slots );
+}
+#endif  /* __arm64ec__ */
+
 NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
                                        ULONG ord, PVOID *address)
 {
@@ -2440,6 +2531,26 @@ NTSTATUS WINAPI LdrGetProcedureAddress(HMODULE module, const ANSI_STRING *name,
         {
             *address = proc;
             ret = STATUS_SUCCESS;
+#ifdef __arm64ec__
+            /* Substitute only for the exact module and exact export name;
+             * ordinal lookups and every other module are untouched. The real
+             * pointer is captured first, so a failed resolve can never leave a
+             * wrapper pointing at nothing. */
+            if (tft_ready && name && name->Buffer && module == tft_target)
+            {
+                int i;
+                for (i = 0; i < 5; i++)
+                {
+                    if (strcmp( name->Buffer, tft_names[i] )) continue;
+                    tft_real_slots[i] = proc;
+                    *address = tft_wrappers[i];
+                    if (!tft_beaconed[i]++)
+                        ERR( "[tf-trace] ml734 REDIRECT %s real=%p -> wrapper=%p\n",
+                             tft_names[i], proc, tft_wrappers[i] );
+                    break;
+                }
+            }
+#endif
         }
         else
         {
@@ -3189,6 +3300,12 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
      * point where mapping, relocation and imports have all succeeded and no DllMain has
      * run yet. See arm64ec_notify_image_map(). */
     if (NT_SUCCESS(status) && *pwm) arm64ec_notify_image_map( (*pwm)->ldr.DllBase );
+    /* ml734: arm the Theorafile tracer once its target has finished loading.
+     * Done here, not inside LdrGetProcedureAddress, so loading the tracer never
+     * re-enters the resolver. */
+    if (NT_SUCCESS(status) && *pwm && (*pwm)->ldr.BaseDllName.Buffer &&
+        !wcsnicmp( (*pwm)->ldr.BaseDllName.Buffer, L"libtheorafile", 13 ))
+        tft_attach( (*pwm)->ldr.DllBase );
 #endif
     if (status && module) NtUnmapViewOfSection( NtCurrentProcess(), module );
     return status;
