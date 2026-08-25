@@ -26,7 +26,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d9);
 
-/* iOS-Mythic (rev ml700): several titles hard-import d3d9.dll purely to satisfy
+/* iOS-Madeira (rev ml700): several titles hard-import d3d9.dll purely to satisfy
  * their import table and then render through D3D11.  Report once per entry point
  * whether a guest actually creates a d3d9 object, and whether wined3d can come up
  * at all on a host with no GL/Vulkan driver, so one device log answers both.

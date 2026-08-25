@@ -751,7 +751,7 @@ static NTSTATUS unix_getaddrinfo( void *args )
     }
 
 #ifdef WINE_IOS
-    /* iOS-Mythic (Steam S0): getaddrinfo() goes through libsystem_info /
+    /* iOS-Madeira (Steam S0): getaddrinfo() goes through libsystem_info /
      * mDNSResponder, which autoreleases internal Objective-C objects. On
      * a Wine worker thread (no autorelease pool in place) those land in
      * the implicit top-level pool that Apple's pthread_exit TSD cleanup

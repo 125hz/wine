@@ -281,7 +281,7 @@ static void set_socket_blocking(netconn_t *conn, BOOL is_blocking)
 {
     if(conn->is_blocking != is_blocking) {
         ULONG arg = !is_blocking;
-        /* iOS-Mythic ml592: the ioctlsocket() result used to be DISCARDED while
+        /* iOS-Madeira ml592: the ioctlsocket() result used to be DISCARDED while
          * conn->is_blocking was updated unconditionally, so a failed FIONBIO left
          * wininet believing a socket was blocking when the kernel still had it
          * non-blocking. Every later recv then returns WSAEWOULDBLOCK, wininet

@@ -730,7 +730,7 @@ DECL_HANDLER(create_desktop)
     {
         if ((desktop = create_desktop( &name, req->attributes, req->flags, winstation )))
         {
-            /* iOS-Mythic (S2): a virtual desktop created by explorer must
+            /* iOS-Madeira (S2): a virtual desktop created by explorer must
              * receive hardware input. Wine only marks WinSta0 WSF_VISIBLE,
              * but is_service_process()=TRUE on iOS routes every process into
              * a non-WinSta0 winstation — set_input_desktop then fails and
@@ -741,7 +741,7 @@ DECL_HANDLER(create_desktop)
              * which only covers the games path. */
             if (req->flags & DF_WINE_VIRTUAL_DESKTOP)
             {
-                const char *w_env = getenv( "MYTHIC_SCREEN_W" ), *h_env = getenv( "MYTHIC_SCREEN_H" );
+                const char *w_env = getenv( "MADEIRA_SCREEN_W" ), *h_env = getenv( "MADEIRA_SCREEN_H" );
                 int scr_w = (w_env && atoi( w_env ) > 0) ? atoi( w_env ) : 1024;
                 int scr_h = (h_env && atoi( h_env ) > 0) ? atoi( h_env ) : 768;
                 desktop_shm_t *desktop_shm = desktop->shared;

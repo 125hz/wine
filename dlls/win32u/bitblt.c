@@ -22,7 +22,7 @@
 #pragma makedep unix
 #endif
 
-#include <unistd.h>   /* iOS-Mythic ml506: dprintf for the blit census */
+#include <unistd.h>   /* iOS-Madeira ml506: dprintf for the blit census */
 #include <stdarg.h>
 #include <limits.h>
 #include <math.h>
@@ -621,7 +621,7 @@ BOOL WINAPI NtGdiStretchBlt( HDC hdcDst, INT xDst, INT yDst, INT widthDst, INT h
         }
         ret = !get_vis_rectangles( dcDst, &dst, dcSrc, &src );
 
-        /* iOS-Mythic ml506: blit census.
+        /* iOS-Madeira ml506: blit census.
          *
          * The Steam login surface contains DUPLICATED 256x256 tiles — the
          * same tile content composited into two different slots, with other

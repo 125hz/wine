@@ -3261,7 +3261,7 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
 
     TRACE( "(0x%08x,%p,0x%08x,%p)\n", class, info, size, ret_size );
 
-    /* iOS-Mythic ml441 (#74): private class — hands every PE ntdll copy the
+    /* iOS-Madeira ml441 (#74): private class — hands every PE ntdll copy the
      * address of the ONE process-wide futex queue table (unix sync.c), fixing
      * the per-copy futex_queues split that lost RtlWakeAddress* wakes. */
     if ((unsigned int)class == 0xf00d && size == sizeof(void *))

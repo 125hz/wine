@@ -304,7 +304,7 @@ void free_async_queue( struct async_queue *queue )
 
     LIST_FOR_EACH_ENTRY_SAFE( async, next, &queue->queue, struct async, queue_entry )
     {
-        /* iOS-Mythic ml575: USE-AFTER-FREE FIX (upstream Wine bug).
+        /* iOS-Madeira ml575: USE-AFTER-FREE FIX (upstream Wine bug).
          *
          * async_terminate() can free this async before it returns. It documents
          * the hazard itself — it grabs a temporary reference because

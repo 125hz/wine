@@ -1032,7 +1032,7 @@ BOOL WINAPI MiniDumpWriteDump(HANDLE hProcess, DWORD pid, HANDLE hFile,
     TRACE("(%p, %lu, %p, %u, %p, %p, %p)\n",
           hProcess, pid, hFile, DumpType, ExceptionParam, UserStreamParam, CallbackParam);
 
-    /* iOS-Mythic ml467 (wall #79, run ml466): Steam's crashhandler64 writes a
+    /* iOS-Madeira ml467 (wall #79, run ml466): Steam's crashhandler64 writes a
      * minidump whenever its watchdog sees steamwebhelper "not responding".
      * Under FEX the dump takes minutes — it walks the whole single-process
      * address space and suspends every thread of the target pseudo-process on

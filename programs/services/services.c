@@ -426,7 +426,7 @@ static void scmdatabase_autostart_services(struct scmdatabase *db)
 
     LIST_FOR_EACH_ENTRY(service, &db->services, struct service_entry, entry)
     {
-        /* iOS-Mythic (task #19): respect SERVICE_DISABLED even for
+        /* iOS-Madeira (task #19): respect SERVICE_DISABLED even for
          * root-PnP services — upstream's pnp branch overrode Start=4 and
          * kept autostarting winebus (whose winedevice host wedges on iOS
          * and starves every demand-start behind the startup lock). On
@@ -437,7 +437,7 @@ static void scmdatabase_autostart_services(struct scmdatabase *db)
             service->config.dwStartType == SERVICE_AUTO_START ||
             (set != INVALID_HANDLE_VALUE && is_root_pnp_service(set, service))))
         {
-            /* iOS-Mythic diagnostic (task #19): name every autostart
+            /* iOS-Madeira diagnostic (task #19): name every autostart
              * candidate — a phantom kept spawning winedevice with all
              * registry Start values at 4. */
             WINE_ERR("autostart candidate %s (type %#lx start %lu pnp %d)\n",

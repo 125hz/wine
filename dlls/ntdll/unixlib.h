@@ -79,7 +79,7 @@ struct ios_push_jit_aliases_params
                      unsigned long long size);
 };
 
-/* iOS-Mythic ml618: register the per-pseudo-process leaked-hold release callback.
+/* iOS-Madeira ml618: register the per-pseudo-process leaked-hold release callback.
  *
  * A NEW ordinal with its own size/version, deliberately NOT an extension of
  * ios_push_jit_aliases_params: an old one-field caller gives the callee no way
@@ -96,7 +96,7 @@ struct ios_register_hold_release_params
     void *callback;         /* uint32_t (*)(void *teb, uint64_t*, uint32_t*, uint32_t*) */
 };
 
-/* iOS-Mythic ml631: read-only probe of the anon-JIT alias table.
+/* iOS-Madeira ml631: read-only probe of the anon-JIT alias table.
  *
  * Given a guest address inside a Mono JIT buffer, hand back the RW alias so the
  * PE side can read the SAME bytes through both views and compare them. That

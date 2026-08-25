@@ -69,7 +69,7 @@ static inline struct debug_info *get_info(void)
 {
     if (!init_done) return &initial_info;
 #ifdef WINE_IOS
-    /* iOS-Mythic ml379: a thread with NO TEB must not crash the logger.
+    /* iOS-Madeira ml379: a thread with NO TEB must not crash the logger.
      *
      * NtCurrentTeb() resolves through a pthread key on this port, and threads
      * created outside wine (CEF/FEX worker threads, and any thread faulting

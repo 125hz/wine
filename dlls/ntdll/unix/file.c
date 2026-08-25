@@ -4805,7 +4805,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
             }
         }
     }
-    /* iOS-Mythic ml665: [file-fail] — we have NEVER logged a failing guest file
+    /* iOS-Madeira ml665: [file-fail] — we have NEVER logged a failing guest file
      * open, and that blind spot cost several runs on Book of the Dead.
      *
      * Book of the Dead's stdout stream is left at _flags=0,_file=-1 -- the exact
@@ -6159,7 +6159,7 @@ static unsigned int set_pending_write( HANDLE device )
  *              NtReadFile   (NTDLL.@)
  */
 #ifdef WINE_IOS
-/* iOS-Mythic ml487 (#78): the steamloopback JS-boot lottery. Roughly half of all
+/* iOS-Madeira ml487 (#78): the steamloopback JS-boot lottery. Roughly half of all
  * runs die because Steam's UI JavaScript arrives corrupt — `SyntaxError:
  * Invalid or unexpected token` in library.js (whole run lost, no dial, no retry
  * path), or a partial hit where a lazily-loaded chunk fails (`ChunkLoadError:

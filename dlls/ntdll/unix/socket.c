@@ -785,7 +785,7 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
 }
 
 #ifdef __APPLE__
-/* iOS-Mythic ml464 [sock-big] (#78): steamui's login boot died on
+/* iOS-Madeira ml464 [sock-big] (#78): steamui's login boot died on
  * "ChunkLoadError: missing steamloopback.host/libraries/libraries~....js" —
  * a 1.99MB file that EXISTS on disk, served by steam.exe's loopback HTTP
  * server, while a 678KB file served fine seconds earlier. Prime suspect is a
@@ -795,7 +795,7 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
  * A transfer that STOPS at a byte count without an error implicates the
  * file-read side of TransmitFile instead; an errno names the socket layer.
  * Racy counters are acceptable — fixed array, no pointers, probe-only. */
-/* iOS-Mythic ml578: TRACE THE FIRST BYTES ON EXTERNAL TCP SOCKETS.
+/* iOS-Madeira ml578: TRACE THE FIRST BYTES ON EXTERNAL TCP SOCKETS.
  *
  * State of the hunt: the Shenzhen network is EXONERATED — from the same phone,
  * Safari got 91 CM endpoints from the directory API, loaded /cmping/ on 443, and
@@ -819,7 +819,7 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
  * able to starve the CM sockets, which is the trap that has invalidated three
  * probes in this investigation already. Loopback is skipped so the steamloopback
  * traffic cannot drown the census. */
-/* iOS-Mythic ml591: PER-SOCKET TLS TIMELINE — the timing half of the CM hunt.
+/* iOS-Madeira ml591: PER-SOCKET TLS TIMELINE — the timing half of the CM hunt.
  *
  * ml590 settled the PHASE question: on every CM socket we caught, the handshake ran
  * to completion (ClientHello -> server flight -> CCS+Finished -> encrypted
@@ -1016,7 +1016,7 @@ static void ios_sock_wire( int fd, int is_send, const void *buf, long ret_bytes,
      * Steam never sent its request at all. A useful version must track handshake
      * state, not record type. (Caught by Sol.) */
     { static int off = -1;
-      if (off < 0) { const char *e = getenv( "MYTHIC_SOCK_WIRE" ); off = !(e && *e && *e != '0'); }
+      if (off < 0) { const char *e = getenv( "MADEIRA_SOCK_WIRE" ); off = !(e && *e && *e != '0'); }
       if (off) return; }
     if (getpeername( fd, (struct sockaddr *)&pa, &pl ) != 0) return;   /* not connected */
     if (pa.ss_family == AF_INET)
@@ -1106,7 +1106,7 @@ static void ios_sock_big_note( int fd, int is_send, long ret_bytes, int err )
         tab[slot].next[is_send] = tab[slot].tot[is_send] + 0x80000;
     }
 }
-/* iOS-Mythic ml469 (wall #79 transport): the ml468 run showed steamwebhelper
+/* iOS-Madeira ml469 (wall #79 transport): the ml468 run showed steamwebhelper
  * re-dialing ws://localhost:6252x/transportsocket/ every ~5s forever, with the
  * only connect evidence being IPv6 EHOSTUNREACH + IPv4 EINPROGRESS and no
  * completion, while steam.exe's own connectivity test reported NoLAN.  Nothing

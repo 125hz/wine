@@ -1087,7 +1087,7 @@ int resume_thread( struct thread *thread )
 }
 
 /* add a thread to an object wait queue; return 1 if OK, 0 on error */
-/* iOS-Mythic ml687: does this thread's active wait actually reference `obj`?
+/* iOS-Madeira ml687: does this thread's active wait actually reference `obj`?
  * struct thread_wait is private to this file, so [srv-stuck] in queue_ios.c
  * cannot walk it directly. entry->obj holds the WRAPPER (set at line ~1162 via
  * grab_object(obj)); object_sync_add_queue resolves the sync internally, so the

@@ -443,7 +443,7 @@ static inline BOOL is_inside_syscall( ULONG_PTR sp )
 static inline BOOL is_ec_code( ULONG_PTR ptr )
 {
 #ifdef WINE_IOS
-    /* iOS-Mythic: co-resident pseudo-processes share one address space and the
+    /* iOS-Madeira: co-resident pseudo-processes share one address space and the
      * global `peb` drifts to whichever process last ran, so a WORKER thread of
      * one process (e.g. a cube-x64 / Steam render thread) can read a SIBLING
      * process's peb whose EcCodeBitMap is null -> is_ec_code faults on a null

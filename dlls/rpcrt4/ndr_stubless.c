@@ -483,7 +483,7 @@ void client_do_args( PMIDL_STUB_MESSAGE pStubMsg, PFORMAT_STRING pFormat, enum s
     const NDR_PARAM_OIF *params = (const NDR_PARAM_OIF *)pFormat;
     unsigned int i;
 
-    /* iOS-Mythic ml175 PROBE: Steam dies at ndr_marshall.c:7024 `*ccontext = NULL` with
+    /* iOS-Madeira ml175 PROBE: Steam dies at ndr_marshall.c:7024 `*ccontext = NULL` with
      * ccontext == 0x10, and pArg is computed below as StackTop + stack_offset — so a
      * StackTop of 0 or 0x10 explains the value exactly.
      *
@@ -509,7 +509,7 @@ void client_do_args( PMIDL_STUB_MESSAGE pStubMsg, PFORMAT_STRING pFormat, enum s
         }
     }
 
-    /* iOS-Mythic ml216 PROBE: is the argument window shifted by exactly one 8-byte slot?
+    /* iOS-Madeira ml216 PROBE: is the argument window shifted by exactly one 8-byte slot?
      *
      * Steam faults in #NdrContextHandleUnmarshall+0xcc (ndr_marshall.c:7024) with
      * ccontext == 0x10. The [ec-stacktop] probe above tested "StackTop is tiny" and

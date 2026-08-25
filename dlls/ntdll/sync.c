@@ -521,7 +521,7 @@ NTSTATUS WINAPI RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
         RtlWakeAddressSingle( lock );
         ret = STATUS_SUCCESS;
     }
-    /* iOS-Mythic ml671: [cs-raise] — Book of the Dead dies on an UNHANDLED
+    /* iOS-Madeira ml671: [cs-raise] — Book of the Dead dies on an UNHANDLED
      * c0000008 with flags=1 (EXCEPTION_NONCONTINUABLE). That flag is the
      * discriminator: RtlRaiseStatus sets it, KiRaiseUserExceptionDispatcher
      * does not -- which is why the ml669 [bad-close] probe on the NtClose path
@@ -728,7 +728,7 @@ void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
  *  nested calls from the same thread. "Upgrading" a shared access lock
  *  to an exclusive access lock also doesn't seem to be supported.
  */
-/* iOS-Mythic ml410 (#66→#60): SRWLOCKs are anonymous — when the chrome_ipc
+/* iOS-Madeira ml410 (#66→#60): SRWLOCKs are anonymous — when the chrome_ipc
  * pump parks forever on a lock's `owners` field there is no owner to read.
  * Keep a ring of the last 512 acquire/release events {lock, tid, mode} so the
  * parked waiter can name the holder: the newest unmatched acquire for that
@@ -1110,7 +1110,7 @@ struct futex_queue
 
 static struct futex_queue futex_queues[256];
 
-/* iOS-Mythic ml441 (#74): futex_queues is per-ntdll-COPY .data, and our
+/* iOS-Madeira ml441 (#74): futex_queues is per-ntdll-COPY .data, and our
  * pseudo-processes carry multiple ntdll copies (native + EC), so a waker
  * walking this copy's array never finds a waiter registered through another
  * copy — the wake dies here and the waiter parks forever (the post-
@@ -1135,7 +1135,7 @@ static struct futex_queue *ios_get_futex_table(void)
     return ios_shared_queues;
 }
 
-/* iOS-Mythic ml407 (task #60): the chrome_ipc pump parks in RtlWaitOnAddress
+/* iOS-Madeira ml407 (task #60): the chrome_ipc pump parks in RtlWaitOnAddress
  * immediately after its master-event wake and is never alerted ([alert-unix]:
  * one WAIT, no ALERTED, while its sibling server thread cycles normally).
  * futex_queues is a PER-NTDLL-COPY global and our pseudo-processes each carry

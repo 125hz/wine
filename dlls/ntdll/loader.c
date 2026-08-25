@@ -78,7 +78,7 @@ SYSTEM_DLL_INIT_BLOCK LdrSystemDllInitBlock = { 0xf0 };
 
 void *__wine_syscall_dispatcher = NULL;
 
-/* iOS-Mythic: byte offset from (TPIDRRO_EL0 & ~7) to the raw Apple TSD slot
+/* iOS-Madeira: byte offset from (TPIDRRO_EL0 & ~7) to the raw Apple TSD slot
  * backing ios_teb_tls_key, discovered at process init by the unix loader and
  * published here so ARM64EC modules (FEX) can import one authoritative value
  * instead of hardcoding a slot they do not own. Zero means "not yet
@@ -521,7 +521,7 @@ static inline ULONG_PTR allocate_stub( const char *dll, const char *name ) { ret
 #endif  /* __i386__ */
 
 /*************************************************************************
- *  iOS-Mythic ml701 [iat-life] — stage 1 of the IAT slot-lifecycle probe.
+ *  iOS-Madeira ml701 [iat-life] — stage 1 of the IAT slot-lifecycle probe.
  *
  * An IAT slot must NEVER end up NULL.  An unresolved import becomes
  * allocate_stub()'s 0xdeadbeef, and every arm64ec_redirect_ptr path is
@@ -1212,7 +1212,7 @@ void * WINAPI RtlFindExportedRoutineByName( HMODULE module, const char *name )
  * is no longer mapped.
  */
 
-/* iOS-Mythic ml318: EAGER delay-import resolution for ARM64EC modules.
+/* iOS-Madeira ml318: EAGER delay-import resolution for ARM64EC modules.
  *
  * ml318 proved the lazy path is unfixable for the FIRST call: the pool-side aux
  * slot is now dual-written on resolution (POOL-SYNCED, 6/6), but resolution runs
@@ -1469,7 +1469,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
                 thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
                                                                            (void *)thunk_list->u1.Function,
                                                                            imp_metadata );
-                /* iOS-Mythic ml230: does the EC->EC import bind actually land on native
+                /* iOS-Madeira ml230: does the EC->EC import bind actually land on native
                  * code, and is that code MARKED EC?
                  *
                  * sechost calls rpcrt4's NdrClientCall2 through $iexit_thunk$cdecl$i8$varargs
@@ -1485,7 +1485,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
                     !strcmp( (const char *)pe_name->Name, "NdrClientCall3" ) ||
                     !strcmp( (const char *)pe_name->Name, "NdrAsyncClientCall" ))
                 {
-                    /* iOS-Mythic ml231: the bind is CORRECT (redirected=1, IsEcCode=1,
+                    /* iOS-Madeira ml231: the bind is CORRECT (redirected=1, IsEcCode=1,
                      * native pool address) yet sechost still reached NdrClientCall2 via
                      * $iexit_thunk$cdecl$i8$varargs -- the EC->x64 path. Both can only be
                      * true if the EXECUTING copy reads a different IAT than the loader
@@ -1707,7 +1707,7 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
     *(DWORD *)dir->AddressOfIndex = i;
     tls_dirs[i] = *dir;
     {
-        /* iOS-Mythic ml704 [tls-life]: which TLS slot each module actually got.
+        /* iOS-Madeira ml704 [tls-life]: which TLS slot each module actually got.
          *
          * Compiler-emitted magic statics in main EXEs commonly hardcode TLS[0]
          * on the Windows convention that the EXE owns slot 0.  If xtajit64 (or
@@ -1808,7 +1808,7 @@ static NTSTATUS fixup_imports( WINE_MODREF *wm, LPCWSTR load_path )
     if (!(wm->ldr.Flags & LDR_DONT_RESOLVE_REFS)) return STATUS_SUCCESS;  /* already done */
     wm->ldr.Flags &= ~LDR_DONT_RESOLVE_REFS;
 
-    /* iOS-Mythic: TlsIndex == -1 marks "alloc_tls_slot already done for this
+    /* iOS-Madeira: TlsIndex == -1 marks "alloc_tls_slot already done for this
      * module" (set below). loader_init pre-allocates the main EXE's slot
      * before load_arm64ec_module() so the EXE claims slot 0 instead of
      * xtajit64.dll — Thumper-style games have compiler-generated magic-static
@@ -1971,7 +1971,7 @@ static NTSTATUS alloc_thread_tls(void)
         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
     }
     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
-    ERR( "iOS-Mythic alloc_thread_tls: TEB=%p TEB->TLS=%p TLS[0]=%p TLS[1]=%p TLS[2]=%p TLS[3]=%p (count=%u)\n",
+    ERR( "iOS-Madeira alloc_thread_tls: TEB=%p TEB->TLS=%p TLS[0]=%p TLS[1]=%p TLS[2]=%p TLS[3]=%p (count=%u)\n",
          NtCurrentTeb(), pointers,
          tls_module_count > 0 ? pointers[0] : NULL,
          tls_module_count > 1 ? pointers[1] : NULL,
@@ -2437,7 +2437,7 @@ NTSTATUS WINAPI LdrUnlockLoaderLock( ULONG flags, ULONG_PTR magic )
  * no hand-built stubs, and no raw executable allocation that FEX never
  * registered.
  *
- * Opt-in. With MYTHIC_TF_TRACE unset this file behaves exactly as before. */
+ * Opt-in. With MADEIRA_TF_TRACE unset this file behaves exactly as before. */
 static const char * const tft_names[5] =
     { "tf_fopen", "tf_readvideo", "tf_readaudio", "tf_eos", "tf_close" };
 static const char * const tft_wrap_names[5] =
@@ -2471,7 +2471,7 @@ static int tft_enabled(void)
     {
         UNICODE_STRING nm, val;
         WCHAR buf[8];
-        RtlInitUnicodeString( &nm, L"MYTHIC_TF_TRACE" );
+        RtlInitUnicodeString( &nm, L"MADEIRA_TF_TRACE" );
         val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
         on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length && buf[0] == '1');
     }
@@ -3373,7 +3373,7 @@ static NTSTATUS load_native_dll( LPCWSTR load_path, const UNICODE_STRING *nt_nam
     if (NT_SUCCESS(status)) status = build_module( load_path, nt_name, &module, image_info, id,
                                                    flags, system, redirected, pwm );
 #ifdef __arm64ec__
-    /* iOS-Mythic ml709: tell the emulator this image's code is executable, here rather
+    /* iOS-Madeira ml709: tell the emulator this image's code is executable, here rather
      * than relying on NtMapViewOfSection's notification -- that one never fires in a
      * child pseudo-process, leaving every native x64 dependency unregistered until the
      * first one FEX is asked to execute dies on a synthetic NOEXEC SIGSEGV. This is the
@@ -3886,7 +3886,7 @@ static NTSTATUS find_dll_file( const WCHAR *load_path, const WCHAR *libname, UNI
     if (status == STATUS_NOT_SUPPORTED) status = STATUS_INVALID_IMAGE_FORMAT;
 
 #ifdef __arm64ec__
-    /* iOS-Mythic mixed-arch pseudo-processes: in a native-ARM64 session the
+    /* iOS-Madeira mixed-arch pseudo-processes: in a native-ARM64 session the
      * shared system32 farm serves ARM64 binaries for colliding names, which
      * an AMD64 child (running this EC ntdll privately) cannot load. Fall
      * back to C:\windows\sysx64, a farm of the full ARM64EC DLL set —
@@ -3988,7 +3988,7 @@ done:
         TRACE("Loaded module %s at %p\n", debugstr_us(&nt_name), (*pwm)->ldr.DllBase);
     else
     {
-        /* iOS-Mythic ml336: NAME THE DLL THAT ISN'T THERE.
+        /* iOS-Madeira ml336: NAME THE DLL THAT ISN'T THERE.
          *
          * The webhelper dies in Chromium's delay-load FAILURE hook (int3; ud2 next to the
          * "DelayLoad-ModuleName" crash key). ml335 ruled out the export theory: the farm
@@ -4107,7 +4107,7 @@ NTSTATUS CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int access, int
  *		LdrLoadDll (NTDLL.@)
  */
 /*************************************************************************
- *  iOS-Mythic ml701 [iat-life] - stage 2 of the IAT slot-lifecycle probe.
+ *  iOS-Madeira ml701 [iat-life] - stage 2 of the IAT slot-lifecycle probe.
  *
  * Stage 1 reports a slot that was never bound to anything.  This one reports
  * a slot that is NULL *right now*, sweeping every loaded module after each
@@ -4656,7 +4656,7 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
     if (!nts)
     {
 #ifdef __arm64ec__
-        /* iOS-Mythic ml237 ROOT-CAUSE FIX. import_dll redirects EC->EC imports from the
+        /* iOS-Madeira ml237 ROOT-CAUSE FIX. import_dll redirects EC->EC imports from the
          * x64 .hexpthk export thunk to the ARM64-native target; the DELAY-LOAD path never
          * did, so it stored the thunk. Measured: every rpcrt4 delay import resolved to
          * base+0x60800 (NdrClientCall2's FFS thunk) with IsEcCode(fp)=0.
@@ -4682,7 +4682,7 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
 #endif
         pIAT[id].u1.Function = (ULONG_PTR)fp;
 #ifdef __arm64ec__
-        /* iOS-Mythic ml317 -- the ml236 bug, finally closed. The store above lands in the
+        /* iOS-Madeira ml317 -- the ml236 bug, finally closed. The store above lands in the
          * PE image's .data, but the checker stub that consumes this slot executes from the
          * module's JIT-POOL COPY and reads the CLONED .data, which nothing ever updated:
          * delay-load resolution happens lazily at RUNTIME, after every IAT-sync pass has
@@ -4721,7 +4721,7 @@ void* WINAPI LdrResolveDelayLoadedAPI( void* base, const IMAGE_DELAYLOAD_DESCRIP
     }
 
 fail:
-    /* iOS-Mythic ml334: NAME THE FAILING DELAY-LOAD.
+    /* iOS-Madeira ml334: NAME THE FAILING DELAY-LOAD.
      *
      * ml332/ml333's fatal is libcef executing `int3; ud2` -- Chromium's IMMEDIATE_CRASH()
      * -- from a routine that first stores the crash key string "DelayLoad-ModuleName"
@@ -5400,7 +5400,7 @@ static void ios_sectest(void)
     void *base = NULL;
     SIZE_T view_size = 0;
     ULONG_PTR pid = (ULONG_PTR)NtCurrentTeb()->ClientId.UniqueProcess;
-    const WCHAR *path = L"\\Sessions\\1\\BaseNamedObjects\\__mythic_sectest";
+    const WCHAR *path = L"\\Sessions\\1\\BaseNamedObjects\\__madeira_sectest";
 
     RtlInitUnicodeString( &us, path );
     InitializeObjectAttributes( &attr, &us, OBJ_CASE_INSENSITIVE | OBJ_OPENIF, 0, NULL );
@@ -5409,7 +5409,7 @@ static void ios_sectest(void)
                               PAGE_READWRITE, SEC_COMMIT, 0 );
     if (status == STATUS_OBJECT_PATH_NOT_FOUND)
     {
-        path = L"\\BaseNamedObjects\\__mythic_sectest";
+        path = L"\\BaseNamedObjects\\__madeira_sectest";
         RtlInitUnicodeString( &us, path );
         status = NtCreateSection( &handle, SECTION_ALL_ACCESS, &attr, &sec_size,
                                   PAGE_READWRITE, SEC_COMMIT, 0 );
@@ -5431,7 +5431,7 @@ static void ios_sectest(void)
     if (status != STATUS_OBJECT_NAME_EXISTS)   /* we created it: write the pattern */
     {
         volatile ULONG64 *p = base;
-        p[0] = 0x4d59544849435345ull;  /* 'MYTHICSE' */
+        p[0] = 0x4d59544849435345ull;  /* 'MADEIRASE' */
         p[1] = pid;
         ERR( "[sec-test] pid=%04Ix CREATED %s base=%p magic written (handle+view leaked on purpose)\n",
              pid, debugstr_w(path), base );
@@ -5511,7 +5511,7 @@ void loader_init( CONTEXT *context, void **entry )
         wm = build_main_module();
         build_ntdll_module();
 #ifdef __arm64ec__
-        /* iOS-Mythic: pre-allocate the main EXE's TLS slot BEFORE
+        /* iOS-Madeira: pre-allocate the main EXE's TLS slot BEFORE
          * load_arm64ec_module() so the main EXE claims slot 0 instead of
          * xtajit64.dll. Compiler-emitted magic-static / __declspec(thread)
          * code in main EXEs frequently hardcodes `TLS[0]`, assuming the
@@ -5523,7 +5523,7 @@ void loader_init( CONTEXT *context, void **entry )
          * via the TlsIndex == -1 marker. */
         if (alloc_tls_slot( &wm->ldr )) wm->ldr.TlsIndex = -1;
         ERR( "loader_init: pre-allocated main EXE TLS slot (TlsIndex=%ld)\n", wm->ldr.TlsIndex );
-        /* iOS-Mythic (FEX-2607 rebase): wire the NLS casemap BEFORE
+        /* iOS-Madeira (FEX-2607 rebase): wire the NLS casemap BEFORE
          * load_arm64ec_module(). The rebased xtajit64 arm64ec_process_init
          * uppercases strings (RtlUpcaseUnicodeStringToCountedOemString ->
          * upcase_unicode_to_utf8), which reads nls_info's upcase table set by

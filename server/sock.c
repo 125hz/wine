@@ -125,7 +125,7 @@
 
 #ifndef HAVE_NETINET_TCP_FSM_H
 #ifdef __APPLE__
-/* iOS-Mythic ml478 (#79 root cause): Darwin's TCP_CONNECTION_INFO reports
+/* iOS-Madeira ml478 (#79 root cause): Darwin's TCP_CONNECTION_INFO reports
  * BSD-numbered FSM states (LISTEN=1, ESTABLISHED=4), but the iOS SDK ships
  * no netinet/tcp_fsm.h, so the Linux-numbered fallback below was used:
  * every listener (1) matched TCPS_ESTABLISHED and every live connection (4)
@@ -157,14 +157,14 @@
 #endif
 #endif
 
-/* iOS-Mythic ml480 (#84): accept-latency instrument. Steam's WebUITransport
+/* iOS-Madeira ml480 (#84): accept-latency instrument. Steam's WebUITransport
  * only drains its listen backlog every 2-3 minutes (11-13 connections logged
  * in one second, then nothing), so CEF's ~12s websocket handshake always times
  * out and the login window never appears. [acc-ready] stamps the moment the
  * SERVER sees a pending connection on a listener; [acc-take] stamps the moment
  * the GUEST actually accepts it. ready-prompt + take-late ⇒ Steam's thread is
  * the laggard (frame stalls); no [acc-ready] at all ⇒ our poll registration is.
- * Wall-clock ms, since mythic-log lines carry no timestamps after boot. */
+ * Wall-clock ms, since madeira-log lines carry no timestamps after boot. */
 static unsigned long long ios_acc_now_ms(void)
 {
     struct timeval tv;
@@ -1410,7 +1410,7 @@ static void sock_dispatch_events( struct sock *sock, enum connection_state prevs
         }
         if (event & (POLLERR | POLLHUP))
             post_socket_event( sock, AFD_POLL_BIT_CONNECT_ERR );
-        /* iOS-Mythic ml493: the OUTCOME half of the [srv-conn] census.
+        /* iOS-Madeira ml493: the OUTCOME half of the [srv-conn] census.
          * ml493's log proved Steam dials the CMs (dport=443/27018, ret=-1
          * EINPROGRESS) yet not one appears ESTABLISHED, so every
          * PingWebSocketCM fails inside a second — but the dial census alone
@@ -1418,7 +1418,7 @@ static void sock_dispatch_events( struct sock *sock, enum connection_state prevs
          * (TLS/WebSocket) rejected it, or the handshake never landed at all.
          * One line per connecting socket's first event decides that. */
         {
-            /* iOS-Mythic ml576: this probe had TWO defects that made ml575's data
+            /* iOS-Madeira ml576: this probe had TWO defects that made ml575's data
              * unusable, both fixed here.
              *
              * (1) ONE shared 96-event cap. Port-80 traffic consumed the entire
@@ -1527,7 +1527,7 @@ static void sock_poll_event( struct fd *fd, int event )
         break;
 
     case SOCK_LISTENING:
-        /* iOS-Mythic ml480 (#84): see accept_socket — stamp when the SERVER
+        /* iOS-Madeira ml480 (#84): see accept_socket — stamp when the SERVER
          * first sees a pending connection, so [acc-take] can be differenced
          * against it. */
         if (event & POLLIN)
@@ -2903,7 +2903,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         sock->addr_len = sockaddr_from_unix( &unix_addr, &sock->addr.addr, sizeof(sock->addr) );
         sock->peer_addr_len = sockaddr_from_unix( &peer_addr, &sock->peer_addr.addr, sizeof(sock->peer_addr));
 
-        /* iOS-Mythic ml474 (#79): connect census. The transport reject loop
+        /* iOS-Madeira ml474 (#79): connect census. The transport reject loop
          * hinges on the connecting socket's row appearing in the AF_INET
          * table SteamUI authenticates from — a dial that lands on the v6
          * family can never appear there. One line per stream connect names
@@ -4422,7 +4422,7 @@ static MIB_TCP_STATE get_tcp_socket_state( int fd )
     if (getsockopt( fd, IPPROTO_TCP, TCP_INFO, &info, &info_len ) == 0)
         return tcp_state_to_mib_state( info.tcpi_state );
 
-    /* iOS-Mythic ml474 (#79): the ESTAB fallback below can lie a listener
+    /* iOS-Madeira ml474 (#79): the ESTAB fallback below can lie a listener
      * into the ESTAB table (observed: port 27060 with no peer at state=5) —
      * record why it fired so honest states can be told from fallbacks. */
     {
@@ -4461,7 +4461,7 @@ static int enum_tcp_connections( struct process *process, struct object *obj, vo
 
     socket_state = get_tcp_socket_state( get_unix_fd(sock->fd) );
 
-    /* iOS-Mythic ml474 (#79): census of every visited socket on the count
+    /* iOS-Madeira ml474 (#79): census of every visited socket on the count
      * pass — the ml473 run's table froze at 3 rows while the webhelper's
      * dialing client socket (and steam's accepted peers) never appeared.
      * This names every socket the walk actually reaches, pre-filter, so

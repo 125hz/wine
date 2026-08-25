@@ -658,7 +658,7 @@ static BOOL CRYPT_DownloadObject(DWORD dwRetrievalFlags, HINTERNET hHttp,
                     {
                         if (GetLastError() == ERROR_IO_PENDING && !context)
                         {
-                            /* iOS-Mythic ml592: see CRYPT_DownloadObject below --
+                            /* iOS-Madeira ml592: see CRYPT_DownloadObject below --
                              * a SYNCHRONOUS session must never report pending. */
                             ERR("read: ERROR_IO_PENDING on a synchronous session (context=NULL)\n");
                             SetLastError(ERROR_TIMEOUT);
@@ -686,7 +686,7 @@ static BOOL CRYPT_DownloadObject(DWORD dwRetrievalFlags, HINTERNET hHttp,
         }
         else if (GetLastError() == ERROR_IO_PENDING && !context)
         {
-            /* iOS-Mythic ml592: THIS LINE CRASHED THE WHOLE APP (ml591, db 7156).
+            /* iOS-Madeira ml592: THIS LINE CRASHED THE WHOLE APP (ml591, db 7156).
              * context is NULL for a synchronous retrieval (dwTimeout == 0), so
              * context->timeout faulted at address 0x8 -- cryptnet+0x137fc,
              * `ldr w1,[x22,#8]` with x22 == NULL -- and since every Windows

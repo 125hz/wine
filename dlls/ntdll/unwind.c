@@ -2045,7 +2045,7 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
     unsigned int i, prolog_offset;
     BOOL mach_frame = FALSE, chained = FALSE;
 
-    /* iOS-Mythic 2026-07-04: [VU2_RATE] — the render worker lives in this
+    /* iOS-Madeira 2026-07-04: [VU2_RATE] — the render worker lives in this
      * function per PROF, yet BOTH exception-path callers (call_seh_handlers,
      * RtlUnwindEx) measured cold. Someone calls the raw unwind API directly
      * and constantly. Log first + every 4096th: rate, unwound pc, and the

@@ -78,7 +78,7 @@ static inline CHPE_V2_CPU_AREA_INFO *get_arm64ec_cpu_area(void)
     return NtCurrentTeb()->ChpeV2CpuAreaInfo;
 }
 
-/* iOS-Mythic ml617: THE GUEST-STACK WINDOW FOR ONE UNWIND.
+/* iOS-Madeira ml617: THE GUEST-STACK WINDOW FOR ONE UNWIND.
  *
  * ml616 fabricated 24,576 unwind frames and then terminated the process with
  * exit code 0xdaa1f848 — which is not a status at all, it is the low half of
@@ -179,7 +179,7 @@ static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
         if (area && frame >= area->EmulatorStackLimit &&
             frame <= area->EmulatorStackBase) return TRUE;
     }
-    /* iOS-Mythic task#34: EC threads here run on THREE stacks — Tib holds
+    /* iOS-Madeira task#34: EC threads here run on THREE stacks — Tib holds
      * the NATIVE pthread stack, the CpuArea holds the emulator stack, and
      * the guest x64 frames live on the GUEST stack that neither range
      * covers (ml65: frame 0x7ecafb0008 vs Tib 0x153c88000-0x153d80000 →
@@ -236,7 +236,7 @@ static const char *ec_stack_window_step( ULONG_PTR frame, ULONG_PTR pc )
         ec_win.last_pc = pc;
         return NULL;
     }
-    /* iOS-Mythic ml627: `<=` WAS A FALSE POSITIVE. `<` IS THE CORRECT TEST.
+    /* iOS-Madeira ml627: `<=` WAS A FALSE POSITIVE. `<` IS THE CORRECT TEST.
      *
      * Unwinding walks UP the stack, so a frame pointer must never move BACKWARDS
      * -- but it may legitimately stay EQUAL across consecutive steps while
@@ -270,7 +270,7 @@ static const char *ec_stack_window_step( ULONG_PTR frame, ULONG_PTR pc )
     return NULL;
 }
 
-/* iOS-Mythic ml382: the CPU area can legitimately be NULL on this port.
+/* iOS-Madeira ml382: the CPU area can legitimately be NULL on this port.
  *
  * get_arm64ec_cpu_area() is NtCurrentTeb()->ChpeV2CpuAreaInfo, and
  * init_thread_stack deliberately does NOT set it for the native-aarch64
@@ -443,7 +443,7 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
         int pos = (min + max) / 2;
         if (map[pos].Source == rva)
         {
-            /* iOS-Mythic 2026-07-10 (Steam S3 run 7): validate the Destination
+            /* iOS-Madeira 2026-07-10 (Steam S3 run 7): validate the Destination
              * RVA before trusting it. A corrupt entry once produced
              * module+0xC483974 (far past SizeOfImage); xlate_ios_jit then
              * matched that VA against ANOTHER process's module mapping and a
@@ -657,7 +657,7 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
     /* No else — on non-iOS hosts pBTCpu64IosAddAliasMapping is naturally NULL,
      * which is silent + correct: the bridge has nothing to do off-iOS. */
 
-    /* iOS-Mythic ml648: HAND FEX THE MONO-BACKPATCHER BRIDGE.
+    /* iOS-Madeira ml648: HAND FEX THE MONO-BACKPATCHER BRIDGE.
      *
      * Two hops, both in safe directions. PE -> unix via WINE_UNIX_CALL gets the
      * shared struct's address; PE -> PE via the arm64ec_redirect_ptr'd export
@@ -679,7 +679,7 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
                  st, bridge ? "set" : "NULL" );
     }
 
-    /* iOS-Mythic ml618: REGISTER THE LEAKED-HOLD RELEASE CALLBACK.
+    /* iOS-Madeira ml618: REGISTER THE LEAKED-HOLD RELEASE CALLBACK.
      *
      * ml611/ml616/ml617 all froze the whole app the same way: a thread dies in
      * abnormal exit still owning one CodeInvalidationMutex reader, a writer
@@ -1684,7 +1684,7 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
     return status;
 }
 
-/* iOS-Mythic ml188: SELF-TARGETING FILTER.
+/* iOS-Madeira ml188: SELF-TARGETING FILTER.
  *
  * A global cap is the wrong design when the event of interest is LATE: the ml187/ml188
  * probes burned their whole budget on early loader traffic (unexec #400 at log line 3048)
@@ -1715,7 +1715,7 @@ static int ios_in_big_image( ULONG_PTR a )
     return 0;
 }
 
-/* iOS-Mythic ml187: unmap ALSO removes executable intervals
+/* iOS-Madeira ml187: unmap ALSO removes executable intervals
  * (InvalidationTracker::InvalidateContainingSection -> XIntervals.Remove), and this port
  * purges stale image mappings (#33). If libcef's view is unmapped and not re-notified, its
  * .text leaves XIntervals and every later decode there is NOEXEC. Log unmaps in the guest
@@ -1736,7 +1736,7 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, 
     SECTION_IMAGE_INFORMATION info;
     NTSTATUS status;
 
-    /* iOS-Mythic ml184 PROBE. FEX only treats a guest range as executable if
+    /* iOS-Madeira ml184 PROBE. FEX only treats a guest range as executable if
      * InvalidationTracker::XIntervals covers it, and that is populated ONLY from
      * HandleImageMap(), which runs off this notification. A skipped notify means every
      * later decode in that image returns NOEXEC -> NoExecOp -> FAULT_SIGSEGV -> the
@@ -1775,7 +1775,7 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, 
     *ret_status = status;
 }
 
-/* iOS-Mythic ml709: WHICH GATE DROPS THE IMAGE NOTIFICATION?
+/* iOS-Madeira ml709: WHICH GATE DROPS THE IMAGE NOTIFICATION?
  *
  * FEX only treats a guest range as executable if InvalidationTracker::XIntervals
  * covers it, and that is populated ONLY from HandleImageMap(), which runs off
@@ -1797,7 +1797,7 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, 
  * Log outside every gate so one run separates them. Zero [map-gate] lines
  * alongside the [jit-pool] image lines means (a) and nothing else. */
 
-/* iOS-Mythic ml709: REGISTER IMAGES AT THE LOADER BOUNDARY, NOT THE SYSCALL BOUNDARY.
+/* iOS-Madeira ml709: REGISTER IMAGES AT THE LOADER BOUNDARY, NOT THE SYSCALL BOUNDARY.
  *
  * FEX only treats a guest range as executable if InvalidationTracker::XIntervals covers
  * it, and that is populated from HandleImageMap(), which until now ran ONLY off
@@ -1926,7 +1926,7 @@ NTSTATUS SYSCALL_API NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID 
     return status;
 }
 
-/* iOS-Mythic ml206: shared guard for ALL THREE NotifyMemoryProtect paths.
+/* iOS-Madeira ml206: shared guard for ALL THREE NotifyMemoryProtect paths.
  *
  * A protect spanning >= 1GB is never a code-permission change; it is an allocator managing
  * a reservation. FEX, however, treats any protect without EXEC as "this range is no longer
@@ -1966,7 +1966,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
                                                       *addr_ptr, *size_ptr, 2, new_prot, 0 );
     else if (pNotifyMemoryProtect)
     {
-        /* iOS-Mythic ml203 ROOT-CAUSE FIX. FEX treats a protect notification without EXEC
+        /* iOS-Madeira ml203 ROOT-CAUSE FIX. FEX treats a protect notification without EXEC
          * as "this range is no longer executable" and REMOVES it from
          * InvalidationTracker::XIntervals (InvalidationTracker.cpp:69-71). A single
          * PartitionAlloc protect over its own 16GB soft pool
@@ -1986,7 +1986,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
             pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, FALSE, 0 );
     }
 
-    /* iOS-Mythic ml186 PROBE. libcef IS registered at map time ([map-notify] addr=...
+    /* iOS-Madeira ml186 PROBE. libcef IS registered at map time ([map-notify] addr=...
      * size=0xD3CA000 pfn=1), so its .text reaches InvalidationTracker::XIntervals — yet
      * the decoder still reports NOEXEC at libcef+0x1900733 / +0x3b508f0. The only thing
      * that REMOVES an XInterval is HandleMemoryProtectionNotification being told a
@@ -2265,7 +2265,7 @@ void WINAPI ProcessPendingCrossProcessEmulatorWork(void)
         case CrossProcessPreVirtualProtect:
         case CrossProcessPostVirtualProtect:
             if (!pNotifyMemoryProtect) break;
-            /* iOS-Mythic ml206: THE path the 16GB wipe actually arrived on. Our
+            /* iOS-Madeira ml206: THE path the 16GB wipe actually arrived on. Our
              * pseudo-processes share one address space, so RtlIsCurrentProcess() is FALSE
              * for a sibling handle and the protect is queued here rather than taking the
              * is_current branch ml203 guarded — which is why that fix logged nothing while
@@ -2430,7 +2430,7 @@ static DWORD __attribute__((naked)) call_seh_handler( EXCEPTION_RECORD *rec, ULO
 
 
 /**********************************************************************
- *           ios_seh_xlate_note   (iOS-Mythic ml603)
+ *           ios_seh_xlate_note   (iOS-Madeira ml603)
  *
  * Report SEH language-handler translation ONCE PER DISTINCT HANDLER.
  *
@@ -2502,7 +2502,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     ULONG_PTR frame;
     DWORD res;
 
-    /* iOS-Mythic ml409 (#66): third bracket point — see [ki-path]. If Rsp is
+    /* iOS-Madeira ml409 (#66): third bracket point — see [ki-path]. If Rsp is
      * already corrupt here but was clean at [veh], the vectored handlers (or
      * the emulator trip that ran them) are the corruptor. AV-only, capped. */
     if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
@@ -2512,14 +2512,14 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
             ERR( "[seh-entry] ctx=%p Rsp=%p Rip=%p\n", orig_context,
                  (void *)(ULONG_PTR)orig_context->Rsp, (void *)(ULONG_PTR)orig_context->Rip );
 
-    /* iOS-Mythic ml633: ESTABLISH THE GUEST-STACK WINDOW IN PHASE ONE TOO.
+    /* iOS-Madeira ml633: ESTABLISH THE GUEST-STACK WINDOW IN PHASE ONE TOO.
      * ec_stack_window_begin() was only called on the phase-two unwind path, yet phase
      * one consults ec_win — so a thread could validate frames against another
      * exception's bounds, or none at all. Re-establish from the ORIGINAL Rsp here. */
     ec_stack_window_begin( (ULONG_PTR)orig_context->Rsp );
     }
 
-    /* iOS-Mythic 2026-07-04: [SEH_RATE] — the render worker burns ~75% of
+    /* iOS-Madeira 2026-07-04: [SEH_RATE] — the render worker burns ~75% of
      * its frame in virtual_unwind/RtlVirtualUnwind2/memset below this
      * function (PROF), yet nothing logs: these are HANDLED exceptions
      * (likely software RaiseException/C++ throws — no Mach fault, TRACE
@@ -2542,7 +2542,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     dispatch.HistoryTable  = &table;
     dispatch.NonVolatileRegisters = nonvol_regs.Buffer;
 
-    /* iOS-Mythic 2026-07-04: no-progress guard. A dispatch whose context
+    /* iOS-Madeira 2026-07-04: no-progress guard. A dispatch whose context
      * holds JIT-pool VAs finds no unwind tables (function tables are
      * registered for the PE VAs), so RtlVirtualUnwind2's leaf-frame
      * fallback can cycle without advancing — measured: ONE stuck dispatch
@@ -2575,7 +2575,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 
         if (!dispatch.EstablisherFrame) break;
 
-        /* iOS-Mythic ml246: ControlPc == 0 is the END OF THE STACK -- there is nothing to
+        /* iOS-Madeira ml246: ControlPc == 0 is the END OF THE STACK -- there is nothing to
          * unwind to, and continuing just walks memory until it faults.
          *
          * The existing no-progress guard needs BOTH pc and frame to repeat, so it cannot
@@ -2617,7 +2617,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         if ((dispatch.ControlPc == prev_pc && dispatch.EstablisherFrame == prev_frame) ||
             ++walk_steps > 0x10000)
         {
-            /* iOS-Mythic ml327 LIVELOCK BREAKER.
+            /* iOS-Madeira ml327 LIVELOCK BREAKER.
              *
              * Abandoning the walk ends THIS dispatch, but nothing stops the same fault
              * from recurring: a live run was caught repeating
@@ -2662,7 +2662,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         prev_pc = dispatch.ControlPc;
         prev_frame = dispatch.EstablisherFrame;
 
-        /* iOS-Mythic ml633: THE TERMINAL ROOT FRAME IS LEGAL — DO NOT REJECT IT.
+        /* iOS-Madeira ml633: THE TERMINAL ROOT FRAME IS LEGAL — DO NOT REJECT IT.
          *
          * Usable frames are [lo, hi), but the OUTERMOST frame of a thread sits exactly
          * AT hi. In the ml632 ULTRAKILL run the walk reached
@@ -2846,7 +2846,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         {
             TRACE( "calling handler %p (rec=%p, frame=%I64x context=%p, dispatch=%p)\n",
                    dispatch.LanguageHandler, rec, dispatch.EstablisherFrame, orig_context, &dispatch );
-            /* iOS-Mythic #81 — RE-LANDED ml603, GATED, exactly as the ml477
+            /* iOS-Madeira #81 — RE-LANDED ml603, GATED, exactly as the ml477
              * revert note below instructed.
              *
              * The problem: LanguageHandler is ImageBase + unwind handler RVA,
@@ -2863,7 +2863,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
              *  (a) "the storm ONLY occurs with --js-flags=--jitless OFF, and
              *      jitless-off is convicted anyway, so the fix buys nothing."
              *      >>> FALSIFIED by ml602 (db 7252): jitless was ON
-             *      ([proc-gate] V8 JITLESS (interpreted) MYTHIC_JITLESS=1,
+             *      ([proc-gate] V8 JITLESS (interpreted) MADEIRA_JITLESS=1,
              *      cmdline-tail shows --js-flags=--jitless) and the storm still
              *      reached 791,552 exec faults, 749/1029 sampled at this exact
              *      handler.  The dominant site is ntdll's own
@@ -3006,7 +3006,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
 {
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
     context_arm_to_x64( context, arm_ctx );
-    /* iOS-Mythic task#34 probe: FEX's LogMan output is invisible on iOS (its
+    /* iOS-Madeira task#34 probe: FEX's LogMan output is invisible on iOS (its
      * write(2) resolves to the PE CRT's WriteFile → unplumbed std handle),
      * so trace the guest-exception conversion from the wine side. Rate-
      * capped; STATUS_EMULATION_SYSCALL is the hot syscall path and is
@@ -3115,7 +3115,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                                  " cannot name the caller\n", grsp );
                     }
 
-                    /* iOS-Mythic ml631: THIS `else` WAS DANGLING.
+                    /* iOS-Madeira ml631: THIS `else` WAS DANGLING.
                      *
                      * It hangs off the INNER committed-but-non-executable test, not off
                      * the `else if (!qst)` chain, so ANY executable page printed
@@ -3142,7 +3142,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                      *
                      * Bounded and read-only: capped firings, no allocation, no locks; the
                      * unix probe is a pure table walk. */
-                    /* iOS-Mythic ml636: DO NOT GATE ON "the page is executable".
+                    /* iOS-Madeira ml636: DO NOT GATE ON "the page is executable".
                      *
                      * The ml635 gate required NtQueryVirtualMemory to classify the
                      * reconstructed RIP as executable — which CANNOT hold for the very case
@@ -3203,7 +3203,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                                      pp.highest + 256 >= pp.end - pp.base
                                          ? "tail WAS written (reaches the very end)"
                                          : "**TAIL NEVER WRITTEN** — control ran past the real code" );
-                                /* iOS-Mythic ml639: WHICH OF THE THREE VIEWS DETACHED?
+                                /* iOS-Madeira ml639: WHICH OF THE THREE VIEWS DETACHED?
                                  *
                                  * guest = user_va+off, poolRX = jit_rx_alias+off,
                                  * poolRW = jit_rw_alias+off. All three are the SAME physical
@@ -3351,7 +3351,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                  (void *)(ULONG_PTR)arm_ctx->Pc );
     }
     /* call x64 dispatcher if the thunk or the function pointer was modified */
-    /* iOS-Mythic ml409 (#66): the fatal [bogus-ctx] walks a context whose Rsp
+    /* iOS-Madeira ml409 (#66): the fatal [bogus-ctx] walks a context whose Rsp
      * high dword became exactly 1 and whose Rip/Rbp/R12 turned into FEX-band
      * host pointers with recurring low bits, while [rtcs] post had printed the
      * SAME context fields correct moments earlier. The corruption window is
@@ -3398,7 +3398,7 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
          /* bypass exit thunk to avoid messing up the stack */
          "adrp x16, __os_arm64x_dispatch_call_no_redirect\n\t"
          "ldr x16, [x16, #:lo12:__os_arm64x_dispatch_call_no_redirect]\n\t"
-         /* iOS-Mythic (task#29): in a child pseudo-process's private ntdll copy
+         /* iOS-Madeira (task#29): in a child pseudo-process's private ntdll copy
           * this slot is sometimes still NULL (per-process ntdll global not
           * populated; arm64ec_process_init_dispatchers SKIPs ntdll re-patch).
           * A NULL x16 here → `blr x16` to 0 → SEGV loop → dead thread (observed
@@ -3472,7 +3472,7 @@ __ASM_GLOBAL_FUNC( "#KiUserCallbackDispatcher",
 /**************************************************************************
  *              RtlIsEcCode (NTDLL.@)
  */
-/* iOS-Mythic: highest address the EcCodeBitMap can actually represent.
+/* iOS-Madeira: highest address the EcCodeBitMap can actually represent.
  *
  * The 0x800000000000 (48-bit) bound below was WRONG for this port. alloc_arm64ec_map()
  * sizes the bitmap from min(address_space_limit, host_addr_space_limit) rather than
@@ -3561,7 +3561,7 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 
 
 /* unwind context by one call frame */
-/* iOS-Mythic ml703: returns whether a real function entry was found and used.
+/* iOS-Madeira ml703: returns whether a real function entry was found and used.
  *
  * Unwind info is registered for PE VAs, but code physically executes from the
  * JIT-pool alias, so context->Rip is a POOL VA here.  RtlLookupFunctionEntry
@@ -3871,7 +3871,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 
     rec->ExceptionFlags |= EXCEPTION_UNWINDING | (end_frame ? 0 : EXCEPTION_EXIT_UNWIND);
 
-    /* iOS-Mythic 2026-07-04: [UNW_RATE] — [SEH_RATE] in call_seh_handlers
+    /* iOS-Madeira 2026-07-04: [UNW_RATE] — [SEH_RATE] in call_seh_handlers
      * stayed at zero while PROF shows the render worker living in
      * virtual_unwind/RtlVirtualUnwind2, so THIS entry point (phase-2
      * unwind without dispatch = longjmp / handled unwinds) must be the
@@ -4163,7 +4163,7 @@ static void __attribute__((naked)) arm64x_check_call(void)
     asm( ".seh_proc \"#arm64x_check_call\"\n\t"
          ".seh_endprologue\n\t"
          /* check for EC code */
-         /* iOS-Mythic ml238 ROOT-CAUSE FIX: read the TEB from TPIDRRO_EL0 + TSD slot 275,
+         /* iOS-Madeira ml238 ROOT-CAUSE FIX: read the TEB from TPIDRRO_EL0 + TSD slot 275,
           * NOT from x18. iOS clobbers x18 (every SEGV dump in this port shows x18=0), so
           * `ldr x16,[x18,#0x60]` fetched a garbage PEB, the EcCodeBitMap pointer was
           * garbage, the bit test read 0, and this function reported EVERY target as
@@ -4179,7 +4179,7 @@ static void __attribute__((naked)) arm64x_check_call(void)
           *
           * FEX's own check_target_ec already does this (IOS_LOAD_TEB); Wine's copy never
           * did. x16 is scratch here, so the load is free of side effects. */
-         /* iOS-Mythic ml246: this x18 read IS WRONG, and is deliberately kept anyway.
+         /* iOS-Madeira ml246: this x18 read IS WRONG, and is deliberately kept anyway.
           *
           * iOS clobbers x18 (every SEGV dump in this port shows x18=0), so this fetches a
           * garbage PEB, the EcCodeBitMap pointer is garbage, the bit test reads 0, and this

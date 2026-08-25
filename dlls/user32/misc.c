@@ -461,7 +461,7 @@ BOOL WINAPI RegisterPointerDeviceNotifications(HWND hwnd, BOOL notifyrange)
 /**********************************************************************
  * GetPointerDevice [USER32.@]
  *
- * iOS-Mythic ml335: the ONE export CEF needs that wine's user32 lacked.
+ * iOS-Madeira ml335: the ONE export CEF needs that wine's user32 lacked.
  *
  * ml332-ml334's fatal was steamwebhelper executing `int3; ud2` -- Chromium's
  * IMMEDIATE_CRASH() -- inside its delay-load FAILURE hook (identified by the

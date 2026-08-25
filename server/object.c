@@ -298,7 +298,7 @@ WCHAR *default_get_full_name( struct object *obj, data_size_t max, data_size_t *
     return (WCHAR *)ret;
 }
 
-/* iOS-Mythic ml574: DEAD-RELEASE DETECTOR (diagnostic, opt-in).
+/* iOS-Madeira ml574: DEAD-RELEASE DETECTOR (diagnostic, opt-in).
  *
  * ml573 proved something decrements the first 32-bit word of an already-freed
  * 320-byte block by exactly 1 (expected0 0x...2942 vs actual0 0x...2941, byte 0
@@ -316,7 +316,7 @@ WCHAR *default_get_full_name( struct object *obj, data_size_t max, data_size_t *
  *     identity was already gone.
  *
  * Everything here is allocation-free (fixed buffers, raw write) because the host
- * allocator is exactly what is suspect. Enable with MYTHIC_DEAD_RELEASE=1. */
+ * allocator is exactly what is suspect. Enable with MADEIRA_DEAD_RELEASE=1. */
 #define IOS_FREE_RING 1024
 static struct ios_free_rec {
     const void *obj;
@@ -350,7 +350,7 @@ static int ios_dead_release_on(void)
     static int cached = -1;                 /* getenv once, not per release */
     if (cached < 0)
     {
-        const char *e = getenv( "MYTHIC_DEAD_RELEASE" );
+        const char *e = getenv( "MADEIRA_DEAD_RELEASE" );
         cached = (e && *e && *e != '0') ? 1 : 0;
         if (cached)
         {

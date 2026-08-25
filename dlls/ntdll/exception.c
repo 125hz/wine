@@ -174,7 +174,7 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
         TRACE( "calling handler at %p code=%lx flags=%lx\n",
                func, rec->ExceptionCode, rec->ExceptionFlags );
 #ifdef __arm64ec__
-        /* iOS-Mythic ml409 (#66): second bracket point — see [ki-path] in
+        /* iOS-Madeira ml409 (#66): second bracket point — see [ki-path] in
          * signal_arm64ec.c. Vectored handlers are guest x64 code running under
          * the emulator with a pointer to the live dispatch context; log Rsp
          * around each call to catch the corruptor in the act. AV-only, capped. */
@@ -187,7 +187,7 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
         }
 #endif
 #ifdef __arm64ec__
-        /* iOS-Mythic ml418 (#66 CAUGHT): the ml418 freeze was traced to this
+        /* iOS-Madeira ml418 (#66 CAUGHT): the ml418 freeze was traced to this
          * exact call.  SDL3's handler returned 0 with the context intact; the
          * next handler (chrome_elf+0x312c0 = Crashpad's) returned 0 with the
          * context WRECKED — Rsp's high dword replaced by 1 (0x73DBBAFBA0 →
@@ -334,7 +334,7 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         TRACE( " info[%ld]=%p\n", i, (void *)rec->ExceptionInformation[i] );
     TRACE_CONTEXT( context );
 
-    /* iOS-Mythic ml604: FAST-FAIL MUST KILL THE PROCESS, NOT UNWIND.
+    /* iOS-Madeira ml604: FAST-FAIL MUST KILL THE PROCESS, NOT UNWIND.
      *
      * STATUS_STACK_BUFFER_OVERRUN is what `int 0x29` (__fastfail) and the /GS
      * cookie check raise.  On real Windows this NEVER runs VEH or frame-based

@@ -498,7 +498,7 @@ unsigned int alloc_ptid( void *ptr )
         index = used_ptid_entries + PTID_OFFSET;
         entry = &ptid_entries[used_ptid_entries++];
     }
-    /* iOS-Mythic ml400 (task #60/#66): NEVER reuse ptids.  Crash-roulette
+    /* iOS-Madeira ml400 (task #60/#66): NEVER reuse ptids.  Crash-roulette
      * leaves dead threads on threadpool/wait-address lists in other
      * pseudo-processes; when the dead tid is reused, those stale lists
      * alert/act on an innocent new thread (ml400: instant-ALERTED storm on

@@ -3517,7 +3517,7 @@ NTSTATUS WINAPI NtAlertMultipleThreadByThreadId( HANDLE *tids, ULONG count, void
 }
 
 
-/* iOS-Mythic ml400 (task #60): last-64 (from-tid, target-tid) alert pairs.
+/* iOS-Madeira ml400 (task #60): last-64 (from-tid, target-tid) alert pairs.
  * ml400 caught a thread storming instant-ALERTED on INFINITE waits (webhelper
  * 00c8) while other threads slept through their wakes — the recycled-tid
  * theory says a stale threadpool/waiter list in another pseudo-process keeps
@@ -3926,7 +3926,7 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
 #ifdef USE_FUTEX
     {
         LONG *futex = &entry->futex;
-        /* iOS-Mythic ml482 (#86): NtAlertThreadByThreadId itself needs no TEB —
+        /* iOS-Madeira ml482 (#86): NtAlertThreadByThreadId itself needs no TEB —
          * it wakes a TARGET tid — but the two probes below read
          * NtCurrentTeb()->ClientId.UniqueThread, i.e. TEB+0x48. Threads created
          * directly by CEF/FEX have no TEB, so on those the probe (not the
@@ -3937,7 +3937,7 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
          * sender", which is all the diagnostics ever needed. */
         TEB *self_teb = NtCurrentTeb();
         unsigned int self_tid = self_teb ? (unsigned int)(ULONG_PTR)self_teb->ClientId.UniqueThread : 0;
-        /* iOS-Mythic ml400 (task #60): ring of recent alerts so a storming
+        /* iOS-Madeira ml400 (task #60): ring of recent alerts so a storming
          * waiter can name its pounder — see [alert-storm] in
          * NtWaitForAlertByThreadId. */
         LONG pos = InterlockedIncrement( &ios_alert_ring_pos );
@@ -4004,7 +4004,7 @@ static LONGLONG update_timeout( ULONGLONG end )
 NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
 {
     union tid_alert_entry *entry = get_tid_alert_entry( NtCurrentTeb()->ClientId.UniqueThread );
-    /* iOS-Mythic ml406 (task #60): unix-side tap for beacon-marked threads
+    /* iOS-Madeira ml406 (task #60): unix-side tap for beacon-marked threads
      * (TEB->Instrumentation[10] == 'PUMP', stamped by the EC chrome-ipc
      * wrappers).  The pump entered an alert-wait post-wake WITHOUT hitting
      * the EC-side [pump-op] wrapper — native-aarch64-ntdll routes bypass it,
@@ -4087,7 +4087,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         if (ios_marked && ios_alert_unix_n < 120) { InterlockedIncrement( &ios_alert_unix_n );
             ERR( "[alert-unix] tid=%04x -> ALERTED\n",
                  (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread ); }
-        /* iOS-Mythic ml400 (task #60): detect an alert STORM — one thread
+        /* iOS-Madeira ml400 (task #60): detect an alert STORM — one thread
          * getting instant-ALERTED over and over (ml400: webhelper 00c8, 40+
          * consecutive on INFINITE waits).  Every 16th consecutive hit, dump
          * the last 16 alert-ring pairs; the from-tids name the pounder.

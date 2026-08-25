@@ -195,7 +195,7 @@ static BOOL CALLBACK init_current_version(PINIT_ONCE init_once, PVOID parameter,
 
     if (idx < 0) return TRUE;
 
-    /* iOS-Mythic (task #29, 2026-07-10): never apply the Win8 compatibility
+    /* iOS-Madeira (task #29, 2026-07-10): never apply the Win8 compatibility
      * lie. Our pseudo-process bootstrap does not build the main exe's
      * activation context, so the compat-GUID escape hatch below never fires
      * and every modern app is told 6.2.9200 — Steam's updater then

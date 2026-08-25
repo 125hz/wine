@@ -35,7 +35,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(nsi);
 static HANDLE nsi_device = INVALID_HANDLE_VALUE;
 static HANDLE nsi_device_async = INVALID_HANDLE_VALUE;
 
-/* iOS-Mythic 2026-08-03 rev=ml470 (#79 transport): nsiproxy.sys is not
+/* iOS-Madeira 2026-08-03 rev=ml470 (#79 transport): nsiproxy.sys is not
  * shipped on iOS, so \\.\Nsi never exists and every NSI table read
  * fails — Steam's loopback peer authentication (GetExtendedTcpTable pid
  * lookup) dies before any pid compare and each CEF connection is

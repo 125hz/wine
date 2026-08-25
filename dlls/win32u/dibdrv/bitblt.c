@@ -22,7 +22,7 @@
 #pragma makedep unix
 #endif
 
-#include <unistd.h>   /* iOS-Mythic ml508 */
+#include <unistd.h>   /* iOS-Madeira ml508 */
 #include <assert.h>
 
 #include "ntgdi_private.h"
@@ -993,7 +993,7 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
                        const struct gdi_image_bits *bits, struct bitblt_coords *src,
                        struct bitblt_coords *dst, DWORD rop )
 {
-    /* iOS-Mythic ml508: the real pixel-landing choke point.
+    /* iOS-Madeira ml508: the real pixel-landing choke point.
      *
      * ml506/ml507 eliminated FOUR entry points — NtGdiBitBlt, StretchBlt,
      * StretchDIBits and SetDIBitsToDevice never carry a window-sized paint
@@ -1011,7 +1011,7 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
      * `bits->ptr` is the buffer Chromium composited into and hands us — the
      * one that already carries the displaced panel. Watching it names the
      * GUEST code that wrote each region. Only the big paint qualifies; the
-     * watch itself is one-shot and env-gated (MYTHIC_SRCWATCH). */
+     * watch itself is one-shot and env-gated (MADEIRA_SRCWATCH). */
     if (dst && bits && bits->ptr && dst->visrect.right - dst->visrect.left >= 640
         && dst->visrect.bottom - dst->visrect.top >= 400)
     {
@@ -1045,7 +1045,7 @@ DWORD dibdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
         }
 
         /* ml548: hand srcwatch the image geometry so it can (a) restrict the
-         * watch to a row band via MYTHIC_SRCWATCH_ROWS and (b) report faults as
+         * watch to a row band via MADEIRA_SRCWATCH_ROWS and (b) report faults as
          * (x,y,tile_col) instead of raw byte offsets. Falls back to the whole
          * buffer when the env var is unset. */
         extern void ios_srcwatch_arm_geom( const void *bits, unsigned long len,
