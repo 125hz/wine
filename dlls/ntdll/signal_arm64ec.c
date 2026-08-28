@@ -609,6 +609,34 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
         }
     }
 
+    /* ml755: print xtajit64's VA band selector log, which nothing else can.
+     *
+     * ios_fex_band_select() runs during rpmalloc init, before the ARM64EC TEB
+     * exists, so it cannot call any logging API -- it appends to a static byte
+     * buffer instead. ml751 flushed that buffer from FEX's own Module.cpp after
+     * the [build-id] line, which works only when FEX gets far enough to print
+     * it. When the selector finds NO BAND, FEX dies long before that on a null
+     * allocation result, and every [va-profile] line is lost precisely in the
+     * failure that needs explaining.
+     *
+     * Here is early, it demonstrably runs in those failed launches, it has
+     * working logging, and it holds the correct module handle for THIS
+     * pseudo-process -- pseudo-processes carry separate libarm64ecfex mappings
+     * inside one Mach task, so a native-side symbol lookup could read the wrong
+     * copy. Read it as exported DATA; never call a PE export from native code.
+     * A stale flush is harmless: FEX's own later flush is bounded by the same
+     * length and simply reprints. */
+    {
+        const int *len = RtlFindExportedRoutineByName( module, "ios_va_log_len" );
+        const char *log = RtlFindExportedRoutineByName( module, "ios_va_log" );
+        if (len && log && *len > 0)
+            ERR( "[va-profile] ml755 selector log (%d bytes, early flush):\n%.*s\n",
+                 *len, *len, log );
+        else
+            ERR( "[va-profile] ml755 selector log EMPTY at dispatcher init "
+                 "(len=%p log=%p) -- band selection has not run yet\n", len, log );
+    }
+
 #define GET_PTR(name) p ## name = arm64ec_redirect_ptr( module, \
                                       RtlFindExportedRoutineByName( module, #name ), metadata )
     GET_PTR( BTCpu64FlushInstructionCache );
@@ -2512,12 +2540,28 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
             ERR( "[seh-entry] ctx=%p Rsp=%p Rip=%p\n", orig_context,
                  (void *)(ULONG_PTR)orig_context->Rsp, (void *)(ULONG_PTR)orig_context->Rip );
 
+    }
+
     /* iOS-Madeira ml633: ESTABLISH THE GUEST-STACK WINDOW IN PHASE ONE TOO.
      * ec_stack_window_begin() was only called on the phase-two unwind path, yet phase
      * one consults ec_win — so a thread could validate frames against another
-     * exception's bounds, or none at all. Re-establish from the ORIGINAL Rsp here. */
+     * exception's bounds, or none at all. Re-establish from the ORIGINAL Rsp here.
+     *
+     * ml742: this call used to sit INSIDE the access-violation-only diagnostic
+     * block above -- a brace-placement slip, since the comment describes a
+     * requirement for phase one generally. Any exception that is not an access
+     * violation therefore ran phase one against whatever window the previous
+     * exception left behind, and ec_win is AUTHORITATIVE in
+     * is_valid_arm64ec_frame(): when ec_win.hi is set the TEB bounds are never
+     * consulted. A stale window rejects a perfectly good frame, and the caller
+     * treats that as a bogus context and kills the thread.
+     *
+     * That is what stopped a UE4 title from starting: it raised 0x406D1388 --
+     * the benign code a thread raises purely to NAME itself -- while running its
+     * DLL_THREAD_ATTACH callbacks. Not an access violation, so no window; the
+     * frame was rejected despite sitting inside the printed stack bounds, and
+     * one of the game's own threads was terminated during initialisation. */
     ec_stack_window_begin( (ULONG_PTR)orig_context->Rsp );
-    }
 
     /* iOS-Madeira 2026-07-04: [SEH_RATE] — the render worker burns ~75% of
      * its frame in virtual_unwind/RtlVirtualUnwind2/memset below this
@@ -2697,6 +2741,24 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
 
         if (!is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
         {
+            /* ml742: print the bounds the decision was ACTUALLY made against.
+             * The existing report below prints only the TEB stack, but ec_win
+             * overrides it when set -- so a frame plainly inside the printed
+             * range can still be rejected, which reads as a contradiction and
+             * sent one investigation down the wrong path. Show both, plus
+             * whether the plain TEB test would have passed. Bounded. */
+            {
+                static LONG ml742_n;
+                if (InterlockedIncrement( &ml742_n ) <= 24)
+                    ERR( "[ec-frame] ml742 REJECT frame=%p code=%08x | ec_win lo=%p hi=%p "
+                         "emu lo=%p hi=%p | origRsp=%p tebStack=%p-%p | teb_test=%d\n",
+                         (void *)dispatch.EstablisherFrame, (int)rec->ExceptionCode,
+                         (void *)ec_win.lo, (void *)ec_win.hi,
+                         (void *)ec_win.emu_lo, (void *)ec_win.emu_hi,
+                         (void *)(ULONG_PTR)orig_context->Rsp,
+                         NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase,
+                         is_valid_frame( dispatch.EstablisherFrame ) );
+            }
             /* ml221: report WHY the walk produced this frame, not just that it did.
              *
              * The frame that killed the webhelper was 0x73c9f70008 -- 8 bytes into
