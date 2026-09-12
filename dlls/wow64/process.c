@@ -71,7 +71,7 @@ static RTL_USER_PROCESS_PARAMETERS *process_params_32to64( RTL_USER_PROCESS_PARA
                                       unicode_str_32to64( &dllpath, &params32->DllPath ),
                                       unicode_str_32to64( &curdir, &params32->CurrentDirectory.DosPath ),
                                       unicode_str_32to64( &cmdline, &params32->CommandLine ),
-                                      ULongToPtr( params32->Environment ),
+                                      guest_ptr32( params32->Environment ),
                                       unicode_str_32to64( &title, &params32->WindowTitle ),
                                       unicode_str_32to64( &desktop, &params32->Desktop ),
                                       unicode_str_32to64( &shell, &params32->ShellInfo ),
@@ -95,7 +95,7 @@ static RTL_USER_PROCESS_PARAMETERS *process_params_32to64( RTL_USER_PROCESS_PARA
     ret->dwFlags               = params32->dwFlags;
     ret->wShowWindow           = params32->wShowWindow;
     ret->EnvironmentVersion    = params32->EnvironmentVersion;
-    ret->PackageDependencyData = ULongToPtr( params32->PackageDependencyData );
+    ret->PackageDependencyData = guest_ptr32( params32->PackageDependencyData );
     ret->ProcessGroupId        = params32->ProcessGroupId;
     ret->LoaderThreads         = params32->LoaderThreads;
     *params = ret;
@@ -180,7 +180,7 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
                 ret->Attributes[i].ValuePtr = Wow64AllocateTemp( ret->Attributes[i].Size );
                 for (j = 0; j < handles_count; j++)
                     ((HANDLE *)ret->Attributes[i].ValuePtr)[j] =
-                        LongToHandle( ((LONG *)ULongToPtr(attr32->Attributes[i].Value))[j] );
+                        LongToHandle( ((LONG *)guest_ptr32(attr32->Attributes[i].Value))[j] );
             }
             break;
         case PS_ATTRIBUTE_PARENT_PROCESS:
@@ -208,7 +208,10 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
 }
 
 
-static void put_ps_attributes( PS_ATTRIBUTE_LIST32 *attr32, const PS_ATTRIBUTE_LIST *attr )
+/* `owner` is the process the attributes describe — its own window is what
+ * PS_ATTRIBUTE_TEB_ADDRESS has to be expressed in (invariant §3.2), not ours. */
+static void put_ps_attributes( PS_ATTRIBUTE_LIST32 *attr32, const PS_ATTRIBUTE_LIST *attr,
+                               HANDLE owner )
 {
     ULONG i;
 
@@ -222,9 +225,9 @@ static void put_ps_attributes( PS_ATTRIBUTE_LIST32 *attr32, const PS_ATTRIBUTE_L
             CLIENT_ID32 id32;
             ULONG size = min( attr32->Attributes[i].Size, sizeof(id32) );
             put_client_id( &id32, attr->Attributes[i].ValuePtr );
-            memcpy( ULongToPtr( attr32->Attributes[i].Value ), &id32, size );
+            memcpy( guest_ptr32( attr32->Attributes[i].Value ), &id32, size );
             if (attr32->Attributes[i].ReturnLength)
-                *(ULONG *)ULongToPtr(attr32->Attributes[i].ReturnLength) = size;
+                *(ULONG *)guest_ptr32(attr32->Attributes[i].ReturnLength) = size;
             break;
         }
         case PS_ATTRIBUTE_IMAGE_INFO:
@@ -232,19 +235,38 @@ static void put_ps_attributes( PS_ATTRIBUTE_LIST32 *attr32, const PS_ATTRIBUTE_L
             SECTION_IMAGE_INFORMATION32 info32;
             ULONG size = min( attr32->Attributes[i].Size, sizeof(info32) );
             put_section_image_info( &info32, attr->Attributes[i].ValuePtr );
-            memcpy( ULongToPtr( attr32->Attributes[i].Value ), &info32, size );
+            memcpy( guest_ptr32( attr32->Attributes[i].Value ), &info32, size );
             if (attr32->Attributes[i].ReturnLength)
-                *(ULONG *)ULongToPtr(attr32->Attributes[i].ReturnLength) = size;
+                *(ULONG *)guest_ptr32(attr32->Attributes[i].ReturnLength) = size;
             break;
         }
         case PS_ATTRIBUTE_TEB_ADDRESS:
         {
             TEB **teb = attr->Attributes[i].ValuePtr;
-            ULONG teb32 = PtrToUlong( *teb ) + 0x2000;
+            /* stage C review F7: the new thread's TEB32 (TEB64 + teb_offset)
+             * lives in the OWNING process's window, so convert with that
+             * process's B.  For NtCreateThreadEx the target already exists and
+             * this is exact.  For NtCreateUserProcess it is not knowable yet:
+             * on this port a child pseudo-process reserves its window inside
+             * wine_ios_child_main, which runs asynchronously on the child's own
+             * thread, so B is still 0 when NtCreateUserProcess returns — say so
+             * once instead of silently publishing a truncated host address. */
+            ULONG_PTR owner_base = wow_guest_base_for_process( owner );
+            ULONG teb32;
             ULONG size = min( attr->Attributes[i].Size, sizeof(teb32) );
-            memcpy( ULongToPtr( attr32->Attributes[i].Value ), &teb32, size );
+
+            if (wow_guest_base && *teb && !owner_base)
+            {
+                static int reported;
+                if (!reported++)
+                    ERR( "PS_ATTRIBUTE_TEB_ADDRESS: target process has no guest window yet, "
+                         "TEB %p cannot be expressed as a guest address\n", *teb );
+            }
+            teb32 = host_ptr32_in( owner_base, *teb );
+            if (teb32) teb32 += 0x2000;
+            memcpy( guest_ptr32( attr32->Attributes[i].Value ), &teb32, size );
             if (attr32->Attributes[i].ReturnLength)
-                *(ULONG *)ULongToPtr(attr32->Attributes[i].ReturnLength) = size;
+                *(ULONG *)guest_ptr32(attr32->Attributes[i].ReturnLength) = size;
             break;
         }
         }
@@ -383,7 +405,7 @@ NTSTATUS WINAPI wow64_NtCreateThreadEx( UINT *args )
                                    start, param, flags, get_zero_bits( zero_bits ),
                                    stack_commit, stack_reserve,
                                    ps_attributes_32to64( &attr_list, attr_list32 ));
-        put_ps_attributes( attr_list32, attr_list );
+        put_ps_attributes( attr_list32, attr_list, process );
     }
     else status = STATUS_ACCESS_DENIED;
 
@@ -427,7 +449,7 @@ NTSTATUS WINAPI wow64_NtCreateUserProcess( UINT *args )
     put_handle( process_handle_ptr, process_handle );
     put_handle( thread_handle_ptr, thread_handle );
     put_ps_create_info( info32, &info );
-    put_ps_attributes( attr32, attr );
+    put_ps_attributes( attr32, attr, process_handle );
     RtlDestroyProcessParameters( params );
     return status;
 }
@@ -577,7 +599,10 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
             if (!(status = NtQueryInformationProcess( handle, class, &info, sizeof(info), NULL )))
             {
                 if (is_process_wow64( handle ))
-                    info32->PebBaseAddress = PtrToUlong( info.PebBaseAddress ) + 0x1000;
+                    /* the TARGET's PEB32, in the TARGET's window (§3.2) */
+                    info32->PebBaseAddress =
+                        host_ptr32_in( wow_guest_base_for_process( handle ),
+                                       info.PebBaseAddress ) + 0x1000;
                 else
                     info32->PebBaseAddress = 0;
                 info32->ExitStatus = info.ExitStatus;
@@ -654,7 +679,14 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
 
             if (!(status = NtQueryInformationProcess( handle, class, &data, sizeof(data), NULL )))
             {
-                *(ULONG *)ptr = data;
+                /* ProcessWow64Information is the target's PEB32 ADDRESS, so
+                 * it converts through the target's window.  The other three
+                 * classes are a debug port cookie, an affinity bitmask and a
+                 * handle — never window-converted. */
+                if (class == ProcessWow64Information)
+                    *(ULONG *)ptr = host_ptr32_in( wow_guest_base_for_process( handle ), (void *)data );
+                else
+                    *(ULONG *)ptr = data;
                 if (retlen) *retlen = sizeof(ULONG);
             }
             else if (status == STATUS_PORT_NOT_SET)
@@ -677,7 +709,7 @@ NTSTATUS WINAPI wow64_NtQueryInformationProcess( UINT *args )
             {
                 str32->Length = str->Length;
                 str32->MaximumLength = str->MaximumLength;
-                str32->Buffer = PtrToUlong( str32 + 1 );
+                str32->Buffer = host_ptr32( str32 + 1 );
                 memcpy( str32 + 1, str->Buffer, str->MaximumLength );
             }
             if (retlen) *retlen = retsize + sizeof(UNICODE_STRING32) - sizeof(UNICODE_STRING);
@@ -732,7 +764,7 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
         {
             info32.ExitStatus = info.ExitStatus;
             info32.TebBaseAddress = is_process_id_wow64( &info.ClientId ) && info.TebBaseAddress ?
-                                    PtrToUlong(info.TebBaseAddress) + 0x2000 : 0;
+                                    host_ptr32(info.TebBaseAddress) + 0x2000 : 0;
             info32.ClientId.UniqueProcess = HandleToULong( info.ClientId.UniqueProcess );
             info32.ClientId.UniqueThread = HandleToULong( info.ClientId.UniqueThread );
             info32.AffinityMask = info.AffinityMask;
@@ -805,7 +837,7 @@ NTSTATUS WINAPI wow64_NtQueryInformationThread( UINT *args )
             {
                 info32->ThreadName.Length = info->ThreadName.Length;
                 info32->ThreadName.MaximumLength = info->ThreadName.MaximumLength;
-                info32->ThreadName.Buffer = PtrToUlong( info32 + 1 );
+                info32->ThreadName.Buffer = host_ptr32( info32 + 1 );
                 memcpy( info32 + 1, info + 1, min( len, info->ThreadName.MaximumLength ));
             }
         }
@@ -975,7 +1007,7 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
             info.AllocInfo.ReserveSize = stack->AllocInfo.ReserveSize;
             info.AllocInfo.ZeroBits = get_zero_bits( stack->AllocInfo.ZeroBits );
             if (!(status = NtSetInformationProcess( handle, class, &info, sizeof(info) )))
-                stack->AllocInfo.StackBase = PtrToUlong( info.AllocInfo.StackBase );
+                stack->AllocInfo.StackBase = host_ptr32( info.AllocInfo.StackBase );
             return status;
         }
         else if (len == sizeof(PROCESS_STACK_ALLOCATION_INFORMATION32))
@@ -986,7 +1018,7 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
             info.ReserveSize = stack->ReserveSize;
             info.ZeroBits = get_zero_bits( stack->ZeroBits );
             if (!(status = NtSetInformationProcess( handle, class, &info, sizeof(info) )))
-                stack->StackBase = PtrToUlong( info.StackBase );
+                stack->StackBase = host_ptr32( info.StackBase );
             return status;
         }
         else return STATUS_INFO_LENGTH_MISMATCH;

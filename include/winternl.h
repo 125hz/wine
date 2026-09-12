@@ -2033,6 +2033,13 @@ typedef enum _PROCESSINFOCLASS {
 #ifdef __WINESRC__
     ProcessWineMakeProcessSystem = 1000,
     ProcessWineGrantAdminToken = 1002,
+    /* iOS-Madeira (WOW64_DESIGN.md §2): host address of guest 0 for a 32-bit
+     * pseudo-process, i.e. the base B of its [B, B+4G) guest window.  Returns
+     * a ULONG_PTR; 0 for a process that has no window (every 64-bit process,
+     * and every platform other than the iOS port).  This is the single source
+     * of truth for B — wow64.dll and the FEX WoW64 module each read it once
+     * at process init.  No environment variables, no cross-process globals. */
+    ProcessWineIosWowGuestBase = 1010,
 #endif
 } PROCESSINFOCLASS;
 

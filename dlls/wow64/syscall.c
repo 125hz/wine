@@ -90,6 +90,62 @@ struct user_apc_frame
 
 SYSTEM_DLL_INIT_BLOCK *pLdrSystemDllInitBlock = NULL;
 
+/* WOW64_DESIGN.md §2: host address of guest 0 for THIS process.  0 means the
+ * classic WoW64 identity (guest address == host address), which is what every
+ * platform except the iOS port uses — with 0 the guest_ptr32/host_ptr32
+ * helpers are exactly the ULongToPtr/PtrToUlong they replaced. */
+ULONG_PTR wow_guest_base = 0;
+
+/* Same, for another process.  Cross-process VM calls must use the TARGET's
+ * window (invariant §3.2), never ours.  Cached per handle value because the
+ * query is a syscall and these calls come in bursts; a handle is closed and
+ * reused only after the process object is gone, and a pseudo-process's window
+ * dies with it, so a stale entry can only appear after a handle is recycled —
+ * revalidated by comparing the process's unique id below. */
+ULONG_PTR wow_guest_base_for_process( HANDLE process )
+{
+    static struct { HANDLE volatile handle; ULONG_PTR pid; ULONG_PTR base; } cache[8];
+    static LONG cache_pos;
+    PROCESS_BASIC_INFORMATION pbi;
+    ULONG_PTR base = 0, pid;
+    unsigned int i;
+
+    /* stage C review F8: on a platform that keeps the classic WoW64 identity
+     * there are no windows at all, so answer without any syscall — this runs
+     * on every cross-process VM call. */
+    if (!wow_guest_base) return 0;
+    if (process == GetCurrentProcess() || !process) return wow_guest_base;
+
+    /* Cache lookup FIRST: the ProcessBasicInformation query below is itself a
+     * syscall, so doing it before the lookup made the cache pointless. */
+    for (i = 0; i < ARRAY_SIZE(cache); i++)
+    {
+        HANDLE h = ReadPointerAcquire( &cache[i].handle );   /* pairs with the release below */
+
+        if (h == process) return cache[i].base;
+    }
+
+    /* Not cached.  Resolve the unique id so a recycled handle value cannot
+     * alias a dead process's entry, then query B. */
+    if (NtQueryInformationProcess( process, ProcessBasicInformation, &pbi, sizeof(pbi), NULL ))
+        return 0;
+    pid = pbi.UniqueProcessId;
+    for (i = 0; i < ARRAY_SIZE(cache); i++)
+        if (cache[i].handle == process && cache[i].pid == pid) return cache[i].base;
+    if (NtQueryInformationProcess( process, ProcessWineIosWowGuestBase, &base, sizeof(base), NULL ))
+        base = 0;
+
+    /* Ordered publish: base and pid are visible before the handle that makes
+     * the entry findable, so a concurrent reader can never match a handle and
+     * then read a half-written base. */
+    i = (unsigned int)InterlockedIncrement( &cache_pos ) % ARRAY_SIZE(cache);
+    WritePointerRelease( &cache[i].handle, NULL );   /* retire the old entry first */
+    cache[i].base = base;
+    cache[i].pid = pid;
+    WritePointerRelease( &cache[i].handle, process );
+    return base;
+}
+
 static WOW64INFO *wow64info;
 static WORD ss32_sel;
 
@@ -154,11 +210,18 @@ static EXCEPTION_RECORD *exception_record_32to64( const EXCEPTION_RECORD32 *rec3
     rec = Wow64AllocateTemp( sizeof(*rec) );
     rec->ExceptionCode = rec32->ExceptionCode;
     rec->ExceptionFlags = rec32->ExceptionFlags;
-    rec->ExceptionRecord = rec32->ExceptionRecord ? exception_record_32to64( ULongToPtr(rec32->ExceptionRecord) ) : NULL;
-    rec->ExceptionAddress = ULongToPtr( rec32->ExceptionAddress );
+    rec->ExceptionRecord = rec32->ExceptionRecord ? exception_record_32to64( guest_ptr32(rec32->ExceptionRecord) ) : NULL;
+    rec->ExceptionAddress = guest_ptr32( rec32->ExceptionAddress );
     rec->NumberParameters = rec32->NumberParameters;
     for (i = 0; i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
         rec->ExceptionInformation[i] = rec32->ExceptionInformation[i];
+    /* WOW64_DESIGN.md §3 invariant 5: for an access violation / in-page error
+     * ExceptionInformation[1] is the FAULTING ADDRESS, not a scalar, so it
+     * converts like any other pointer.  [0] is the access type and [2] (page
+     * error) is an NTSTATUS — both stay as they are. */
+    if ((rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+         rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && rec->NumberParameters >= 2)
+        rec->ExceptionInformation[1] = (ULONG_PTR)guest_ptr32( rec32->ExceptionInformation[1] );
     return rec;
 }
 
@@ -169,11 +232,15 @@ static void exception_record_64to32( EXCEPTION_RECORD32 *rec32, const EXCEPTION_
 
     rec32->ExceptionCode    = rec->ExceptionCode;
     rec32->ExceptionFlags   = rec->ExceptionFlags;
-    rec32->ExceptionRecord  = PtrToUlong( rec->ExceptionRecord );
-    rec32->ExceptionAddress = PtrToUlong( rec->ExceptionAddress );
+    rec32->ExceptionRecord  = host_ptr32( rec->ExceptionRecord );
+    rec32->ExceptionAddress = host_ptr32( rec->ExceptionAddress );
     rec32->NumberParameters = rec->NumberParameters;
     for (i = 0; i < rec->NumberParameters; i++)
         rec32->ExceptionInformation[i] = rec->ExceptionInformation[i];
+    /* WOW64_DESIGN.md §3 invariant 5 — see exception_record_32to64. */
+    if ((rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+         rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && rec->NumberParameters >= 2)
+        rec32->ExceptionInformation[1] = host_ptr32( (void *)rec->ExceptionInformation[1] );
 }
 
 
@@ -239,9 +306,9 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
             RtlGetExtendedContextLength( flags, &context_length );
 
             esp = LOWORD(ctx.SegSs) != ss32_sel ? NtCurrentTeb32()->SystemReserved1[0] : ctx.Esp;
-            stack = (struct exc_stack_layout32 *)ULongToPtr( (esp - offsetof(struct exc_stack_layout32, context) - context_length) & ~3 );
-            stack->rec_ptr     = PtrToUlong( &stack->rec );
-            stack->context_ptr = PtrToUlong( &stack->context );
+            stack = (struct exc_stack_layout32 *)guest_ptr32( (esp - offsetof(struct exc_stack_layout32, context) - context_length) & ~3 );
+            stack->rec_ptr     = host_ptr32( &stack->rec );
+            stack->context_ptr = host_ptr32( &stack->context );
             stack->rec         = *rec;
             stack->context     = ctx;
             RtlInitializeExtendedContext( &stack->context, flags, &context_ex );
@@ -251,7 +318,7 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
             if (rec->ExceptionCode == EXCEPTION_BREAKPOINT && (wow64info->CpuFlags & WOW64_CPUFLAGS_SOFTWARE))
                 stack->context.Eip--;
 
-            ctx.Esp = PtrToUlong( stack );
+            ctx.Esp = host_ptr32( stack );
             ctx.Eip = pLdrSystemDllInitBlock->pKiUserExceptionDispatcher;
             ctx.EFlags &= ~(0x100|0x400|0x40000);
             ctx.ContextFlags = CONTEXT_I386_CONTROL;
@@ -272,13 +339,13 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
             ARM_CONTEXT ctx = { CONTEXT_ARM_ALL };
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            stack = (struct stack_layout *)(ULONG_PTR)(ctx.Sp & ~3) - 1;
+            stack = (struct stack_layout *)guest_ptr32( ctx.Sp & ~3 ) - 1;
             stack->rec = *rec;
             stack->context = ctx;
 
-            ctx.R0 = PtrToUlong( &stack->rec );     /* first arg for KiUserExceptionDispatcher */
-            ctx.R1 = PtrToUlong( &stack->context ); /* second arg for KiUserExceptionDispatcher */
-            ctx.Sp = PtrToUlong( stack );
+            ctx.R0 = host_ptr32( &stack->rec );     /* first arg for KiUserExceptionDispatcher */
+            ctx.R1 = host_ptr32( &stack->context ); /* second arg for KiUserExceptionDispatcher */
+            ctx.Sp = host_ptr32( stack );
             ctx.Pc = pLdrSystemDllInitBlock->pKiUserExceptionDispatcher;
             if (ctx.Pc & 1) ctx.Cpsr |= 0x20;
             else ctx.Cpsr &= ~0x20;
@@ -309,8 +376,8 @@ static void __attribute__((used)) call_raise_user_exception_dispatcher( ULONG co
             ctx.ContextFlags = CONTEXT_I386_CONTROL;
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
             ctx.Esp -= sizeof(ULONG);
-            *(ULONG *)ULongToPtr( ctx.Esp ) = ctx.Eip;
-            ctx.Eip = (ULONG_PTR)pKiRaiseUserExceptionDispatcher;
+            *(ULONG *)guest_ptr32( ctx.Esp ) = ctx.Eip;
+            ctx.Eip = host_ptr32( pKiRaiseUserExceptionDispatcher );
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
         }
         break;
@@ -321,7 +388,7 @@ static void __attribute__((used)) call_raise_user_exception_dispatcher( ULONG co
 
             ctx.ContextFlags = CONTEXT_ARM_CONTROL;
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            ctx.Pc = (ULONG_PTR)pKiRaiseUserExceptionDispatcher;
+            ctx.Pc = host_ptr32( pKiRaiseUserExceptionDispatcher );
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
         }
         break;
@@ -502,7 +569,20 @@ NTSTATUS WINAPI wow64_NtClose( UINT *args )
 NTSTATUS WINAPI wow64_NtContinueEx( UINT *args )
 {
     void *context = get_ptr( &args );
-    KCONTINUE_ARGUMENT *cont_args = get_ptr( &args );
+    /* INVARIANT 4 (WOW64_DESIGN.md §3): this argument is NOT always a pointer.
+     * NtContinue( context, alertable ) and NtContinueEx( context, cont_args )
+     * share one entry here; the callee side (ntdll NtContinueEx) tells them
+     * apart by value, "<= 0xff is the BOOLEAN alertable".  The discriminator
+     * must therefore run on the RAW 32-bit value, BEFORE any window
+     * conversion: with B != 0, get_ptr() turned NtContinue( ctx, TRUE ) into
+     * B+1, which is > 0xff, so the pointer branch below dereferenced
+     * (B+1)->ContinueFlags.  That was the surviving AV of the ninth device
+     * run (ldrb w8,[x22,#4], x22 = B+1); the i386 caller is ntdll's
+     * signal_start_thread(), which ends LdrInitializeThunk with a literal
+     * NtContinue( context, 1 ) (dlls/ntdll/signal_i386.c:528-530). */
+    ULONG cont_args32 = get_ulong( &args );
+    KCONTINUE_ARGUMENT *cont_args = (cont_args32 > 0xff) ? guest_ptr32( cont_args32 )
+                                                         : ULongToPtr( cont_args32 );
 
     NTSTATUS status = get_context_return_value( context );
     struct user_apc_frame *frame = NtCurrentTeb()->TlsSlots[WOW64_TLS_APCLIST];
@@ -514,10 +594,10 @@ NTSTATUS WINAPI wow64_NtContinueEx( UINT *args )
     NtCurrentTeb()->TlsSlots[WOW64_TLS_APCLIST] = frame ? frame->prev_frame : NULL;
     if (frame) NtContinueEx( frame->context, cont_args );
 
-    if ((UINT_PTR)cont_args > 0xff)
+    if (cont_args32 > 0xff)
         alertable = cont_args->ContinueFlags & KCONTINUE_FLAG_TEST_ALERT;
     else
-        alertable = !!cont_args;
+        alertable = !!cont_args32;
 
     if (alertable) NtTestAlert();
     return status;
@@ -702,6 +782,34 @@ NTSTATUS WINAPI wow64_NtWow64IsProcessorFeaturePresent( UINT *args )
 }
 
 
+/* CPU-DLL CONTRACT (WOW64_DESIGN.md §4, stage C reviews F9 + FB1).
+ *
+ * BTCpuGetBopCode() and __wine_get_unix_opcode() return GUEST addresses, not
+ * host pointers: the backend allocates the BOP / unix-call code page inside
+ * this process's window (NtAllocateVirtualMemory with a guest zero_bits
+ * ceiling puts it there) and publishes `host - B` itself.  The values are
+ * therefore already in the namespace the 32-bit side reads, and must be
+ * stored verbatim — running them through host_ptr32() subtracts B a second
+ * time, which only happened to survive because B is 4 GB-aligned and the
+ * result wrapped back to the same low 32 bits.
+ *
+ * So validate the RAW value instead: a guest address is nonzero and below
+ * 4 GB.  Anything else is a broken backend; one greppable line. */
+static void check_guest_addr( const char *what, const void *p )
+{
+    static int reported;
+
+    if (!wow_guest_base) return;   /* classic identity: host == guest */
+    if (p && (ULONG_PTR)p < 0x100000000ull) return;
+    if (reported++) return;
+    ERR( "[wow-window] CONTRACT VIOLATION: %s is %p, which is not a guest address "
+         "(must be nonzero and < 4GB). The CPU backend must allocate this page "
+         "inside the guest window [%p,%p) and return host - B.\n",
+         what, p, (void *)wow_guest_base,
+         (void *)(wow_guest_base + 0x100000000ull) );
+}
+
+
 /**********************************************************************
  *           init_image_mapping
  */
@@ -709,16 +817,34 @@ void init_image_mapping( HMODULE module )
 {
     ULONG *ptr = RtlFindExportedRoutineByName( module, "Wow64Transition" );
 
-    if (ptr) *ptr = PtrToUlong( pBTCpuGetBopCode() );
+    /* WOW64_DESIGN.md §4: Wow64Transition is read by 32-bit code, and
+     * BTCpuGetBopCode() already returns a GUEST address (see the CPU-DLL
+     * contract above) — store it verbatim, do NOT apply host_ptr32(). */
+    check_guest_addr( "Wow64Transition (BTCpuGetBopCode)", pBTCpuGetBopCode() );
+    if (ptr) *ptr = (ULONG)(ULONG_PTR)pBTCpuGetBopCode();
 }
 
 
 /**********************************************************************
  *           load_64bit_module
  */
-static HMODULE load_64bit_module( const WCHAR *name )
+/* wow64.dll links against ntdll only, so wine_dbgstr_wn (which calls
+ * IsBadStringPtrW) is unavailable here; dll names are ASCII. */
+static const char *dllname_a( const WCHAR *name )
 {
-    NTSTATUS status;
+    static char buffer[4][64];
+    static LONG pos;
+    char *ret = buffer[InterlockedIncrement( &pos ) & 3];
+    unsigned int i;
+
+    for (i = 0; i < sizeof(buffer[0]) - 1 && name[i]; i++)
+        ret[i] = (name[i] < 0x80) ? (char)name[i] : '?';
+    ret[i] = 0;
+    return ret;
+}
+
+static HMODULE try_load_64bit_module( const WCHAR *name )
+{
     HMODULE module;
     UNICODE_STRING str;
     WCHAR path[MAX_PATH];
@@ -726,10 +852,46 @@ static HMODULE load_64bit_module( const WCHAR *name )
 
     swprintf( path, MAX_PATH, L"%s\\%s", dir, name );
     RtlInitUnicodeString( &str, path );
-    if ((status = LdrLoadDll( dir, 0, &str, &module )))
+    if (LdrLoadDll( dir, 0, &str, &module )) return NULL;
+    return module;
+}
+
+static HMODULE load_64bit_module( const WCHAR *name )
+{
+    HMODULE module = try_load_64bit_module( name );
+
+    if (!module)
     {
-        ERR( "failed to load dll %lx\n", status );
-        NtTerminateProcess( GetCurrentProcess(), status );
+        ERR( "failed to load dll %s\n", dllname_a(name) );
+        NtTerminateProcess( GetCurrentProcess(), STATUS_DLL_NOT_FOUND );
+    }
+    return module;
+}
+
+
+/**********************************************************************
+ *           load_cpu_dll
+ *
+ * The CPU backend named by the registry may not exist on this host (a prefix
+ * captured on another architecture records a different one — e.g. an x86_64
+ * capture leaves "wow64cpu.dll" behind for \Wow64\x86).  Falling back to the
+ * platform default rather than terminating the process is a generic
+ * robustness fix, not a per-configuration workaround.
+ */
+static HMODULE load_cpu_dll( const WCHAR *name, const WCHAR *fallback )
+{
+    HMODULE module = try_load_64bit_module( name );
+
+    if (!module && fallback && wcsicmp( name, fallback ))
+    {
+        ERR( "CPU backend %s not available, falling back to the platform default %s\n",
+             dllname_a(name), dllname_a(fallback) );
+        module = try_load_64bit_module( fallback );
+    }
+    if (!module)
+    {
+        ERR( "failed to load CPU backend %s\n", dllname_a(name) );
+        NtTerminateProcess( GetCurrentProcess(), STATUS_DLL_NOT_FOUND );
     }
     return module;
 }
@@ -738,7 +900,7 @@ static HMODULE load_64bit_module( const WCHAR *name )
 /**********************************************************************
  *           get_cpu_dll_name
  */
-static const WCHAR *get_cpu_dll_name(void)
+static const WCHAR *get_cpu_dll_name( const WCHAR **platform_default )
 {
     static ULONG buffer[32];
     KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
@@ -762,6 +924,7 @@ static const WCHAR *get_cpu_dll_name(void)
         ERR( "unsupported machine %04x\n", current_machine );
         RtlExitUserProcess( 1 );
     }
+    *platform_default = ret;
     InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
     if (NtOpenKey( &key, KEY_READ | KEY_WOW64_64KEY, &attr )) return ret;
     RtlInitUnicodeString( &nameW, L"" );
@@ -824,6 +987,14 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
 
     RtlWow64GetProcessMachines( GetCurrentProcess(), &current_machine, &native_machine );
     if (!current_machine) current_machine = native_machine;
+    /* WOW64_DESIGN.md §2: read B ONCE, before anything converts a pointer.
+     * Stays 0 (classic identity) on every build whose ntdll does not know the
+     * class, which is every platform but the iOS port. */
+    if (NtQueryInformationProcess( GetCurrentProcess(), ProcessWineIosWowGuestBase,
+                                   &wow_guest_base, sizeof(wow_guest_base), NULL ))
+        wow_guest_base = 0;
+    if (wow_guest_base)
+        TRACE( "guest window base %p\n", (void *)wow_guest_base );
     args_alignment = (current_machine == IMAGE_FILE_MACHINE_I386) ? sizeof(ULONG) : sizeof(ULONG64);
     NtQuerySystemInformation( SystemEmulationBasicInformation, &info, sizeof(info), NULL );
     highest_user_address = (ULONG_PTR)info.HighestUserAddress;
@@ -840,7 +1011,12 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     LdrGetDllHandle( NULL, 0, &str, &module );
     GET_PTR( LdrSystemDllInitBlock );
 
-    module = load_64bit_module( get_cpu_dll_name() );
+    {
+        const WCHAR *cpu_default = NULL;
+        const WCHAR *cpu_name = get_cpu_dll_name( &cpu_default );
+
+        module = load_cpu_dll( cpu_name, cpu_default );
+    }
     GET_PTR( BTCpuGetBopCode );
     GET_PTR( BTCpuGetContext );
     GET_PTR( BTCpuIsProcessorFeaturePresent );
@@ -869,14 +1045,23 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
 
     pBTCpuProcessInit();
 
-    module = (HMODULE)(ULONG_PTR)pLdrSystemDllInitBlock->ntdll_handle;
+    /* WOW64_DESIGN.md §4: ntdll_handle is published as the 32-bit ntdll's
+     * GUEST base (like every other LdrSystemDllInitBlock entry, which end up
+     * in 32-bit CONTEXT registers); turn it back into a host module here. */
+    module = (HMODULE)guest_ptr32( (ULONG)pLdrSystemDllInitBlock->ntdll_handle );
     init_image_mapping( module );
     GET_PTR( KiRaiseUserExceptionDispatcher );
     GET_PTR( __wine_syscall_dispatcher );
     GET_PTR( __wine_unix_call_dispatcher );
 
-    *p__wine_syscall_dispatcher = PtrToUlong( pBTCpuGetBopCode() );
-    *p__wine_unix_call_dispatcher = PtrToUlong( p__wine_get_unix_opcode() );
+    /* both are read by 32-bit code, and both backend entry points already
+     * return GUEST addresses — store verbatim (see the CPU-DLL contract at
+     * check_guest_addr) */
+    check_guest_addr( "__wine_syscall_dispatcher (BTCpuGetBopCode)", pBTCpuGetBopCode() );
+    check_guest_addr( "__wine_unix_call_dispatcher (__wine_get_unix_opcode)",
+                      p__wine_get_unix_opcode() );
+    *p__wine_syscall_dispatcher = (ULONG)(ULONG_PTR)pBTCpuGetBopCode();
+    *p__wine_unix_call_dispatcher = (ULONG)(ULONG_PTR)p__wine_get_unix_opcode();
 
     if (wow64info->CpuFlags & WOW64_CPUFLAGS_SOFTWARE) create_cross_process_work_list( wow64info );
 
@@ -899,7 +1084,9 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
  */
 static void thread_init(void)
 {
-    NtCurrentTeb32()->WOW32Reserved = PtrToUlong( pBTCpuGetBopCode() );
+    /* BTCpuGetBopCode() returns a GUEST address — store verbatim */
+    check_guest_addr( "WOW32Reserved (BTCpuGetBopCode)", pBTCpuGetBopCode() );
+    NtCurrentTeb32()->WOW32Reserved = (ULONG)(ULONG_PTR)pBTCpuGetBopCode();
     NtCurrentTeb()->TlsSlots[WOW64_TLS_WOW64INFO] = wow64info;
     if (pBTCpuThreadInit) pBTCpuThreadInit();
 
@@ -912,15 +1099,15 @@ static void thread_init(void)
             ULONG *stack;
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            ctx_ptr = (I386_CONTEXT *)ULongToPtr( ctx.Esp ) - 1;
+            ctx_ptr = (I386_CONTEXT *)guest_ptr32( ctx.Esp ) - 1;
             *ctx_ptr = ctx;
             stack = (ULONG *)ctx_ptr;
             *(--stack) = 0;
             *(--stack) = 0;
             *(--stack) = 0;
-            *(--stack) = PtrToUlong( ctx_ptr );
+            *(--stack) = host_ptr32( ctx_ptr );
             *(--stack) = 0xdeadbabe;
-            ctx.Esp = PtrToUlong( stack );
+            ctx.Esp = host_ptr32( stack );
             ctx.Eip = pLdrSystemDllInitBlock->pLdrInitializeThunk;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
         }
@@ -931,11 +1118,11 @@ static void thread_init(void)
             ARM_CONTEXT *ctx_ptr, ctx = { CONTEXT_ARM_FULL };
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            ctx_ptr = (ARM_CONTEXT *)ULongToPtr( ctx.Sp & ~15 ) - 1;
+            ctx_ptr = (ARM_CONTEXT *)guest_ptr32( ctx.Sp & ~15 ) - 1;
             *ctx_ptr = ctx;
 
-            ctx.R0 = PtrToUlong( ctx_ptr );
-            ctx.Sp = PtrToUlong( ctx_ptr );
+            ctx.R0 = host_ptr32( ctx_ptr );
+            ctx.Sp = host_ptr32( ctx_ptr );
             ctx.Pc = pLdrSystemDllInitBlock->pLdrInitializeThunk;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
         }
@@ -1164,7 +1351,7 @@ void WINAPI Wow64ApcRoutine( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, CON
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
-            stack = (struct apc_stack_layout32 *)ULongToPtr( ctx.Esp & ~3 ) - 1;
+            stack = (struct apc_stack_layout32 *)guest_ptr32( ctx.Esp & ~3 ) - 1;
             stack->func      = arg1 >> 32;
             stack->arg1      = arg1;
             stack->arg2      = arg2;
@@ -1178,7 +1365,7 @@ void WINAPI Wow64ApcRoutine( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, CON
             stack->xctx.XState.Offset = 25;
             stack->xctx.XState.Length = 0;
 
-            ctx.Esp = PtrToUlong( stack );
+            ctx.Esp = host_ptr32( stack );
             ctx.Eip = pLdrSystemDllInitBlock->pKiUserApcDispatcher;
             frame.wow_context = &stack->context;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
@@ -1197,12 +1384,12 @@ void WINAPI Wow64ApcRoutine( ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, CON
             ARM_CONTEXT ctx = { CONTEXT_ARM_FULL };
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            stack = (struct apc_stack_layout *)ULongToPtr( ctx.Sp & ~15 ) - 1;
+            stack = (struct apc_stack_layout *)guest_ptr32( ctx.Sp & ~15 ) - 1;
             stack->func = arg1 >> 32;
             stack->context = ctx;
-            ctx.Sp = PtrToUlong( stack );
+            ctx.Sp = host_ptr32( stack );
             ctx.Pc = pLdrSystemDllInitBlock->pKiUserApcDispatcher;
-            ctx.R0 = PtrToUlong( &stack->context );
+            ctx.R0 = host_ptr32( &stack->context );
             ctx.R1 = arg1;
             ctx.R2 = arg2;
             ctx.R3 = arg3;
@@ -1258,15 +1445,15 @@ NTSTATUS WINAPI Wow64KiUserCallbackDispatcher( ULONG id, void *args, ULONG len,
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
             orig_ctx = ctx;
 
-            stack = ULongToPtr( (ctx.Esp - offsetof(struct callback_stack_layout32,args_data[len])) & ~15 );
+            stack = guest_ptr32( (ctx.Esp - offsetof(struct callback_stack_layout32,args_data[len])) & ~15 );
             stack->eip  = ctx.Eip;
             stack->id   = id;
-            stack->args = PtrToUlong( stack->args_data );
+            stack->args = host_ptr32( stack->args_data );
             stack->len  = len;
             stack->esp  = ctx.Esp;
             memcpy( stack->args_data, args, len );
 
-            ctx.Esp = PtrToUlong( stack );
+            ctx.Esp = host_ptr32( stack );
             ctx.Eip = pLdrSystemDllInitBlock->pKiUserCallbackDispatcher;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
@@ -1285,13 +1472,13 @@ NTSTATUS WINAPI Wow64KiUserCallbackDispatcher( ULONG id, void *args, ULONG len,
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
             orig_ctx = ctx;
 
-            args_data = ULongToPtr( (ctx.Sp - len) & ~15 );
+            args_data = guest_ptr32( (ctx.Sp - len) & ~15 );
             memcpy( args_data, args, len );
 
             ctx.R0 = id;
-            ctx.R1 = PtrToUlong( args_data );
+            ctx.R1 = host_ptr32( args_data );
             ctx.R2 = len;
-            ctx.Sp = PtrToUlong( args_data );
+            ctx.Sp = host_ptr32( args_data );
             ctx.Pc = pLdrSystemDllInitBlock->pKiUserCallbackDispatcher;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
 
@@ -1473,7 +1660,13 @@ NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec )
         ctx32.i386.ContextFlags = CONTEXT_I386_ALL;
         pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx32.i386 );
         if (code == -1) break;
-        int_rec.ExceptionAddress = (void *)(ULONG_PTR)ctx32.i386.Eip;
+        /* WOW64_DESIGN.md §3: this function SYNTHESISES a 64-bit record out
+         * of guest register values, and exception_record_64to32() below then
+         * applies the single uniform -B.  So anything built from a guest
+         * value has to be turned into a host address here first, or it gets
+         * -B applied twice.  (Same rule the FEX WoW64 module follows for the
+         * records it hands back: they stay host-side.) */
+        int_rec.ExceptionAddress = guest_ptr32( ctx32.i386.Eip );
         switch (code)
         {
         case 0x00:  /* division by zero */
@@ -1486,7 +1679,7 @@ NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec )
             break;
         case 0x03:  /* breakpoint */
             int_rec.ExceptionCode = EXCEPTION_BREAKPOINT;
-            int_rec.ExceptionAddress = (void *)(ULONG_PTR)(ctx32.i386.Eip - 1);
+            int_rec.ExceptionAddress = guest_ptr32( ctx32.i386.Eip - 1 );
             int_rec.NumberParameters = 1;
             break;
         case 0x04:  /* overflow */
@@ -1518,15 +1711,19 @@ NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec )
             ctx32.i386.Eip += 3;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx32.i386 );
             int_rec.ExceptionCode    = EXCEPTION_BREAKPOINT;
-            int_rec.ExceptionAddress = (void *)(ULONG_PTR)ctx32.i386.Eip;
+            int_rec.ExceptionAddress = guest_ptr32( ctx32.i386.Eip );
             int_rec.NumberParameters = 1;
             int_rec.ExceptionInformation[0] = ctx32.i386.Eax;
             break;
         default:
             int_rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
-            int_rec.ExceptionAddress = (void *)(ULONG_PTR)ctx32.i386.Eip;
+            int_rec.ExceptionAddress = guest_ptr32( ctx32.i386.Eip );
             int_rec.NumberParameters = 2;
-            int_rec.ExceptionInformation[1] = 0xffffffff;
+            /* 0xffffffff is the guest-visible "unknown address" sentinel, and
+             * this is an ACCESS_VIOLATION, so exception_record_64to32() will
+             * apply -B to it.  Store it host-side so it round-trips back to
+             * exactly 0xffffffff. */
+            int_rec.ExceptionInformation[1] = (ULONG_PTR)guest_ptr32( 0xffffffff );
             break;
         }
         *rec = int_rec;

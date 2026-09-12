@@ -38,6 +38,37 @@ extern DECLSPEC_EXPORT NTSTATUS __wine_unix_lib_init(void);
 extern DECLSPEC_EXPORT const unixlib_entry_t __wine_unix_call_funcs[];
 extern DECLSPEC_EXPORT const unixlib_entry_t __wine_unix_call_wow64_funcs[];
 
+/* iOS-Madeira, WoW64 guest window (WOW64_DESIGN.md §2).
+ *
+ * An entry in __wine_unix_call_wow64_funcs receives its `args` block as a
+ * HOST pointer — the WoW64 module converts that one outer pointer.  Every
+ * pointer EMBEDDED in the block is still a 32-bit GUEST address and must be
+ * turned into a host address with + B before it is dereferenced, which is
+ * exactly what the ULongToPtr in those thunks used to assume was a no-op.
+ *
+ * ios_wow_host_ptr() is that conversion, NULL-preserving.  ios_wow_base()
+ * lives in ntdll's unix side and is 0 for a process with no guest window, so
+ * on every other platform (and for a 64-bit caller) this is byte-for-byte the
+ * ULongToPtr it replaces.  The reverse direction (a host pointer written back
+ * into a 32-bit field) is ios_wow_guest_ptr32(). */
+#ifndef __MADEIRA_IOS_WOW_HOST_PTR
+#define __MADEIRA_IOS_WOW_HOST_PTR
+#ifdef WINE_IOS
+extern ULONG_PTR ios_wow_base(void);
+static inline void *ios_wow_host_ptr( ULONG addr )
+{
+    return addr ? (void *)(ios_wow_base() + (ULONG_PTR)addr) : NULL;
+}
+static inline ULONG ios_wow_guest_ptr32( const void *host )
+{
+    return host ? (ULONG)((ULONG_PTR)host - ios_wow_base()) : 0;
+}
+#else
+static inline void *ios_wow_host_ptr( ULONG addr ) { return ULongToPtr( addr ); }
+static inline ULONG ios_wow_guest_ptr32( const void *host ) { return PtrToUlong( host ); }
+#endif
+#endif /* __MADEIRA_IOS_WOW_HOST_PTR */
+
 /* some useful private helpers from ntdll */
 
 #ifdef __WINESRC__
