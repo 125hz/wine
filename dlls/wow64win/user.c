@@ -1657,6 +1657,10 @@ NTSTATUS WINAPI wow64_NtUserBuildPropList( UINT *args )
     return NtUserBuildPropList( hwnd, count, props, ret_count );
 }
 
+/* MADEIRA: audited against dlls/win32u/window.c NtUserCallHwnd -- every code
+ * takes only the hwnd, and every return value is a handle, a scalar, or an
+ * opaque 32-bit value the guest itself stored (GetDialogInfo,
+ * GetMDIClientInfo).  Nothing to convert in either direction. */
 NTSTATUS WINAPI wow64_NtUserCallHwnd( UINT *args )
 {
     HWND hwnd = get_handle( &args );
@@ -1702,6 +1706,7 @@ NTSTATUS WINAPI wow64_NtUserCallHwndParam( UINT *args )
         }
 
     case NtUserCallHwndParam_GetClientRect:
+    case NtUserCallHwndParam_GetPresentRect:
         {
             struct
             {
@@ -1749,6 +1754,27 @@ NTSTATUS WINAPI wow64_NtUserCallHwndParam( UINT *args )
             return NtUserCallHwndParam( hwnd, (UINT_PTR)&params, code );
         }
 
+    /* MADEIRA: `param` is a flat pointer whose target is layout-identical on
+     * both sides, so only the pointer itself needs the guest window. */
+    case NtUserCallHwndParam_ClientToScreen:        /* POINT * (in/out) */
+    case NtUserCallHwndParam_ScreenToClient:        /* POINT * (in/out) */
+    case NtUserCallHwndParam_GetChildRect:          /* RECT * (out) */
+    case NtUserCallHwndParam_GetWindowInfo:         /* WINDOWINFO * (in/out, 60 bytes both) */
+    case NtUserCallHwndParam_GetWindowThread:       /* DWORD * (out, may be NULL) */
+    case NtUserCallHwndParam_ExposeWindowSurface:   /* struct expose_window_surface_params * */
+    case NtUserCallHwndParam_SetRawWindowPos:       /* struct set_raw_window_pos_params * */
+        return NtUserCallHwndParam( hwnd, (UINT_PTR)guest_ptr32( param ), code );
+
+    /* MADEIRA, deliberately NOT converted (invariant 4):
+     * - GetClassLong{,Ptr}{A,W}, GetClassWord, GetWindowLong{,Ptr}{A,W},
+     *   GetWindowWord, GetWindowRelative, MonitorFromWindow, GetWinMonitorDpi:
+     *   scalars (an offset, a relation, a flag set).
+     * - IsChild, MirrorRgn: handles.
+     * - SetDialogInfo, SetMDIClientInfo: opaque 32-bit values that win32u only
+     *   stores (window.c set_dialog_info / NtUserSetWindowLongPtr) and hands
+     *   back verbatim through NtUserCallHwnd_GetDialogInfo /
+     *   NtUserCallHwnd_GetMDIClientInfo.  They never leave the guest namespace,
+     *   so offsetting them here would corrupt the round trip. */
     default:
         return NtUserCallHwndParam( hwnd, param, code );
     }
@@ -1776,6 +1802,8 @@ NTSTATUS WINAPI wow64_NtUserCallNextHookEx( UINT *args )
     return NtUserCallNextHookEx( hhook, code, wparam, lparam );
 }
 
+/* MADEIRA: audited against dlls/win32u/sysparams.c NtUserCallNoParam -- no
+ * argument at all and every result is a handle or a scalar.  Nothing to do. */
 NTSTATUS WINAPI wow64_NtUserCallNoParam( UINT *args )
 {
     ULONG code = get_ulong( &args );
@@ -1783,12 +1811,47 @@ NTSTATUS WINAPI wow64_NtUserCallNoParam( UINT *args )
     return NtUserCallNoParam( code );
 }
 
+/* MADEIRA (WOW64_DESIGN.md invariants 1, 2 and 4).  The NtUserCall* family is
+ * a set of multiplexed syscalls: the same ULONG_PTR argument is a scalar for
+ * one code, a handle for another and a POINTER for a third, so there is no way
+ * to convert it without switching on the code.  Upstream forwards the raw
+ * ULONG because classic WoW64 has guest address == host address; under a
+ * shifted guest window every pointer-valued code must go through guest_ptr32()
+ * (NULL-preserving, `+B`) before native win32u dereferences it, and handles,
+ * scalars, guest callbacks and opaque round-tripped values must NOT be touched.
+ *
+ * The classification below is taken code by code from win32u's own dispatch
+ * (dlls/win32u/sysparams.c NtUserCallNoParam/OneParam/TwoParam and
+ * dlls/win32u/window.c NtUserCallHwnd/NtUserCallHwndParam).  Every structure
+ * reached this way is layout-identical on i386 and ARM64 (RECT, POINT,
+ * WINDOWINFO, the ntuser.h `*_params` blocks, D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME
+ * and struct free_icon_params are all fixed-width fields), so converting the
+ * pointer is sufficient and no marshalling copy is needed.  The two exceptions
+ * that do need a copy -- MENUINFO for GetMenuInfo and the nested pointers in
+ * the CallHwndParam blocks -- already had one. */
+
 NTSTATUS WINAPI wow64_NtUserCallOneParam( UINT *args )
 {
     ULONG_PTR arg = get_ulong( &args );
     ULONG code = get_ulong( &args );
 
-    return NtUserCallOneParam( arg, code );
+    switch (code)
+    {
+    /* pointer arguments: convert, the pointed-to layout is identical */
+    case NtUserCallOneParam_GetPrimaryMonitorRect:       /* RECT * (out) */
+    case NtUserCallOneParam_GetAsyncKeyboardState:       /* BYTE[256] (out) */
+    case NtUserCallOneParam_D3DKMTOpenAdapterFromGdiDisplayName: /* D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME * (in/out) */
+    case NtUserGetDeskPattern:                           /* WCHAR[256] (out) */
+        return NtUserCallOneParam( (ULONG_PTR)guest_ptr32( arg ), code );
+
+    /* everything else is a scalar (CreateCursorIcon, GetSysColor{,Brush,Pen},
+     * GetSystemMetrics, SetKeyboardAutoRepeat, SetThreadDpiAwarenessContext),
+     * a handle (EnableDC, GetIconParam, GetMenuItemCount) or a guest callback
+     * that win32u only ever hands back to the 32-bit side (EnableThunkLock) --
+     * invariant 4, never offset. */
+    default:
+        return NtUserCallOneParam( arg, code );
+    }
 }
 
 NTSTATUS WINAPI wow64_NtUserCallTwoParam( UINT *args )
@@ -1821,6 +1884,30 @@ NTSTATUS WINAPI wow64_NtUserCallTwoParam( UINT *args )
             return TRUE;
         }
 
+    /* arg2 is a pointer, arg1 a handle or a scalar */
+    case NtUserCallTwoParam_GetMonitorInfo:       /* MONITORINFO(EX) * (in/out) */
+    case NtUserCallTwoParam_SetIMECompositionRect: /* const RECT * (in) */
+    case NtUserCallTwoParam_SetIconParam:         /* struct free_icon_params * (in);
+                                                   * its `callback` is a guest callback
+                                                   * that KeUserModeCallback hands back
+                                                   * to the 32-bit side -- not offset */
+        return NtUserCallTwoParam( arg1, (ULONG_PTR)guest_ptr32( arg2 ), code );
+
+    /* arg1 is a pointer, arg2 a scalar */
+    case NtUserCallTwoParam_MonitorFromRect:      /* const RECT * (in) */
+    case NtUserCallTwoParam_GetVirtualScreenRect: /* RECT * (out) */
+        return NtUserCallTwoParam( (ULONG_PTR)guest_ptr32( arg1 ), arg2, code );
+
+    /* both are pointers */
+    case NtUserCallTwoParam_AdjustWindowRect:     /* RECT * (in/out) +
+                                                   * struct adjust_window_rect_params * (in) */
+        return NtUserCallTwoParam( (ULONG_PTR)guest_ptr32( arg1 ),
+                                   (ULONG_PTR)guest_ptr32( arg2 ), code );
+
+    /* GetDialogProc (arg1 is a guest DLGPROC / winproc handle that win32u only
+     * stores and hands back), GetSystemMetricsForDpi (two scalars) and
+     * NtUserAllocWinProc (arg1 is a guest WNDPROC) are invariant 4: never
+     * offset. */
     default:
         return NtUserCallTwoParam( arg1, arg2, code );
     }
