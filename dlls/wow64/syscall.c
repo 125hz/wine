@@ -1554,7 +1554,18 @@ void WINAPI Wow64PrepareForException( EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     EXCEPTION_POINTERS ptrs = { rec, context };
 
-    pBTCpuResetToConsistentState( &ptrs );
+    /* iOS-Madeira: this is the ONE BTCpu entry point wow64 called without a
+     * NULL check (every other optional one is guarded, cf. virtual.c:167).
+     * pBTCpuResetToConsistentState is only bound at GET_PTR time in
+     * process_init(), i.e. AFTER load_cpu_dll() has finished; the CPU backend
+     * here is a full C++ module that drags in the native ucrtbase/kernel32/
+     * kernelbase, so a native fault raised while those DllMains run reaches
+     * KiUserExceptionDispatcher -> Wow64PrepareForException with the pointer
+     * still NULL, and `blr x8` branched to 0 -- turning one survivable access
+     * violation into an unrecoverable redelivery storm.  Skipping the
+     * consistency fixup is correct in that window: there is no guest context
+     * to reset, the fault is native. */
+    if (pBTCpuResetToConsistentState) pBTCpuResetToConsistentState( &ptrs );
 }
 #endif
 

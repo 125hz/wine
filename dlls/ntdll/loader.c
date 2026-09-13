@@ -5637,7 +5637,41 @@ void loader_init( CONTEXT *context, void **entry )
         if (!default_load_path)
             get_dll_load_path( peb->ProcessParameters->ImagePathName.Buffer, NULL, dll_safe_mode, &default_load_path );
 
-        if (NtCurrentTeb()->WowTebOffset) init_wow64( context );
+        if (NtCurrentTeb()->WowTebOffset)
+        {
+            /* iOS-Madeira: init_wow64() never returns -- it tail-calls
+             * Wow64LdrpInitialize(), which runs the 32-bit process for the rest
+             * of this thread's life.  So for a WoW64 pseudo-process NOTHING
+             * below this point in loader_init() ever executes, including both
+             * locale_init() calls.  The NATIVE ntdll's `nls_info`
+             * (dlls/ntdll/locale.c:42) therefore keeps its static initialiser
+             * and UpperCaseTable/LowerCaseTable stay NULL, so any native call
+             * that reaches casemap() -- RtlUpcaseUnicodeString,
+             * RtlPrefixUnicodeString, upcase_unicode_to_utf8, ... -- reads
+             * through a NULL table.  Upstream never notices because on Windows
+             * nothing but wow64.dll/wow64win.dll runs 64-bit in a WoW64
+             * process; here the CPU backend (xtajit.dll) is a full C++ module
+             * that pulls in the native ucrtbase/kernel32/kernelbase, whose
+             * process-attach code does upcase string work.
+             *
+             * Each pseudo-process also gets a PRIVATE copy of ntdll's .data
+             * (build/ntdll-unix/virtual_ios.c, "[child-ntdll] copied ..."), so
+             * an initialised table can never be inherited from the parent
+             * either: every process must run locale_init() itself.
+             *
+             * Same reasoning (and same safety argument) as the arm64ec early
+             * call below: RtlQueryActivationContextApplicationSettings is the
+             * only actctx dependency and fails gracefully with no actctx.
+             *
+             * Only the 64-bit build needs this: the 32-bit ntdll's init_wow64()
+             * (the #else one, ~200 lines above) returns normally, so its own
+             * locale_init() below still runs. */
+#ifdef _WIN64
+            locale_init();
+            ERR( "loader_init: [iOS] wow64 early locale_init done (casemap wired before Wow64LdrpInitialize)\n" );
+#endif
+            init_wow64( context );  /* 64-bit: does not return */
+        }
 
         wm = build_main_module();
         build_ntdll_module();

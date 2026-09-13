@@ -47,6 +47,16 @@ static const WCHAR *locale_strings;
 
 static WCHAR casemap( USHORT *table, WCHAR ch )
 {
+    /* iOS-Madeira: several callers below (RtlUpcaseUnicodeChar/String,
+     * RtlDowncaseUnicodeString, RtlPrefixUnicodeString,
+     * RtlUpcaseUnicodeToCustomCPN, upcase_unicode_to_utf8) pass nls_info's
+     * table without checking it, while RtlCompareUnicodeStrings and
+     * RtlHashUnicodeString do check and fall back to ASCII "locale not setup
+     * yet".  Make that fallback the property of casemap() itself so an
+     * uninitialised nls_info can never turn into a read through NULL --
+     * every pseudo-process here has its own private ntdll .data copy, so
+     * "not set up yet" is a reachable state on more paths than upstream. */
+    if (!table) return casemap_ascii( ch );
     return ch + table[table[table[ch >> 8] + ((ch >> 4) & 0x0f)] + (ch & 0x0f)];
 }
 
