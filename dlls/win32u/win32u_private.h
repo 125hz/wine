@@ -355,6 +355,32 @@ extern struct client_surface *nulldrv_client_surface_create( HWND hwnd );
 
 extern ULONG_PTR zero_bits;
 
+#ifdef WINE_IOS
+/* iOS-Madeira: upstream's `zero_bits` is a win32u PROCESS global, set once at
+ * unix-lib init from the WoW64 TEB.  On Madeira every Windows process is a
+ * pseudo-process thread inside ONE Mach task sharing ONE win32u instance, so
+ * that "process global" is really task-global and answers wrongly for every
+ * process but the one that set it (a 32-bit process poisons the 64-bit desktop
+ * with an unsatisfiable low-2GB ceiling; a cleared global hands a 32-bit guest
+ * host pointers it truncates into garbage).  Every zero_bits consumer therefore
+ * asks the CALLING pseudo-process.  Defined in build/win32u-unix/syscall_ios.c. */
+extern ULONG_PTR win32u_zero_bits(void);
+
+/* Publish the GDI shared handle table into the calling pseudo-process's PEB,
+ * mapping a second view of the table inside its guest window first if it is a
+ * 32-bit process (gdiobj.c).  The __thread flag makes the steady-state check
+ * one load and one compare. */
+extern __thread void *win32u_gdi_published_peb;
+extern void win32u_gdi_publish_shared(void);
+static inline void win32u_gdi_check_publish(void)
+{
+    if (win32u_gdi_published_peb != NtCurrentTeb()->Peb) win32u_gdi_publish_shared();
+}
+#else
+static inline ULONG_PTR win32u_zero_bits(void) { return zero_bits; }
+static inline void win32u_gdi_check_publish(void) { }
+#endif
+
 static inline BOOL set_ntstatus( NTSTATUS status )
 {
     if (status) RtlSetLastWin32Error( RtlNtStatusToDosError( status ));
