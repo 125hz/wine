@@ -202,8 +202,62 @@ static void DECLSPEC_NORETURN stub_syscall( const char *name )
 #define SYSCALL_STUB(name) NTSTATUS WINAPI wow64_ ## name( UINT *args ) { stub_syscall( #name ); }
 ALL_SYSCALL_STUBS
 
+/* WOW64_DESIGN.md §3 invariant 5: most ExceptionInformation[] entries are
+ * scalars (access type, length, thread id, NTSTATUS, ordinal, __fastfail code)
+ * and must NEVER be offset — but a handful are ADDRESSES by contract, and
+ * those cross the window boundary like any other pointer.  Fill `is_ptr[]`
+ * with the ones that do.
+ *
+ * `info` must be the entries in the namespace being converted FROM.  The one
+ * value-dependent test (EXCEPTION_WINE_STUB's function-name-or-ordinal) is
+ * stable in both namespaces: an ordinal is <= 0xffff on both sides, and any
+ * real pointer is > 0xffff as a guest address and >= 4 GB as a host one, so
+ * the record round-trips exactly.
+ */
+static void get_exception_info_ptrs( DWORD code, ULONG count, const ULONG_PTR *info,
+                                     BOOL is_ptr[EXCEPTION_MAXIMUM_PARAMETERS] )
+{
+    unsigned int i;
+
+    for (i = 0; i < EXCEPTION_MAXIMUM_PARAMETERS; i++) is_ptr[i] = FALSE;
+    if (count > EXCEPTION_MAXIMUM_PARAMETERS) count = EXCEPTION_MAXIMUM_PARAMETERS;
+
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_IN_PAGE_ERROR:
+        /* [0] access type, [1] FAULTING ADDRESS, [2] (in-page) NTSTATUS */
+        if (count >= 2) is_ptr[1] = TRUE;
+        break;
+
+    case EXCEPTION_WINE_NAME_THREAD:
+        /* [0] 0x1000 magic, [1] const char *name, [2] thread id.  Raised by
+         * 32-bit code (RaiseException from a debugger-style SetThreadName) and
+         * consumed by the 64-bit ntdll's dispatch_exception, which prints the
+         * name and passes it to set_native_thread_name — one SEGV per raise
+         * until the pointer converts. */
+        if (count >= 2 && info[0] == 0x1000) is_ptr[1] = TRUE;
+        break;
+
+    case EXCEPTION_WINE_STUB:
+        /* [0] const char *module, [1] const char *function OR an ordinal —
+         * dispatch_exception discriminates with the same `>> 16` test. */
+        if (count >= 1) is_ptr[0] = TRUE;
+        if (count >= 2 && (info[1] >> 16)) is_ptr[1] = TRUE;
+        break;
+
+    case DBG_PRINTEXCEPTION_C:
+    case DBG_PRINTEXCEPTION_WIDE_C:
+        /* [0] length in characters, [1] the string (char * / WCHAR *) */
+        if (count >= 2) is_ptr[1] = TRUE;
+        break;
+    }
+}
+
+
 static EXCEPTION_RECORD *exception_record_32to64( const EXCEPTION_RECORD32 *rec32 )
 {
+    BOOL is_ptr[EXCEPTION_MAXIMUM_PARAMETERS];
     EXCEPTION_RECORD *rec;
     unsigned int i;
 
@@ -215,19 +269,24 @@ static EXCEPTION_RECORD *exception_record_32to64( const EXCEPTION_RECORD32 *rec3
     rec->NumberParameters = rec32->NumberParameters;
     for (i = 0; i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
         rec->ExceptionInformation[i] = rec32->ExceptionInformation[i];
-    /* WOW64_DESIGN.md §3 invariant 5: for an access violation / in-page error
-     * ExceptionInformation[1] is the FAULTING ADDRESS, not a scalar, so it
-     * converts like any other pointer.  [0] is the access type and [2] (page
-     * error) is an NTSTATUS — both stay as they are. */
-    if ((rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
-         rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && rec->NumberParameters >= 2)
-        rec->ExceptionInformation[1] = (ULONG_PTR)guest_ptr32( rec32->ExceptionInformation[1] );
+
+    /* The record built here is the one NtRaiseException and the 64-bit ntdll's
+     * dispatch_exception see, so its addresses must be HOST addresses.  The
+     * caller keeps rec32 and hands THAT to the 32-bit KiUserExceptionDispatcher
+     * (see raise_exception), so the guest's own filters still read guest
+     * values — the two records are never the same storage. */
+    get_exception_info_ptrs( rec->ExceptionCode, rec->NumberParameters,
+                             rec->ExceptionInformation, is_ptr );
+    for (i = 0; i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
+        if (is_ptr[i])
+            rec->ExceptionInformation[i] = (ULONG_PTR)guest_ptr32( rec32->ExceptionInformation[i] );
     return rec;
 }
 
 
 static void exception_record_64to32( EXCEPTION_RECORD32 *rec32, const EXCEPTION_RECORD *rec )
 {
+    BOOL is_ptr[EXCEPTION_MAXIMUM_PARAMETERS];
     unsigned int i;
 
     rec32->ExceptionCode    = rec->ExceptionCode;
@@ -235,12 +294,15 @@ static void exception_record_64to32( EXCEPTION_RECORD32 *rec32, const EXCEPTION_
     rec32->ExceptionRecord  = host_ptr32( rec->ExceptionRecord );
     rec32->ExceptionAddress = host_ptr32( rec->ExceptionAddress );
     rec32->NumberParameters = rec->NumberParameters;
-    for (i = 0; i < rec->NumberParameters; i++)
+    for (i = 0; i < rec->NumberParameters && i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
         rec32->ExceptionInformation[i] = rec->ExceptionInformation[i];
-    /* WOW64_DESIGN.md §3 invariant 5 — see exception_record_32to64. */
-    if ((rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
-         rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && rec->NumberParameters >= 2)
-        rec32->ExceptionInformation[1] = host_ptr32( (void *)rec->ExceptionInformation[1] );
+
+    /* Same catalogue the other way round — see exception_record_32to64. */
+    get_exception_info_ptrs( rec->ExceptionCode, rec->NumberParameters,
+                             rec->ExceptionInformation, is_ptr );
+    for (i = 0; i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
+        if (is_ptr[i])
+            rec32->ExceptionInformation[i] = host_ptr32( (void *)rec->ExceptionInformation[i] );
 }
 
 
@@ -939,6 +1001,87 @@ static const WCHAR *get_cpu_dll_name( const WCHAR **platform_default )
 }
 
 
+/* MADEIRA (WOW64_DESIGN.md §4): Wine-private MEMORY_INFORMATION_CLASS that
+ * maps a PE image VA to the executable JIT-pool copy of the same code.  Kept
+ * local to the two files that implement and use it (this one and
+ * build/ntdll-unix/virtual_ios.c); 1000..1004 are the MemoryWine* block. */
+#define MemoryWineIosJitPoolAddress ((MEMORY_INFORMATION_CLASS)1005)
+
+/**********************************************************************
+ *           jit_pool_code_ptr
+ *
+ * On the iOS port PE code cannot execute at its mapped address: every image's
+ * code is copied into the dual-mapped JIT pool and a Mach exception handler
+ * redirects a PC that lands on the PE address to the pool copy.  That redirect
+ * is a full kernel round-trip, so a function pointer that is CALLED repeatedly
+ * must hold the pool address, not the PE address.
+ *
+ * Pointers that live inside a pool-copied image are repaired in bulk by the
+ * ntdll-side [iat-sync] sweep, and stragglers by [stale-heal] after 256 faults.
+ * Neither can repair a table that is read from the PE view of a read-only
+ * section — see the comment on MemoryWineIosJitPoolAddress in virtual_ios.c.
+ * This asks for the pool address explicitly instead.
+ *
+ * Returns `addr` unchanged on every platform whose ntdll does not know the
+ * class (i.e. everywhere but the iOS port) and for any address that is not
+ * inside a pool-copied image, so it is a no-op there and idempotent here.
+ */
+static void *jit_pool_code_ptr( void *addr )
+{
+    ULONG_PTR pool = 0;
+
+    if (!addr) return NULL;
+    if (NtQueryVirtualMemory( GetCurrentProcess(), addr, MemoryWineIosJitPoolAddress,
+                              &pool, sizeof(pool), NULL ))
+        return addr;
+    return pool ? (void *)pool : addr;
+}
+
+
+/**********************************************************************
+ *           init_syscall_table_pool_copy
+ *
+ * Replace one syscall table's ServiceTable with a private writable array whose
+ * entries are the JIT-pool addresses of the thunks.
+ *
+ * syscall_tables[1] is a struct copy of wow64win.dll's exported sdwhwin32,
+ * whose ServiceTable points into wow64win.dll's READ-ONLY .rdata at its PE
+ * address and holds PE addresses.  Every NtUser or NtGdi call from 32-bit code
+ * therefore branched to a PE address and paid one Mach exception; the pool
+ * copy of that .rdata is already translated, so the [stale-heal] exact-value
+ * scan found nothing to rewrite and the storm never ended (~500k redirects in
+ * one minute of a windowed 32-bit program).
+ *
+ * Doing it here, once, is deterministic: no fault threshold, no scan, and no
+ * dependence on which view of the table a later sweep happens to see.
+ */
+static void init_syscall_table_pool_copy( unsigned int idx, const char *name )
+{
+    SYSTEM_SERVICE_TABLE *table = &syscall_tables[idx];
+    ULONG_PTR *copy;
+    ULONG_PTR i;
+    unsigned int translated = 0;
+
+    if (!table->ServiceTable || !table->ServiceLimit) return;
+    if (!(copy = RtlAllocateHeap( GetProcessHeap(), 0, table->ServiceLimit * sizeof(*copy) )))
+    {
+        ERR( "no memory for %s service table copy\n", name );
+        return;
+    }
+    for (i = 0; i < table->ServiceLimit; i++)
+    {
+        void *pe = (void *)table->ServiceTable[i];
+        void *pool = jit_pool_code_ptr( pe );
+
+        copy[i] = (ULONG_PTR)pool;
+        if (pool != pe) translated++;
+    }
+    table->ServiceTable = copy;
+    if (translated)
+        ERR( "[wow-syscall] translated %u ServiceTable entries for %s\n", translated, name );
+}
+
+
 /**********************************************************************
  *           create_cross_process_work_list
  */
@@ -1042,6 +1185,41 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     module = load_64bit_module( L"wow64win.dll" );
     GET_PTR( sdwhwin32 );
     syscall_tables[1] = *psdwhwin32;
+
+    /* MADEIRA (WOW64_DESIGN.md §4): every pointer resolved above is a PE image
+     * address, and on this port PE code only executes out of the JIT pool.  A
+     * PE address stored in a pointer that is BRANCHED THROUGH costs one Mach
+     * exception per call, so translate the ones this dll calls, once, here.
+     *
+     * Only CALL targets are converted: pLdrSystemDllInitBlock and psdwhwin32
+     * are data, and the three 32-bit-ntdll exports resolved after this point
+     * live in the guest window, not in a pool-copied 64-bit image.
+     * jit_pool_code_ptr() is a no-op wherever the class is unknown. */
+#define XLATE_PTR(name) p ## name = jit_pool_code_ptr( p ## name )
+    XLATE_PTR( BTCpuGetBopCode );
+    XLATE_PTR( BTCpuGetContext );
+    XLATE_PTR( BTCpuIsProcessorFeaturePresent );
+    XLATE_PTR( BTCpuProcessInit );
+    XLATE_PTR( BTCpuThreadInit );
+    XLATE_PTR( BTCpuResetToConsistentState );
+    XLATE_PTR( BTCpuSetContext );
+    XLATE_PTR( BTCpuSimulate );
+    XLATE_PTR( BTCpuFlushInstructionCache2 );
+    XLATE_PTR( BTCpuFlushInstructionCacheHeavy );
+    XLATE_PTR( BTCpuNotifyMapViewOfSection );
+    XLATE_PTR( BTCpuNotifyMemoryAlloc );
+    XLATE_PTR( BTCpuNotifyMemoryDirty );
+    XLATE_PTR( BTCpuNotifyMemoryFree );
+    XLATE_PTR( BTCpuNotifyMemoryProtect );
+    XLATE_PTR( BTCpuNotifyReadFile );
+    XLATE_PTR( BTCpuNotifyUnmapViewOfSection );
+    XLATE_PTR( BTCpuUpdateProcessorInformation );
+    XLATE_PTR( BTCpuProcessTerm );
+    XLATE_PTR( BTCpuThreadTerm );
+    XLATE_PTR( __wine_get_unix_opcode );
+#undef XLATE_PTR
+    init_syscall_table_pool_copy( 0, "ntdll.dll" );
+    init_syscall_table_pool_copy( 1, "wow64win.dll" );
 
     pBTCpuProcessInit();
 

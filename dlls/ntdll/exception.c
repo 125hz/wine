@@ -274,6 +274,46 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
 }
 
 
+#ifdef _WIN64
+/* iOS-Madeira, WOW64_DESIGN.md §3 invariant 5 — DEFENCE IN DEPTH ONLY.
+ *
+ * Several exception codes carry pointers in ExceptionInformation[], and the
+ * conversion that turns a 32-bit guest address into a host one belongs at the
+ * wow64 boundary (exception_record_32to64).  If one is ever missed, this
+ * function dereferences a guest address as a host pointer and takes a SEGV in
+ * the middle of exception dispatch — an expensive fault/dump cycle per raise,
+ * and the information is lost anyway.
+ *
+ * In a process that owns a guest window B (the single source of truth is
+ * ProcessWineIosWowGuestBase), a sub-4 GB value in a NATIVE record is an exact
+ * impossibility, not a heuristic: XNU's mandatory 4 GB __PAGEZERO means no
+ * host mapping can ever exist below 4 GB.  Refuse the dereference and say so.
+ * B is 0 — and this always returns FALSE — on every build and every process
+ * that keeps the classic WoW64 identity. */
+static BOOL unconverted_guest_ptr( ULONG_PTR val )
+{
+    static ULONG_PTR guest_base = ~(ULONG_PTR)0;
+
+    if (!val || val >= (ULONG_PTR)0x100000000ull) return FALSE;
+    if (guest_base == ~(ULONG_PTR)0)
+    {
+        ULONG_PTR base = 0;
+
+        if (NtQueryInformationProcess( NtCurrentProcess(), ProcessWineIosWowGuestBase,
+                                       &base, sizeof(base), NULL ))
+            base = 0;
+        guest_base = base;
+    }
+    if (!guest_base) return FALSE;
+    ERR( "[exc-info] refusing to dereference %p: a 32-bit GUEST address reached native "
+         "exception dispatch unconverted (wow64 exception_record_32to64)\n", (void *)val );
+    return TRUE;
+}
+#else
+static BOOL unconverted_guest_ptr( ULONG_PTR val ) { return FALSE; }
+#endif
+
+
 /*******************************************************************
  *		dispatch_exception
  */
@@ -285,10 +325,14 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
     switch (rec->ExceptionCode)
     {
     case EXCEPTION_WINE_STUB:
+        if (unconverted_guest_ptr( rec->ExceptionInformation[0] )) break;
         if (rec->ExceptionInformation[1] >> 16)
+        {
+            if (unconverted_guest_ptr( rec->ExceptionInformation[1] )) break;
             MESSAGE( "wine: Call from %p to unimplemented function %s.%s, aborting\n",
                      rec->ExceptionAddress,
                      (char *)rec->ExceptionInformation[0], (char *)rec->ExceptionInformation[1] );
+        }
         else
             MESSAGE( "wine: Call from %p to unimplemented function %s.%u, aborting\n",
                      rec->ExceptionAddress,
@@ -301,6 +345,7 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
             const char *name = (char *)rec->ExceptionInformation[1];
             DWORD tid = (DWORD)rec->ExceptionInformation[2];
 
+            if (unconverted_guest_ptr( rec->ExceptionInformation[1] )) break;
             if (tid == -1 || tid == GetCurrentThreadId())
                 WARN_(threadname)( "Thread renamed to %s\n", debugstr_a(name) );
             else
@@ -310,10 +355,12 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         break;
 
     case DBG_PRINTEXCEPTION_C:
+        if (unconverted_guest_ptr( rec->ExceptionInformation[1] )) break;
         WARN( "%s\n", debugstr_an((char *)rec->ExceptionInformation[1], rec->ExceptionInformation[0] - 1) );
         break;
 
     case DBG_PRINTEXCEPTION_WIDE_C:
+        if (unconverted_guest_ptr( rec->ExceptionInformation[1] )) break;
         WARN( "%s\n", debugstr_wn((WCHAR *)rec->ExceptionInformation[1], rec->ExceptionInformation[0] - 1) );
         break;
 
