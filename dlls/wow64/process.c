@@ -161,7 +161,16 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
                 OBJECT_ATTRIBUTES attr;
                 UNICODE_STRING path;
 
+                /* §4 boundary: Value is the guest's 32-bit address of the image
+                 * name buffer.  Everything below dereferences it as a host
+                 * pointer — get_file_redirect()'s wcsnicmp right here, and the
+                 * 64-bit NtCreateUserProcess, which copies from path.Buffer —
+                 * so it converts ONCE, here.  (Before this, a 32-bit launcher
+                 * spawning a child faulted inside ntdll's _wcsnicmp on the raw
+                 * guest address.)  Size is a byte count and stays untouched. */
+                ret->Attributes[i].ValuePtr = guest_ptr32( attr32->Attributes[i].Value );
                 path.Length = ret->Attributes[i].Size;
+                path.MaximumLength = path.Length;
                 path.Buffer = ret->Attributes[i].ValuePtr;
                 InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
                 if (get_file_redirect( &attr ))
@@ -188,6 +197,12 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
         case PS_ATTRIBUTE_TOKEN:
             ret->Attributes[i].Size     = sizeof(HANDLE);
             ret->Attributes[i].ValuePtr = LongToHandle( attr32->Attributes[i].Value );
+            break;
+        case PS_ATTRIBUTE_GROUP_AFFINITY:
+            /* §4 boundary: an INPUT pointer to a GROUP_AFFINITY the 64-bit side
+             * dereferences (ntdll's update_attr_list).  The struct has the same
+             * layout for both word sizes, so only the pointer converts. */
+            ret->Attributes[i].ValuePtr = guest_ptr32( attr32->Attributes[i].Value );
             break;
         case PS_ATTRIBUTE_CLIENT_ID:
             ret->Attributes[i].Size     = sizeof(CLIENT_ID);

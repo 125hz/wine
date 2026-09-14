@@ -198,6 +198,10 @@ extern unsigned int supported_machines_count;
 extern USHORT supported_machines[8];
 extern BOOL process_exiting;
 extern HANDLE keyed_event;
+#ifdef WINE_IOS
+/* per-pseudo-process default keyed event (sync.c) — handle tables are not shared */
+extern HANDLE ios_default_keyed_event(void);
+#endif
 extern int inproc_device_fd;
 extern timeout_t server_start_time;
 extern sigset_t server_block_set;

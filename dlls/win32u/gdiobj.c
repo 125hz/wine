@@ -70,8 +70,29 @@ extern int dprintf( int fd, const char *fmt, ... );
  * window of each 32-bit pseudo-process.  Both views are the same memory, so
  * there is still exactly one table; only the address published in each
  * process's PEB differs.  A window address is also a valid host address, so
- * 64-bit code inside a WoW process reading the same PEB field still works. */
+ * 64-bit code inside a WoW process reading the same PEB field still works.
+ *
+ * The section must be a NAMED object.  wineserver handle tables are PER
+ * pseudo-process here, so the HANDLE returned by NtCreateSection is only
+ * meaningful inside the pseudo-process that happened to initialise win32u
+ * first (the 64-bit desktop): in any other one the same numeric handle names a
+ * different object, and NtMapViewOfSection fails with
+ * STATUS_OBJECT_TYPE_MISMATCH (0xc0000024) — which is exactly what a 32-bit
+ * CHILD process saw, leaving it with the truncated host address again.  The
+ * object NAMESPACE, unlike the handle tables, is session-wide, so each
+ * pseudo-process opens the section by name for itself. */
+static const WCHAR gdi_shared_nameW[] =
+    {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s','\\',
+     '_','_','w','i','n','e','_','i','o','s','_','g','d','i','_','s','h','a','r','e','d',0};
+/* fallback if \KernelObjects is not available in this prefix */
+static const WCHAR gdi_shared_name_bnoW[] =
+    {'\\','B','a','s','e','N','a','m','e','d','O','b','j','e','c','t','s','\\',
+     '_','_','w','i','n','e','_','i','o','s','_','g','d','i','_','s','h','a','r','e','d',0};
+
+/* valid only in the pseudo-process that created it; everyone else opens by name */
 static HANDLE gdi_shared_section;
+static void *win32u_gdi_creator_peb;
+static const WCHAR *gdi_shared_section_name;
 
 struct gdi_shared_view
 {
@@ -91,6 +112,26 @@ static int gdi_shared_view_next;
 static pthread_mutex_t gdi_shared_view_lock = PTHREAD_MUTEX_INITIALIZER;
 
 __thread void *win32u_gdi_published_peb;
+
+/***********************************************************************
+ *           open_gdi_shared_section
+ *
+ * Open the session's GDI table section IN THE CALLING pseudo-process's handle
+ * table.  Returns 0 when the table is not section-backed (or the name is gone),
+ * in which case the caller keeps the master host address and says so.
+ */
+static HANDLE open_gdi_shared_section(void)
+{
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES attr;
+    HANDLE handle = 0;
+
+    if (!gdi_shared_section_name) return 0;
+    RtlInitUnicodeString( &name, gdi_shared_section_name );
+    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+    if (NtOpenSection( &handle, SECTION_MAP_READ | SECTION_MAP_WRITE, &attr )) return 0;
+    return handle;
+}
 #endif
 
 static inline HGDIOBJ entry_to_handle( GDI_HANDLE_ENTRY *entry )
@@ -643,7 +684,15 @@ void win32u_gdi_publish_shared(void)
     if (i < gdi_shared_view_count) view = gdi_shared_views[i].view;
     else
     {
-        if (gdi_shared_section)
+        /* Per-pseudo-process handle tables: re-open the section by NAME here.
+         * gdi_shared_section itself only names the right object in the
+         * pseudo-process that created it. */
+        HANDLE section = open_gdi_shared_section();
+
+        if (!section && gdi_shared_section &&
+            NtCurrentTeb()->Peb == win32u_gdi_creator_peb) section = gdi_shared_section;
+
+        if (section)
         {
             void *guest_view = NULL;
             SIZE_T view_size = 0;
@@ -654,17 +703,19 @@ void win32u_gdi_publish_shared(void)
              * in build/ntdll-unix/virtual_ios.c turns it into this process's
              * window, and NtMapViewOfSection funnels through the same
              * chokepoint as NtAllocateVirtualMemory. */
-            status = NtMapViewOfSection( gdi_shared_section, GetCurrentProcess(), &guest_view,
+            status = NtMapViewOfSection( section, GetCurrentProcess(), &guest_view,
                                          win32u_zero_bits(), 0, &offset, &view_size,
                                          ViewShare, 0, PAGE_READWRITE );
             if (!status) view = guest_view;
             else
                 ERR( "[gdi-shared] peb=%p pid=%04x: no guest-window view (%#x) — 32-bit gdi32 "
                      "will truncate the host table pointer\n", peb, (int)pid, (int)status );
+            if (section != gdi_shared_section) NtClose( section );
         }
         else
-            ERR( "[gdi-shared] peb=%p pid=%04x: table is not section-backed — 32-bit gdi32 "
-                 "will truncate the host table pointer\n", peb, (int)pid );
+            ERR( "[gdi-shared] peb=%p pid=%04x: cannot open the session table section %s — "
+                 "32-bit gdi32 will truncate the host table pointer\n", peb, (int)pid,
+                 debugstr_w( gdi_shared_section_name ) );
 
         i = gdi_shared_view_next;
         gdi_shared_views[i].pid  = pid;
@@ -693,16 +744,36 @@ static void init_gdi_shared(void)
 #ifdef WINE_IOS
     {
         OBJECT_ATTRIBUTES attr;
+        UNICODE_STRING name;
         LARGE_INTEGER sec_size;
         SIZE_T view_size = 0;
         NTSTATUS status;
 
-        InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
+        /* NAMED (see gdi_shared_section above): every later pseudo-process has
+         * its own handle table and can only find this object by name.
+         * OBJ_OPENIF so a re-entry can never create a second table, and
+         * OBJ_PERMANENT so the name outlives whichever pseudo-process happened
+         * to initialise win32u first (wineserver marks its own session objects
+         * the same way — server/directory.c). */
+        gdi_shared_section_name = gdi_shared_nameW;
+        RtlInitUnicodeString( &name, gdi_shared_section_name );
+        InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE | OBJ_OPENIF | OBJ_PERMANENT,
+                                    NULL, NULL );
         sec_size.QuadPart = size;
         status = NtCreateSection( &gdi_shared_section, SECTION_ALL_ACCESS, &attr, &sec_size,
                                   PAGE_READWRITE, SEC_COMMIT, NULL );
-        if (!status)
+        if (status < 0)   /* e.g. \KernelObjects missing in this prefix */
         {
+            gdi_shared_section_name = gdi_shared_name_bnoW;
+            RtlInitUnicodeString( &name, gdi_shared_section_name );
+            status = NtCreateSection( &gdi_shared_section, SECTION_ALL_ACCESS, &attr, &sec_size,
+                                      PAGE_READWRITE, SEC_COMMIT, NULL );
+        }
+        /* OBJ_OPENIF reports STATUS_OBJECT_NAME_EXISTS (a success code) when it
+         * opened an existing object instead of creating one. */
+        if (status >= 0)
+        {
+            win32u_gdi_creator_peb = NtCurrentTeb()->Peb;
             /* master view: ALWAYS a plain host address (zero_bits 0), even when
              * the pseudo-process that happens to initialise win32u first is
              * 32-bit — this is session-wide state and a guest window does not
@@ -720,12 +791,15 @@ static void init_gdi_shared(void)
         else gdi_shared_section = 0;
 
         if (!gdi_shared)
+        {
+            gdi_shared_section_name = NULL;
             ERR( "[gdi-shared] no section-backed table (%#x) — falling back to a private "
                  "allocation; 32-bit pseudo-processes will not be able to address it\n",
                  (int)status );
+        }
         else
-            dprintf( 2, "[gdi-shared] session table %p (%lu bytes, section-backed)\n",
-                     gdi_shared, (unsigned long)size );
+            dprintf( 2, "[gdi-shared] session table %p (%lu bytes, section-backed, name=%s)\n",
+                     gdi_shared, (unsigned long)size, debugstr_w( gdi_shared_section_name ) );
     }
     if (!gdi_shared &&
         NtAllocateVirtualMemory( GetCurrentProcess(), (void **)&gdi_shared, 0,

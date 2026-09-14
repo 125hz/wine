@@ -2670,6 +2670,73 @@ NTSTATUS WINAPI NtOpenKeyedEvent( HANDLE *handle, ACCESS_MASK access, const OBJE
     return ret;
 }
 
+#ifdef WINE_IOS
+/* iOS-Madeira: the process-default keyed event (the one NtWaitForKeyedEvent /
+ * NtReleaseKeyedEvent substitute for a NULL handle — reached from
+ * RtlRunOnceBeginInitialize / RtlRunOnceComplete on contention) used to be a
+ * single anonymous handle created once during session boot.  Every Windows
+ * process here is a pseudo-process inside ONE Mach task but wineserver handle
+ * tables are PER pseudo-process, so that handle names a DIFFERENT object (or
+ * nothing) in every child — the same class of bug that made a 32-bit child's
+ * NtMapViewOfSection of the GDI shared section fail with
+ * STATUS_OBJECT_TYPE_MISMATCH.  The object NAMESPACE, by contrast, is
+ * session-wide, so the default keyed event is a NAMED object (the name Windows
+ * itself uses) that each pseudo-process opens into its own table, once.
+ * wineserver already creates that object permanently at startup
+ * (server/directory.c), so OBJ_OPENIF turns this into a plain open in one round
+ * trip and still works if it is ever absent.  Keys are addresses in the one
+ * shared address space, so they cannot collide between pseudo-processes and a
+ * single shared object pairs waiters and releasers correctly. */
+static const WCHAR ios_keyed_event_nameW[] =
+    {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s','\\',
+     'C','r','i','t','S','e','c','O','u','t','O','f','M','e','m','o','r','y','E','v','e','n','t',0};
+
+HANDLE ios_default_keyed_event(void)
+{
+    static struct { void *peb; HANDLE handle; } cache[16];
+    static unsigned int cache_count, cache_next;
+    static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
+    void *peb = NtCurrentTeb()->Peb;
+    HANDLE handle = 0;
+    unsigned int i;
+
+    pthread_mutex_lock( &cache_lock );
+    for (i = 0; i < cache_count; i++)
+        if (cache[i].peb == peb) { handle = cache[i].handle; break; }
+
+    if (i == cache_count)
+    {
+        UNICODE_STRING name = RTL_CONSTANT_STRING( ios_keyed_event_nameW );
+        OBJECT_ATTRIBUTES attr;
+        unsigned int status;
+
+        InitializeObjectAttributes( &attr, &name, OBJ_OPENIF | OBJ_CASE_INSENSITIVE, 0, NULL );
+        status = NtCreateKeyedEvent( &handle, GENERIC_READ | GENERIC_WRITE, &attr, 0 );
+        if (status && status != STATUS_OBJECT_NAME_EXISTS)
+        {
+            /* An anonymous one still belongs to THIS handle table, which is the
+             * property that was missing; RtlRunOnce keys are addresses in the
+             * one shared address space, so they never collide between
+             * pseudo-processes and a per-process object pairs correctly. */
+            ERR( "[keyed-event] peb=%p: cannot create/open %s (%#x) — using a private one\n",
+                 peb, debugstr_w(ios_keyed_event_nameW), status );
+            if (NtCreateKeyedEvent( &handle, GENERIC_READ | GENERIC_WRITE, NULL, 0 ))
+                handle = keyed_event;
+        }
+        /* rotating: a slot that is being overwritten belongs to a
+         * pseudo-process that exited long ago (its whole handle table is gone
+         * with it), and a live one that loses its slot simply opens again. */
+        i = cache_next;
+        cache[i].peb = peb;
+        cache[i].handle = handle;
+        cache_next = (i + 1) % ARRAY_SIZE(cache);
+        if (cache_count < ARRAY_SIZE(cache)) cache_count++;
+    }
+    pthread_mutex_unlock( &cache_lock );
+    return handle;
+}
+#endif
+
 /******************************************************************************
  *              NtWaitForKeyedEvent (NTDLL.@)
  */
@@ -2681,7 +2748,11 @@ NTSTATUS WINAPI NtWaitForKeyedEvent( HANDLE handle, const void *key,
 
     TRACE( "handle %p, key %p, alertable %u, timeout %s\n", handle, key, alertable, debugstr_timeout(timeout) );
 
+#ifdef WINE_IOS
+    if (!handle) handle = ios_default_keyed_event();
+#else
     if (!handle) handle = keyed_event;
+#endif
     if ((ULONG_PTR)key & 1) return STATUS_INVALID_PARAMETER_1;
     if (alertable) flags |= SELECT_ALERTABLE;
     select_op.keyed_event.op     = SELECT_KEYED_EVENT_WAIT;
@@ -2702,7 +2773,11 @@ NTSTATUS WINAPI NtReleaseKeyedEvent( HANDLE handle, const void *key,
 
     TRACE( "handle %p, key %p, alertable %u, timeout %s\n", handle, key, alertable, debugstr_timeout(timeout) );
 
+#ifdef WINE_IOS
+    if (!handle) handle = ios_default_keyed_event();
+#else
     if (!handle) handle = keyed_event;
+#endif
     if ((ULONG_PTR)key & 1) return STATUS_INVALID_PARAMETER_1;
     if (alertable) flags |= SELECT_ALERTABLE;
     select_op.keyed_event.op     = SELECT_KEYED_EVENT_RELEASE;
