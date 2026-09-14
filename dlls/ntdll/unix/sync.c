@@ -2585,9 +2585,37 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
  * any real wait (server_wait in server_ios.c) or any non-zero sleep.  State
  * is native __thread — no TEB, so threads created by FEX/CEF are safe.
  */
+/*
+ * iOS-Madeira ml951: the ladder above stops the syscall STORM but not the
+ * SPIN.  sched_yield() on Darwin is swtch_pri(0): if the core has nothing else
+ * runnable it returns immediately and the thread keeps the core, so a guest
+ * thread parked in "PeekMessage; Sleep(0)" until the render thread finishes
+ * still burns a full core competing with the very thread it is waiting for.
+ * [srv-stats] measured sleep0=747177 and yield_sc=95627 in one 10 s window —
+ * the throttle is working, the spin is not being paid for.
+ *
+ * So once a streak is unambiguously a spin and not pacing — IOS_SLEEP0_DEEP
+ * consecutive Sleep(0)s inside the 2 ms window, i.e. several ms of continuous
+ * polling — the periodic action becomes a BOUNDED PARK instead of a yield:
+ * a wait on a private per-thread word that nothing ever wakes, with a
+ * IOS_SLEEP0_PARK_NS timeout.  Same syscall count as the yield it replaces
+ * (one per IOS_SLEEP0_YIELD_EVERY calls), but the thread is actually
+ * descheduled for the duration, so the core goes to whoever it is waiting for.
+ *
+ * Semantics: Sleep(0) promises "other runnable threads may have the CPU", not
+ * "return within X ns", and the park is capped at 10 us — two orders of
+ * magnitude below the 1 ms Sleep(1) a guest would otherwise use, and only
+ * reached after the thread has already spun for milliseconds.  Worst case the
+ * loop is slowed to IOS_SLEEP0_YIELD_EVERY iterations per 10 us.  Any real
+ * wait, any non-zero sleep and any gap longer than the window still reset the
+ * streak through ios_spin_reset(), so a once-per-frame pacing Sleep(0) never
+ * reaches the deep rung at all.
+ */
 #define IOS_SLEEP0_FREE_SPINS   16
 #define IOS_SLEEP0_YIELD_EVERY   8
 #define IOS_SLEEP0_WINDOW    20000ull   /* 2 ms, in 100 ns Win32 ticks */
+#define IOS_SLEEP0_DEEP        512      /* consecutive Sleep(0) before escalating */
+#define IOS_SLEEP0_PARK_NS   10000ull   /* 10 us bounded park */
 
 static __thread unsigned int ios_sleep0_streak;
 static __thread ULONGLONG    ios_sleep0_last;
@@ -2598,6 +2626,22 @@ static inline void ios_cpu_pause( unsigned int loops )
     while (loops--) __asm__ __volatile__( "isb sy" ::: "memory" );
 #else
     while (loops--) __asm__ __volatile__( "" ::: "memory" );
+#endif
+}
+
+/* bounded deschedule: wait on a private word nothing ever wakes, so this
+ * always returns by timeout.  futex_wait() maps to
+ * os_sync_wait_on_address_with_timeout()/__ulock_wait() on Darwin. */
+static void ios_cpu_park( void )
+{
+#ifdef USE_FUTEX
+    static __thread LONG park_word;
+    struct timespec ts = { 0, (long)IOS_SLEEP0_PARK_NS };
+
+    ios_srv_nt_count( IOS_NT_SLEEP0_PARK );
+    futex_wait( &park_word, 0, &ts );
+#else
+    NtYieldExecution();
 #endif
 }
 
@@ -2619,6 +2663,13 @@ static NTSTATUS ios_delay_zero(void)
         (ios_sleep0_streak - IOS_SLEEP0_FREE_SPINS) % IOS_SLEEP0_YIELD_EVERY)
     {
         ios_cpu_pause( 16 );
+        return STATUS_SUCCESS;
+    }
+    /* ml951: a streak this long is a spin, not pacing — give the core away
+     * for real instead of asking a scheduler that has nobody else to run. */
+    if (ios_sleep0_streak > IOS_SLEEP0_DEEP)
+    {
+        ios_cpu_park();
         return STATUS_SUCCESS;
     }
     return NtYieldExecution();
