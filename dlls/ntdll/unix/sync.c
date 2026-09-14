@@ -72,6 +72,15 @@
 #include "wine/debug.h"
 #include "unix_private.h"
 
+/* iOS-Madeira ml950: the [srv-stats] counter block (build/ntdll-unix/shims).
+ * Everything it declares is a relaxed atomic add on a plain array; on any
+ * other target the calls compile to nothing at all. */
+#ifdef WINE_IOS
+# include "ios_srv_stats.h"
+#else
+# define ios_srv_nt_count(which) ((void)0)
+#endif
+
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
 HANDLE keyed_event = 0;
@@ -1068,6 +1077,8 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous 
 
     TRACE( "handle %p, count %u, prev_count %p\n", handle, count, previous );
 
+    ios_srv_nt_count( IOS_NT_RELEASE_SEM );
+
     if ((ret = inproc_release_semaphore( handle, count, previous )) != STATUS_NOT_IMPLEMENTED)
         return ret;
 
@@ -1154,6 +1165,8 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
 
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
 
+    ios_srv_nt_count( IOS_NT_SET_EVENT );
+
     if ((ret = inproc_set_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
 
@@ -1186,6 +1199,8 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
     unsigned int ret;
 
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+
+    ios_srv_nt_count( IOS_NT_RESET_EVENT );
 
     if ((ret = inproc_reset_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -1220,6 +1235,8 @@ NTSTATUS WINAPI NtPulseEvent( HANDLE handle, LONG *prev_state )
     unsigned int ret;
 
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+
+    ios_srv_nt_count( IOS_NT_PULSE_EVENT );
 
     if ((ret = inproc_pulse_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -1342,6 +1359,8 @@ NTSTATUS WINAPI NtReleaseMutant( HANDLE handle, LONG *prev_count )
     unsigned int ret;
 
     TRACE( "handle %p, prev_count %p\n", handle, prev_count );
+
+    ios_srv_nt_count( IOS_NT_RELEASE_MUTANT );
 
     if ((ret = inproc_release_mutex( handle, prev_count )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -2310,6 +2329,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
 
     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
     if (type != WaitAll && type != WaitAny) FIXME( "Unsupported wait type %u\n", type );
+    ios_srv_nt_count( count > 1 ? IOS_NT_WAIT_MULTI : IOS_NT_WAIT_SINGLE );
 
     if (TRACE_ON(sync))
     {
@@ -2349,6 +2369,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     unsigned int ret;
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+    ios_srv_nt_count( IOS_NT_WAIT_SINGLE );
 
     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
     {
@@ -2378,6 +2399,7 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
     TRACE( "signal %p, wait %p, alertable %u, timeout %s\n", signal, wait, alertable, debugstr_timeout(timeout) );
 
     if (!signal) return STATUS_INVALID_HANDLE;
+    ios_srv_nt_count( IOS_NT_SIGNAL_AND_WAIT );
 
     if ((ret = inproc_signal_and_wait( signal, wait, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -2387,6 +2409,69 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
     select_op.signal_and_wait.wait = wine_server_obj_handle( wait );
     select_op.signal_and_wait.signal = wine_server_obj_handle( signal );
     return server_wait( &select_op, sizeof(select_op.signal_and_wait), flags, timeout );
+}
+
+
+/******************************************************************
+ *              iOS-Madeira ml950: the Sleep(0) spin
+ *
+ * [prof] on a 32-bit D3D9 title put 5-21 % of ALL CPU in
+ * swtch_pri <- NtDelayExecution+0x24c: the guest spins on Sleep(0) waiting
+ * for another of its own threads, and every single call costs a syscall.
+ *
+ * The Windows semantic that must survive is "a zero-timeout sleep lets other
+ * runnable threads have the CPU".  A spin that never yields can livelock two
+ * guest threads that the scheduler has put on the same core, so this does not
+ * simply delete the yield: it makes the FIRST IOS_SLEEP0_FREE_SPINS calls of
+ * a streak a userspace pause (~200 ns of `isb sy`, which is a pipeline drain,
+ * not a busy loop that the core can speculate through) and then yields for
+ * real once every IOS_SLEEP0_YIELD_EVERY calls.  Worst-case added latency
+ * before the first real yield is ~3 us, and the syscall rate falls from
+ * 1000 per 1000 Sleep(0) to (1000 - 16)/8 + 1 = 124.
+ *
+ * "Streak" means back-to-back: a Sleep(0) issued once per frame is pacing,
+ * not spinning, and must keep yielding, so the counter resets if more than
+ * IOS_SLEEP0_WINDOW passes between calls, and ios_spin_reset() clears it from
+ * any real wait (server_wait in server_ios.c) or any non-zero sleep.  State
+ * is native __thread — no TEB, so threads created by FEX/CEF are safe.
+ */
+#define IOS_SLEEP0_FREE_SPINS   16
+#define IOS_SLEEP0_YIELD_EVERY   8
+#define IOS_SLEEP0_WINDOW    20000ull   /* 2 ms, in 100 ns Win32 ticks */
+
+static __thread unsigned int ios_sleep0_streak;
+static __thread ULONGLONG    ios_sleep0_last;
+
+static inline void ios_cpu_pause( unsigned int loops )
+{
+#if defined(__aarch64__) || defined(__arm64__)
+    while (loops--) __asm__ __volatile__( "isb sy" ::: "memory" );
+#else
+    while (loops--) __asm__ __volatile__( "" ::: "memory" );
+#endif
+}
+
+/* called from server_ios.c's server_wait, and from the non-zero delay path */
+void ios_spin_reset(void)
+{
+    ios_sleep0_streak = 0;
+}
+
+static NTSTATUS ios_delay_zero(void)
+{
+    ULONGLONG now = monotonic_counter();
+
+    if (now - ios_sleep0_last > IOS_SLEEP0_WINDOW) ios_sleep0_streak = 0;
+    ios_sleep0_last = now;
+    ios_sleep0_streak++;
+
+    if (ios_sleep0_streak <= IOS_SLEEP0_FREE_SPINS ||
+        (ios_sleep0_streak - IOS_SLEEP0_FREE_SPINS) % IOS_SLEEP0_YIELD_EVERY)
+    {
+        ios_cpu_pause( 16 );
+        return STATUS_SUCCESS;
+    }
+    return NtYieldExecution();
 }
 
 
@@ -2418,6 +2503,7 @@ NTSTATUS WINAPI NtYieldExecution(void)
      * syscall itself, so the fix is at the callers: NtDelayExecution below
      * no longer yields for non-zero delays, and the two spin-detecting
      * callers (server_wait, and the win32u message pump) now rate-limit. */
+    ios_srv_nt_count( IOS_NT_YIELD_SYSCALL );
     sched_yield();
     return STATUS_SUCCESS;
 #else
@@ -2468,8 +2554,16 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
            swtch_pri(0) bought nothing and cost one syscall on every single
            Sleep(n) - a 1 ms pacing loop paid it a thousand times a second.
            The alertable path above never yielded either (server_wait's wait
-           is the implicit yield), so this makes the two paths agree. */
-        if (!when) return NtYieldExecution();
+           is the implicit yield), so this makes the two paths agree.
+           iOS-Madeira ml950: and a zero timeout now goes through the streak
+           limiter above instead of an unconditional syscall. */
+        if (!when)
+        {
+            ios_srv_nt_count( IOS_NT_DELAY_ZERO );
+            return ios_delay_zero();
+        }
+        ios_srv_nt_count( IOS_NT_DELAY_NONZERO );
+        ios_spin_reset();
 
         for (;;)
         {
@@ -4015,6 +4109,10 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
     union tid_alert_entry *entry = get_tid_alert_entry( tid );
 
     TRACE( "%p\n", tid );
+    /* ml950: counted for [srv-stats].  USE_FUTEX is defined for __APPLE__ at
+     * the top of this file, so this path never touches the wineserver — the
+     * [alert-storm] ping-pong is an os_sync_wake_by_address pair, not IPC. */
+    ios_srv_nt_count( IOS_NT_ALERT_WAKE );
 
     if (!entry) return STATUS_INVALID_CID;
 
@@ -4114,6 +4212,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
      * whether anyone ever tries to wake it — the unix lib is the single shared
      * copy every route passes through. */
     if (ios_marked) ios_pump_alert_tid = NtCurrentTeb()->ClientId.UniqueThread;
+    ios_srv_nt_count( IOS_NT_ALERT_WAIT );   /* ml950: futex path, no server */
 
     TRACE( "%p %s\n", address, debugstr_timeout( timeout ) );
 
