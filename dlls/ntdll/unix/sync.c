@@ -2584,17 +2584,29 @@ NTSTATUS WINAPI NtYieldExecution(void)
     }
 #endif
 #ifdef HAVE_SCHED_YIELD
-#ifdef RUSAGE_THREAD
-    struct rusage u1, u2;
-    int ret;
-
-    ret = getrusage( RUSAGE_THREAD, &u1 );
-#endif
+    /* iOS-Madeira ml940: upstream brackets the yield with two
+     * getrusage( RUSAGE_THREAD ) calls and compares ru_nvcsw/ru_nivcsw to
+     * decide STATUS_NO_YIELD_PERFORMED.  RUSAGE_THREAD is a Linux extension:
+     * the iPhoneOS SDK's <sys/resource.h> defines only RUSAGE_SELF and
+     * RUSAGE_CHILDREN, so on this target both calls were already
+     * preprocessed away and this function has always been the older
+     * upstream body - sched_yield() then STATUS_SUCCESS, which is what Wine
+     * returned unconditionally for years before the rusage heuristic was
+     * added.  Removed outright so the dead branch cannot come back through a
+     * RUSAGE_THREAD shim, because there is no cheap honest substitute on
+     * Darwin: swtch_pri(0) (what libsystem_kernel turns sched_yield into)
+     * reports nothing about whether another thread ran, and a
+     * clock_gettime( CLOCK_MONOTONIC_RAW ) delta - a commpage read here, not
+     * a syscall - would only measure elapsed time, never a context switch,
+     * so it would be a guess dressed up as a fact.  The only consumer is
+     * kernelbase's SwitchToThread (dlls/kernelbase/thread.c:707), whose
+     * BOOL is advisory.
+     *
+     * The cost the [prof] sampler sees is not this heuristic, it is the
+     * syscall itself, so the fix is at the callers: NtDelayExecution below
+     * no longer yields for non-zero delays, and the two spin-detecting
+     * callers (server_wait, and the win32u message pump) now rate-limit. */
     sched_yield();
-#ifdef RUSAGE_THREAD
-    if (!ret) ret = getrusage( RUSAGE_THREAD, &u2 );
-    if (!ret && u1.ru_nvcsw == u2.ru_nvcsw && u1.ru_nivcsw == u2.ru_nivcsw) return STATUS_NO_YIELD_PERFORMED;
-#endif
     return STATUS_SUCCESS;
 #else
     return STATUS_NO_YIELD_PERFORMED;
@@ -2644,9 +2656,17 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         }
 
         /* Note that we yield after establishing the desired timeout, but
-           we only care about the result of the yield for zero timeouts */
-        status = NtYieldExecution();
-        if (!when) return status;
+           we only care about the result of the yield for zero timeouts.
+           iOS-Madeira ml940: upstream yields here unconditionally and only
+           then tests `when'.  A zero timeout (Sleep(0)) IS a pure yield and
+           its status is the one thing the caller can observe, so it still
+           yields.  A non-zero timeout is about to block in the select()
+           loop below, which deschedules this thread anyway, so the extra
+           swtch_pri(0) bought nothing and cost one syscall on every single
+           Sleep(n) - a 1 ms pacing loop paid it a thousand times a second.
+           The alertable path above never yielded either (server_wait's wait
+           is the implicit yield), so this makes the two paths agree. */
+        if (!when) return NtYieldExecution();
 
         for (;;)
         {

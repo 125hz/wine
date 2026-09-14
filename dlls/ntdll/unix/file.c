@@ -255,6 +255,391 @@ static const BOOL is_case_sensitive = FALSE;
 static pthread_mutex_t dir_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t mnt_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+#ifdef WINE_IOS
+/***********************************************************************
+ * iOS-Madeira ml910 — [fs-stats] and the NT-path resolution caches.
+ *
+ * The sampling profiler put a 32-bit D3D9 title's serial main thread at
+ * fstatat 17-28%, getattrlistat 5-9%, __openat 5-9%, lstat ~3%, listxattr
+ * ~3%, __getdirentries64 ~1.5% of all CPU, for SUCCESSFUL lookups (only 64
+ * NtCreateFile failures in a whole 3-minute run).  The app container volume
+ * is case-SENSITIVE APFS, so every Windows path whose on-disk spelling
+ * differs in case misses lookup_unix_name()'s exact-case shortcut and then
+ * pays, per component: fstatat (exact case) + getattrlistat (FSID, on EVERY
+ * call) + openat + fdopendir + a full getdirentries scan.  That is ~5
+ * syscalls per component of a ~7-deep path, per open, forever, because
+ * nothing upstream remembers the answer.
+ *
+ * Three pieces live here:
+ *   1. counters/timers behind relaxed atomics, reported as [fs-stats] every
+ *      10 s (same cadence as [prof]) from whichever thread first crosses the
+ *      deadline — one CAS elects the printer, no locks anywhere;
+ *   2. ios_pc_*: the resolved-name cache, key = <parent unix path>/<ASCII
+ *      case-folded requested name>, value = the actual on-disk spelling.
+ *      Used both for a whole remaining path (lookup_unix_name) and for a
+ *      single component (find_file_in_dir);
+ *   3. ios_cs_memo: get_dir_case_sensitivity() memoised per directory path,
+ *      which removes the per-call getattrlistat entirely.
+ *
+ * Every cache hit is re-validated with one fstatat, so a stale entry costs a
+ * failed stat and falls through to the upstream scan.  See the correctness
+ * notes at each cache.
+ */
+
+#define IOS_FSA(v,n)  __atomic_fetch_add( &(v), (unsigned long long)(n), __ATOMIC_RELAXED )
+#define IOS_FSL(v)    __atomic_load_n( &(v), __ATOMIC_RELAXED )
+
+enum ios_fs_op { IOS_OP_OPEN, IOS_OP_CREATE, IOS_OP_QATTR, IOS_OP_QFULL,
+                 IOS_OP_QINFO, IOS_OP_QDIR, IOS_OP_READ, IOS_OP_COUNT };
+static const char * const ios_fs_opname[IOS_OP_COUNT] =
+    { "open", "create", "qattr", "qfull", "qinfo", "qdir", "read" };
+static unsigned long long ios_fs_opn[IOS_OP_COUNT];
+static unsigned long long ios_fs_opus[IOS_OP_COUNT];
+
+enum ios_fs_sc { IOS_SC_FSTATAT, IOS_SC_GETATTRLISTAT, IOS_SC_GETATTRLIST, IOS_SC_LSTAT,
+                 IOS_SC_STAT, IOS_SC_FSTAT, IOS_SC_LISTXATTR, IOS_SC_GETXATTR,
+                 IOS_SC_OPENAT, IOS_SC_DIRSCAN, IOS_SC_READDIR, IOS_SC_COUNT };
+static const char * const ios_fs_scname[IOS_SC_COUNT] =
+    { "fstatat", "getattrlistat", "getattrlist", "lstat", "stat", "fstat",
+      "listxattr", "getxattr", "openat", "dirscan", "readdir" };
+static unsigned long long ios_fs_sc[IOS_SC_COUNT];
+
+/* read shape */
+static unsigned long long ios_fs_read_bytes, ios_fs_read_sync, ios_fs_read_srv, ios_fs_read_pos;
+/* lookup shape */
+#define IOS_FS_DEPTH_MAX 8
+static unsigned long long ios_fs_depth[IOS_FS_DEPTH_MAX + 1];
+static unsigned long long ios_fs_exact, ios_fs_scan;
+static unsigned long long ios_fs_pc_hit, ios_fs_pc_miss, ios_fs_pc_stale, ios_fs_pc_put, ios_fs_pc_evict;
+static unsigned long long ios_fs_cs_hit, ios_fs_cs_miss;
+static unsigned long long ios_fs_xa_hit, ios_fs_xa_miss, ios_fs_xa_skip, ios_fs_xa_write;
+
+static inline unsigned long long ios_fs_now_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime( CLOCK_MONOTONIC, &ts )) return 0;
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000;
+}
+
+/* ---- syscall counting wrappers ------------------------------------ */
+/* Thin, always-inlined, one relaxed add each.  Defined as function-like
+ * macros AFTER every system header, so no declaration is ever rewritten. */
+
+static inline int ios_c_fstatat( int fd, const char *p, struct stat *st, int fl )
+{ IOS_FSA( ios_fs_sc[IOS_SC_FSTATAT], 1 ); return fstatat( fd, p, st, fl ); }
+static inline int ios_c_lstat( const char *p, struct stat *st )
+{ IOS_FSA( ios_fs_sc[IOS_SC_LSTAT], 1 ); return lstat( p, st ); }
+static inline int ios_c_stat( const char *p, struct stat *st )
+{ IOS_FSA( ios_fs_sc[IOS_SC_STAT], 1 ); return stat( p, st ); }
+static inline int ios_c_fstat( int fd, struct stat *st )
+{ IOS_FSA( ios_fs_sc[IOS_SC_FSTAT], 1 ); return fstat( fd, st ); }
+static inline int ios_c_openat( int fd, const char *p, int fl )
+{ IOS_FSA( ios_fs_sc[IOS_SC_OPENAT], 1 ); return openat( fd, p, fl ); }
+static inline DIR *ios_c_fdopendir( int fd )
+{ IOS_FSA( ios_fs_sc[IOS_SC_DIRSCAN], 1 ); return fdopendir( fd ); }
+static inline struct dirent *ios_c_readdir( DIR *d )
+{ IOS_FSA( ios_fs_sc[IOS_SC_READDIR], 1 ); return readdir( d ); }
+
+#define fstatat(a,b,c,d)  ios_c_fstatat((a),(b),(c),(d))
+#define lstat(a,b)        ios_c_lstat((a),(b))
+#define stat(a,b)         ios_c_stat((a),(b))
+#define fstat(a,b)        ios_c_fstat((a),(b))
+#define openat(a,b,c)     ios_c_openat((a),(b),(c))
+#define fdopendir(a)      ios_c_fdopendir((a))
+#define readdir(a)        ios_c_readdir((a))
+
+#ifdef HAVE_GETATTRLIST
+static inline int ios_c_getattrlistat( int fd, const char *p, void *al, void *buf, size_t sz, unsigned long o )
+{ IOS_FSA( ios_fs_sc[IOS_SC_GETATTRLISTAT], 1 ); return getattrlistat( fd, p, al, buf, sz, o ); }
+static inline int ios_c_getattrlist( const char *p, void *al, void *buf, size_t sz, unsigned long o )
+{ IOS_FSA( ios_fs_sc[IOS_SC_GETATTRLIST], 1 ); return getattrlist( p, al, buf, sz, o ); }
+#define getattrlistat(a,b,c,d,e,f) ios_c_getattrlistat((a),(b),(c),(d),(e),(f))
+#define getattrlist(a,b,c,d,e)     ios_c_getattrlist((a),(b),(c),(d),(e))
+#endif
+
+#ifdef __APPLE__
+static inline ssize_t ios_c_listxattr( const char *p, char *b, size_t s, int o )
+{ IOS_FSA( ios_fs_sc[IOS_SC_LISTXATTR], 1 ); return listxattr( p, b, s, o ); }
+static inline ssize_t ios_c_flistxattr( int fd, char *b, size_t s, int o )
+{ IOS_FSA( ios_fs_sc[IOS_SC_LISTXATTR], 1 ); return flistxattr( fd, b, s, o ); }
+static inline ssize_t ios_c_getxattr( const char *p, const char *n, void *v, size_t s, u_int32_t po, int o )
+{ IOS_FSA( ios_fs_sc[IOS_SC_GETXATTR], 1 ); return getxattr( p, n, v, s, po, o ); }
+static inline ssize_t ios_c_fgetxattr( int fd, const char *n, void *v, size_t s, u_int32_t po, int o )
+{ IOS_FSA( ios_fs_sc[IOS_SC_GETXATTR], 1 ); return fgetxattr( fd, n, v, s, po, o ); }
+#define listxattr(a,b,c,d)      ios_c_listxattr((a),(b),(c),(d))
+#define flistxattr(a,b,c,d)     ios_c_flistxattr((a),(b),(c),(d))
+#define getxattr(a,b,c,d,e,f)   ios_c_getxattr((a),(b),(c),(d),(e),(f))
+#define fgetxattr(a,b,c,d,e,f)  ios_c_fgetxattr((a),(b),(c),(d),(e),(f))
+#endif
+
+/* ---- the 10 s [fs-stats] report ----------------------------------- */
+
+#define IOS_FS_PERIOD_US 10000000ull
+
+static unsigned long long ios_fs_deadline;   /* µs, 0 = not armed yet */
+static unsigned long long ios_fs_window_t0;
+static int ios_fs_off = -1;                  /* -1 unknown, 1 disabled */
+
+static int ios_fs_disabled(void)
+{
+    int v = __atomic_load_n( &ios_fs_off, __ATOMIC_RELAXED );
+    if (v < 0)
+    {
+        const char *s = getenv( "MADEIRA_FSSTATS" );
+        v = (s && s[0] == '0') ? 1 : 0;
+        __atomic_store_n( &ios_fs_off, v, __ATOMIC_RELAXED );
+    }
+    return v;
+}
+
+static unsigned long long ios_fs_delta( unsigned long long cur, unsigned long long *prev )
+{
+    unsigned long long d = cur - *prev;
+    *prev = cur;
+    return d;
+}
+
+static void ios_fs_report( unsigned long long now )
+{
+    /* Only ever entered by the single thread that won the deadline CAS, so
+     * these "previous window" snapshots need no protection of their own. */
+    static unsigned long long p_opn[IOS_OP_COUNT], p_opus[IOS_OP_COUNT], p_sc[IOS_SC_COUNT];
+    static unsigned long long p_bytes, p_sync, p_srv, p_pos, p_depth[IOS_FS_DEPTH_MAX + 1];
+    static unsigned long long p_exact, p_scan, p_hit, p_miss, p_stale, p_put, p_evict;
+    static unsigned long long p_cshit, p_csmiss, p_xahit, p_xamiss, p_xaskip, p_xawr;
+    char line[700];
+    int i, n = 0;
+    unsigned long long win_us = now - ios_fs_window_t0;
+    unsigned long long d_opn[IOS_OP_COUNT], d_opus[IOS_OP_COUNT], d_sc[IOS_SC_COUNT];
+    unsigned long long d_depth[IOS_FS_DEPTH_MAX + 1];
+    unsigned long long d_bytes, d_sync, d_srv, d_pos;
+
+    ios_fs_window_t0 = now;
+    if (!win_us) win_us = 1;
+
+#define IOS_D(cur,prev)  (ios_fs_delta( IOS_FSL(cur), &(prev) ))
+
+    for (i = 0; i < IOS_OP_COUNT; i++)
+    {
+        d_opn[i]  = IOS_D( ios_fs_opn[i],  p_opn[i] );
+        d_opus[i] = IOS_D( ios_fs_opus[i], p_opus[i] );
+        n += snprintf( line + n, sizeof(line) - n, " %s=%llu/%llu.%03llums",
+                       ios_fs_opname[i], d_opn[i], d_opus[i] / 1000, d_opus[i] % 1000 );
+    }
+    dprintf( 2, "[fs-stats] ml910 %llu.%llus%s\n", win_us / 1000000, (win_us % 1000000) / 100000, line );
+
+    d_bytes = IOS_D( ios_fs_read_bytes, p_bytes );
+    d_sync  = IOS_D( ios_fs_read_sync,  p_sync );
+    d_srv   = IOS_D( ios_fs_read_srv,   p_srv );
+    d_pos   = IOS_D( ios_fs_read_pos,   p_pos );
+    dprintf( 2, "[fs-stats]   read: %lluKB avg=%lluB positioned=%llu streamed=%llu srv=%llu\n",
+             d_bytes / 1024, d_opn[IOS_OP_READ] ? d_bytes / d_opn[IOS_OP_READ] : 0,
+             d_pos, d_sync, d_srv );
+
+    n = 0;
+    for (i = 0; i < IOS_SC_COUNT; i++)
+    {
+        d_sc[i] = IOS_D( ios_fs_sc[i], p_sc[i] );
+        n += snprintf( line + n, sizeof(line) - n, " %s=%llu", ios_fs_scname[i], d_sc[i] );
+    }
+    dprintf( 2, "[fs-stats]   sys:%s\n", line );
+
+    n = 0;
+    for (i = 0; i <= IOS_FS_DEPTH_MAX; i++)
+    {
+        d_depth[i] = IOS_D( ios_fs_depth[i], p_depth[i] );
+        n += snprintf( line + n, sizeof(line) - n, "%s%llu", i ? "/" : "", d_depth[i] );
+    }
+    dprintf( 2, "[fs-stats]   lookup: depth[0..%d+]=%s exact=%llu scan=%llu "
+                "pcache=h%llu/m%llu/s%llu/p%llu/e%llu cs=h%llu/m%llu xattr=h%llu/m%llu/skip%llu/wr%llu\n",
+             IOS_FS_DEPTH_MAX, line, IOS_D( ios_fs_exact, p_exact ), IOS_D( ios_fs_scan, p_scan ),
+             IOS_D( ios_fs_pc_hit, p_hit ), IOS_D( ios_fs_pc_miss, p_miss ), IOS_D( ios_fs_pc_stale, p_stale ),
+             IOS_D( ios_fs_pc_put, p_put ), IOS_D( ios_fs_pc_evict, p_evict ),
+             IOS_D( ios_fs_cs_hit, p_cshit ), IOS_D( ios_fs_cs_miss, p_csmiss ),
+             IOS_D( ios_fs_xa_hit, p_xahit ), IOS_D( ios_fs_xa_miss, p_xamiss ),
+             IOS_D( ios_fs_xa_skip, p_xaskip ), IOS_D( ios_fs_xa_write, p_xawr ) );
+#undef IOS_D
+}
+
+/* Piggy-backed on every instrumented NT entry point; one relaxed load in the
+ * common case, one CAS per window for the thread that gets to print. */
+static void ios_fs_note( int op, unsigned long long t0, unsigned long long t1 )
+{
+    unsigned long long due;
+
+    if (ios_fs_disabled()) return;
+    IOS_FSA( ios_fs_opn[op], 1 );
+    IOS_FSA( ios_fs_opus[op], t1 > t0 ? t1 - t0 : 0 );
+
+    due = __atomic_load_n( &ios_fs_deadline, __ATOMIC_RELAXED );
+    if (!due)
+    {
+        unsigned long long zero = 0;
+        if (__atomic_compare_exchange_n( &ios_fs_deadline, &zero, t1 + IOS_FS_PERIOD_US, 0,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            ios_fs_window_t0 = t1;
+        return;
+    }
+    if (t1 < due) return;
+    if (!__atomic_compare_exchange_n( &ios_fs_deadline, &due, t1 + IOS_FS_PERIOD_US, 0,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        return;                                  /* somebody else is printing this window */
+    ios_fs_report( t1 );
+}
+
+/* ---- resolved-name cache ------------------------------------------ */
+/*
+ * key   = "<absolute parent unix path>/<ASCII case-folded requested name>"
+ *         where <requested name> is either one component (find_file_in_dir)
+ *         or the whole remaining path with '\' already turned into '/'
+ *         (lookup_unix_name).
+ * value = the on-disk spelling that upstream's readdir scan resolved to.
+ *
+ * Only populated for root_fd == AT_FDCWD, i.e. the absolute-path lookups
+ * that every DOS drive path takes; a relative lookup against an open
+ * directory handle would need the fd's identity in the key and fds get
+ * recycled, so those keep the upstream path unchanged.
+ *
+ * Correctness: a hit is only ever believed after fstatat() confirms the
+ * cached name still exists, and the cache is only populated when the
+ * exact-case attempt FAILED, so an exact-case file created later still wins
+ * (upstream's shortcut runs first and we never get asked).  The one thing a
+ * stale entry can do is name a file that a case-only rename recreated under
+ * a different spelling — but a rename removes the old name, so the fstatat
+ * fails and we fall through to the upstream scan.  Two files that differ
+ * only in case remain resolved in readdir order, exactly as upstream.
+ */
+/* Direct-mapped and hard-bounded: 8192 buckets, one entry each, key and
+ * value malloc'd, so the table itself is ~200 KB and a fully populated
+ * cache ~2 MB.  A collision replaces (the [fs-stats] `e` counter reports
+ * the eviction rate, so the size can be tuned from a real run). */
+#define IOS_PC_BUCKETS 8192                    /* power of two */
+#define IOS_PC_KEYMAX  512
+#define IOS_PC_VALMAX  384
+
+struct ios_pc_ent
+{
+    unsigned long long hash;                   /* 0 = empty */
+    char *key;
+    char *val;
+};
+static struct ios_pc_ent ios_pc[IOS_PC_BUCKETS];
+static pthread_mutex_t ios_pc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned long long ios_fnv( const char *s, size_t len )
+{
+    unsigned long long h = 14695981039346656037ull;
+    size_t i;
+    for (i = 0; i < len; i++) { h ^= (unsigned char)s[i]; h *= 1099511628211ull; }
+    return h ? h : 1;
+}
+
+/* copy src[0..len) into dst, ASCII-lowercasing from index `fold_from` on */
+static int ios_pc_key( char *dst, size_t dstsize, const char *src, size_t len, size_t fold_from )
+{
+    size_t i;
+    if (len + 1 > dstsize) return 0;
+    for (i = 0; i < len; i++)
+    {
+        char c = src[i];
+        if (i >= fold_from && c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        dst[i] = c;
+    }
+    dst[len] = 0;
+    return 1;
+}
+
+static int ios_pc_get( const char *key, char *out, size_t outsize )
+{
+    unsigned long long h = ios_fnv( key, strlen(key) );
+    struct ios_pc_ent *e = &ios_pc[h & (IOS_PC_BUCKETS - 1)];
+    int found = 0;
+
+    mutex_lock( &ios_pc_lock );
+    if (e->hash == h && e->key && !strcmp( e->key, key ) && strlen(e->val) < outsize)
+    {
+        memcpy( out, e->val, strlen(e->val) + 1 );
+        found = 1;
+    }
+    mutex_unlock( &ios_pc_lock );
+    return found;
+}
+
+static void ios_pc_put( const char *key, const char *val )
+{
+    unsigned long long h = ios_fnv( key, strlen(key) );
+    struct ios_pc_ent *e = &ios_pc[h & (IOS_PC_BUCKETS - 1)];
+    size_t klen = strlen(key), vlen = strlen(val);
+    char *k, *v;
+
+    if (!vlen || vlen >= IOS_PC_VALMAX) return;
+    if (!(k = malloc( klen + 1 ))) return;
+    if (!(v = malloc( vlen + 1 ))) { free( k ); return; }
+    memcpy( k, key, klen + 1 );
+    memcpy( v, val, vlen + 1 );
+
+    mutex_lock( &ios_pc_lock );
+    if (e->hash && (e->hash != h || !e->key || strcmp( e->key, key ))) IOS_FSA( ios_fs_pc_evict, 1 );
+    free( e->key );
+    free( e->val );
+    e->key = k;
+    e->val = v;
+    e->hash = h;
+    mutex_unlock( &ios_pc_lock );
+    IOS_FSA( ios_fs_pc_put, 1 );
+}
+
+/* ---- get_dir_case_sensitivity memo --------------------------------- */
+/*
+ * One 64-bit word per slot: (tag << 2) | 2 | answer, 0 = empty.  A single
+ * relaxed load/store, so readers can never see a torn entry and no lock is
+ * needed.  Keyed by (root_fd, directory path) rather than by st_dev because
+ * we have the path for free and no stat at all: upstream burns a
+ * getattrlistat on EVERY call just to re-derive the FSID before consulting
+ * its own per-device cache, and that is the 5-9% getattrlistat in [prof].
+ * A path's volume can only change by (un)mounting, which cannot happen
+ * inside the app container.
+ */
+#define IOS_CS_SLOTS 512
+static unsigned long long ios_cs_memo[IOS_CS_SLOTS];
+
+/* ---- DOS-attribute / reparse xattr memo ----------------------------- */
+/*
+ * get_file_info()/fd_get_file_info() ask for two named xattrs on every
+ * attribute query, and on macOS/iOS each xattr_get() first does a
+ * listxattr() ("faster than getxattr", upstream) — so two syscalls per
+ * query for files that, here, essentially never carry either attribute.
+ *
+ * Two changes: ONE listxattr answers both names, and its answer is memoised
+ * per (dev, ino, ctime).  Setting or removing an xattr bumps ctime on APFS,
+ * so the memo self-invalidates; an inode recycled with a bit-identical
+ * nanosecond ctime is the only false hit and cannot be constructed in
+ * practice.  MADEIRA_FS_NOXATTR=1 additionally skips the listxattr outright
+ * until something in this process writes one of the two attributes — a
+ * measurement knob, off by default, because xattrs written by an EARLIER
+ * run would be invisible to it.
+ */
+#define IOS_XA_SLOTS 1024
+#define IOS_XA_REPARSE 1
+#define IOS_XA_DOSATTR 2
+struct ios_xa_ent { dev_t dev; ino_t ino; long long ctime; int bits; };
+static struct ios_xa_ent ios_xa_memo[IOS_XA_SLOTS];
+static pthread_mutex_t ios_xa_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ios_xa_written;        /* something set one of our xattrs this run */
+static int ios_xa_skip_mode = -1;
+
+static long long ios_stat_ctime( const struct stat *st )
+{
+    long long v = (long long)st->st_ctime * 1000000000ll;
+#ifdef HAVE_STRUCT_STAT_ST_CTIM
+    v += st->st_ctim.tv_nsec;
+#elif defined(HAVE_STRUCT_STAT_ST_CTIMESPEC)
+    v += st->st_ctimespec.tv_nsec;
+#endif
+    return v;
+}
+#endif  /* WINE_IOS */
+
 /* check if a given Unicode char is OK in a DOS short name */
 static inline BOOL is_invalid_dos_char( WCHAR ch )
 {
@@ -498,6 +883,94 @@ static int xattr_fget( int filedes, const char *name, void *value, size_t size )
     return -1;
 #endif
 }
+
+
+#ifdef WINE_IOS
+/* ml910: fetch one named xattr without the listxattr() pre-probe, for the
+ * callers that already know from ios_xa_bits() that the name is there. */
+static int ios_xattr_get_raw( const char *path, const char *name, void *value, size_t size )
+{
+    return getxattr( path, name, value, size, 0, 0 );
+}
+
+static int ios_xattr_fget_raw( int filedes, const char *name, void *value, size_t size )
+{
+    return fgetxattr( filedes, name, value, size, 0, 0 );
+}
+
+static int ios_xa_skip_enabled(void)
+{
+    int v = __atomic_load_n( &ios_xa_skip_mode, __ATOMIC_RELAXED );
+    if (v < 0)
+    {
+        const char *s = getenv( "MADEIRA_FS_NOXATTR" );
+        v = (s && s[0] == '1') ? 1 : 0;
+        __atomic_store_n( &ios_xa_skip_mode, v, __ATOMIC_RELAXED );
+    }
+    return v;
+}
+
+/***********************************************************************
+ *           ios_xa_bits
+ *
+ * Which of XATTR_REPARSE / SAMBA_XATTR_DOS_ATTRIB does this file carry?
+ * ONE listxattr() answers both questions (upstream asks twice, and on
+ * macOS/iOS each xattr_get() is itself a listxattr()), and the answer is
+ * memoised per (dev, ino, ctime) — setting or removing an xattr bumps
+ * ctime, so the memo cannot go stale under us.
+ *
+ * Returns a bit mask, or -1 when the answer is unknown and the caller
+ * should fall back to asking for each name directly.
+ */
+static int ios_xa_bits( const char *path, int filedes, const struct stat *st )
+{
+    char names[2048];
+    ssize_t r, i;
+    long long ct = ios_stat_ctime( st );
+    unsigned slot = (unsigned)((((unsigned long long)st->st_ino * 1099511628211ull) >> 16)
+                               & (IOS_XA_SLOTS - 1));
+    struct ios_xa_ent *e = &ios_xa_memo[slot];
+    int bits = 0;
+
+    if (ios_xa_skip_enabled() && !__atomic_load_n( &ios_xa_written, __ATOMIC_RELAXED ))
+    {
+        IOS_FSA( ios_fs_xa_skip, 1 );
+        return 0;
+    }
+
+    mutex_lock( &ios_xa_lock );
+    if (e->ino == st->st_ino && e->dev == st->st_dev && e->ctime == ct)
+    {
+        bits = e->bits;
+        mutex_unlock( &ios_xa_lock );
+        IOS_FSA( ios_fs_xa_hit, 1 );
+        return bits;
+    }
+    mutex_unlock( &ios_xa_lock );
+    IOS_FSA( ios_fs_xa_miss, 1 );
+
+    r = path ? listxattr( path, names, sizeof(names), 0 )
+             : flistxattr( filedes, names, sizeof(names), 0 );
+    if (r < 0)
+    {
+        if (errno == ERANGE) return -1;    /* name list too long: ask directly */
+        return 0;                          /* ENOTSUP or gone: nothing to read */
+    }
+    for (i = 0; i < r; i += (ssize_t)strlen( &names[i] ) + 1)
+    {
+        if (!strcmp( &names[i], XATTR_REPARSE )) bits |= IOS_XA_REPARSE;
+        else if (!strcmp( &names[i], SAMBA_XATTR_DOS_ATTRIB )) bits |= IOS_XA_DOSATTR;
+    }
+
+    mutex_lock( &ios_xa_lock );
+    e->dev   = st->st_dev;
+    e->ino   = st->st_ino;
+    e->ctime = ct;
+    e->bits  = bits;
+    mutex_unlock( &ios_xa_lock );
+    return bits;
+}
+#endif  /* WINE_IOS */
 
 
 /* get space from the current directory data buffer, allocating a new one if necessary */
@@ -1341,12 +1814,55 @@ static BOOLEAN get_dir_case_sensitivity_stat( int root_fd, const char *dir )
  */
 static BOOLEAN get_dir_case_sensitivity( int root_fd, const char *dir )
 {
+#ifdef WINE_IOS
+    /* ml910: memoise per directory path.  Upstream's cache is keyed by
+     * st_dev but it re-derives that device with a getattrlistat() on EVERY
+     * call before it may consult the cache, which [prof] measured at 5-9% of
+     * all CPU.  One relaxed 64-bit load answers it here with no syscall at
+     * all.  Restricted to AT_FDCWD so a recycled directory fd can never make
+     * a relative path inherit another directory's answer. */
+    unsigned long long h = 0, w = 0;
+    unsigned slot = 0;
+    BOOLEAN ret;
+
+    if (root_fd == AT_FDCWD)
+    {
+        h = ios_fnv( dir, strlen(dir) ) >> 2;      /* 62-bit tag */
+        slot = (unsigned)(h & (IOS_CS_SLOTS - 1));
+        w = __atomic_load_n( &ios_cs_memo[slot], __ATOMIC_RELAXED );
+        if (w && (w >> 2) == h)
+        {
+            IOS_FSA( ios_fs_cs_hit, 1 );
+            return (BOOLEAN)(w & 1);
+        }
+        IOS_FSA( ios_fs_cs_miss, 1 );
+    }
+#endif
 #if defined(HAVE_GETATTRLIST) && defined(ATTR_VOL_CAPABILITIES) && \
     defined(VOL_CAPABILITIES_FORMAT) && defined(VOL_CAP_FMT_CASE_SENSITIVE)
-    int case_sensitive = get_dir_case_sensitivity_attr( root_fd, dir );
-    if (case_sensitive != -1) return case_sensitive;
+    {
+        int case_sensitive = get_dir_case_sensitivity_attr( root_fd, dir );
+#ifdef WINE_IOS
+        if (case_sensitive != -1)
+        {
+            if (root_fd == AT_FDCWD)
+                __atomic_store_n( &ios_cs_memo[slot], (h << 2) | 2 | (case_sensitive ? 1 : 0),
+                                  __ATOMIC_RELAXED );
+            return case_sensitive;
+        }
+#else
+        if (case_sensitive != -1) return case_sensitive;
 #endif
+    }
+#endif
+#ifdef WINE_IOS
+    ret = get_dir_case_sensitivity_stat( root_fd, dir );
+    if (root_fd == AT_FDCWD)
+        __atomic_store_n( &ios_cs_memo[slot], (h << 2) | 2 | (ret ? 1 : 0), __ATOMIC_RELAXED );
+    return ret;
+#else
     return get_dir_case_sensitivity_stat( root_fd, dir );
+#endif
 }
 
 
@@ -1696,6 +2212,31 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
         }
     }
 
+#ifdef WINE_IOS
+    /* ml910: one listxattr for both names, memoised by (dev, ino, ctime). */
+    {
+        int xb = ios_xa_bits( NULL, fd, st );
+
+        if (xb >= 0)
+        {
+            if (xb & IOS_XA_REPARSE)
+            {
+                attr_len = ios_xattr_fget_raw( fd, XATTR_REPARSE, buffer, sizeof(buffer) );
+                if (attr_len >= 0 && attr_len >= sizeof(ULONG))
+                {
+                    *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+                    if (reparse_tag) memcpy( reparse_tag, buffer, sizeof(ULONG) );
+                }
+            }
+            if (xb & IOS_XA_DOSATTR)
+            {
+                attr_len = ios_xattr_fget_raw( fd, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
+                if (attr_len != -1) *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
+            }
+            return ret;
+        }
+    }
+#endif
     attr_len = xattr_fget( fd, XATTR_REPARSE, buffer, sizeof(buffer) );
     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
     {
@@ -1724,6 +2265,13 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
 
 static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
 {
+#ifdef WINE_IOS
+    /* ml910: the single place this tree writes a DOS-attribute xattr.  Note
+     * it for the optional MADEIRA_FS_NOXATTR skip; the (dev,ino,ctime) memo
+     * needs nothing here because the write itself bumps ctime. */
+    __atomic_store_n( &ios_xa_written, 1, __ATOMIC_RELAXED );
+    IOS_FSA( ios_fs_xa_write, 1 );
+#endif
     /* we only store the HIDDEN and SYSTEM attributes */
     attr &= XATTR_ATTRIBS_MASK;
     if (force_set || attr != 0)
@@ -1813,6 +2361,39 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     }
     *attr |= get_file_attributes( st );
 
+#ifdef WINE_IOS
+    /* ml910: one listxattr for both names, memoised by (dev, ino, ctime).
+     * NOTE the is_hidden_file() fallback below is preserved exactly: it
+     * applies whenever the DOS-attribute xattr is absent, which is what a
+     * clear IOS_XA_DOSATTR bit means. */
+    {
+        int xb = ios_xa_bits( path, -1, st );
+
+        if (xb >= 0)
+        {
+            if (xb & IOS_XA_REPARSE)
+            {
+                attr_len = ios_xattr_get_raw( path, XATTR_REPARSE, buffer, sizeof(buffer) );
+                if (attr_len >= 0 && attr_len >= sizeof(ULONG))
+                {
+                    *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+                    if (reparse_tag) memcpy( reparse_tag, buffer, sizeof(ULONG) );
+                }
+            }
+            if (xb & IOS_XA_DOSATTR)
+            {
+                attr_len = ios_xattr_get_raw( path, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
+                if (attr_len != -1)
+                {
+                    *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
+                    return ret;
+                }
+            }
+            if (is_hidden_file( path )) *attr |= FILE_ATTRIBUTE_HIDDEN;
+            return ret;
+        }
+    }
+#endif
     attr_len = xattr_get( path, XATTR_REPARSE, buffer, sizeof(buffer) );
     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
     {
@@ -2890,6 +3471,11 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
 /******************************************************************************
  *              NtQueryDirectoryFile   (NTDLL.@)
  */
+#ifdef WINE_IOS
+/* ml910: wrap-with-macro, so the upstream body below is untouched and the
+ * exported symbol is the counting wrapper that follows it. */
+#define NtQueryDirectoryFile ios_inner_NtQueryDirectoryFile
+#endif
 NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc_routine,
                                       void *apc_context, IO_STATUS_BLOCK *io, void *buffer, ULONG length,
                                       FILE_INFORMATION_CLASS info_class, BOOLEAN single_entry,
@@ -2980,6 +3566,21 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
     TRACE( "=> %x (%ld)\n", status, io->Information );
     return status;
 }
+#ifdef WINE_IOS
+#undef NtQueryDirectoryFile
+NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc_routine,
+                                      void *apc_context, IO_STATUS_BLOCK *io, void *buffer, ULONG length,
+                                      FILE_INFORMATION_CLASS info_class, BOOLEAN single_entry,
+                                      UNICODE_STRING *mask, BOOLEAN restart_scan )
+{
+    unsigned long long t0 = ios_fs_now_us();
+    NTSTATUS status = ios_inner_NtQueryDirectoryFile( handle, event, apc_routine, apc_context, io,
+                                                      buffer, length, info_class, single_entry,
+                                                      mask, restart_scan );
+    ios_fs_note( IOS_OP_QDIR, t0, ios_fs_now_us() );
+    return status;
+}
+#endif
 
 
 /***********************************************************************
@@ -2998,6 +3599,10 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     struct dirent *de;
     struct stat st;
     int fd, ret;
+#ifdef WINE_IOS
+    char ios_key[IOS_PC_KEYMAX];
+    int ios_cacheable = 0;
+#endif
 
     /* try a shortcut for this directory */
 
@@ -3006,9 +3611,39 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     if (ret >= 0 && ret <= MAX_DIR_ENTRY_LEN)
     {
         unix_name[pos + ret] = 0;
-        if (!fstatat( root_fd, unix_name, &st, 0 )) return STATUS_SUCCESS;
+        if (!fstatat( root_fd, unix_name, &st, 0 ))
+        {
+#ifdef WINE_IOS
+            IOS_FSA( ios_fs_exact, 1 );
+#endif
+            return STATUS_SUCCESS;
+        }
     }
     if (check_case) goto not_found;  /* we want an exact match */
+
+#ifdef WINE_IOS
+    /* ml910: this component's spelling differs from what the caller asked
+     * for.  Upstream now pays getattrlistat + openat + fdopendir + a full
+     * getdirentries scan for it, every single time, forever.  Ask the
+     * resolved-name cache first; one fstatat re-validates the answer. */
+    IOS_FSA( ios_fs_scan, 1 );
+    if (root_fd == AT_FDCWD && ret > 0 && ret <= MAX_DIR_ENTRY_LEN &&
+        ios_pc_key( ios_key, sizeof(ios_key), unix_name, pos + ret, pos ))
+    {
+        ios_cacheable = 1;
+        if (ios_pc_get( ios_key, unix_name + pos, MAX_DIR_ENTRY_LEN + 1 ))
+        {
+            IOS_FSA( ios_fs_pc_hit, 1 );
+            if (!fstatat( root_fd, unix_name, &st, 0 )) return STATUS_SUCCESS;
+            IOS_FSA( ios_fs_pc_stale, 1 );
+            /* the cached spelling is gone: restore what was asked for and
+             * let the upstream scan below produce a fresh answer */
+            ntdll_wcstoumbs( name, length, unix_name + pos, MAX_DIR_ENTRY_LEN + 1, TRUE );
+            unix_name[pos + ret] = 0;
+        }
+        else IOS_FSA( ios_fs_pc_miss, 1 );
+    }
+#endif
 
     if (pos > 1) unix_name[pos - 1] = 0;
     else unix_name[1] = 0;  /* keep the initial slash */
@@ -3087,6 +3722,9 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
         {
             strcpy( unix_name + pos, de->d_name );
             closedir( dir );
+#ifdef WINE_IOS
+            if (ios_cacheable) ios_pc_put( ios_key, unix_name + pos );
+#endif
             return STATUS_SUCCESS;
         }
 
@@ -3100,6 +3738,9 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
             {
                 strcpy( unix_name + pos, de->d_name );
                 closedir( dir );
+#ifdef WINE_IOS
+                if (ios_cacheable) ios_pc_put( ios_key, unix_name + pos );
+#endif
                 return STATUS_SUCCESS;
             }
         }
@@ -3574,6 +4215,11 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
     struct stat st;
     char *unix_name = *buffer;
     const WCHAR *ptr, *end;
+#ifdef WINE_IOS
+    char *ios_key = NULL;
+    const int ios_pos0 = pos;
+    unsigned int ios_depth = 0;
+#endif
 
     /* check syntax of individual components */
 
@@ -3613,10 +4259,52 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
             return STATUS_SUCCESS;
         }
+#ifdef WINE_IOS
+        /* ml910: the whole path in the requested spelling does not exist, so
+         * upstream now walks it component by component and scans a directory
+         * for every component whose on-disk case differs.  Ask the
+         * resolved-name cache for the whole remaining path first: a repeat
+         * open of a deep path then costs this one extra fstatat instead of
+         * ~5 syscalls per component.  Keyed on the case-folded request, so a
+         * later exact-case file still wins — the shortcut above runs first
+         * and we are never reached for it. */
+        if (root_fd == AT_FDCWD && !is_unix)
+        {
+            char kbuf[IOS_PC_KEYMAX];
+
+            if (ios_pc_key( kbuf, sizeof(kbuf), unix_name, pos + 1 + ret, pos + 1 ))
+            {
+                if (ios_pc_get( kbuf, unix_name + pos + 1, unix_len - pos - 1 ))
+                {
+                    IOS_FSA( ios_fs_pc_hit, 1 );
+                    if (!fstatat( root_fd, unix_name, &st, 0 ))
+                    {
+                        if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
+                        return STATUS_SUCCESS;
+                    }
+                    IOS_FSA( ios_fs_pc_stale, 1 );
+                }
+                else
+                {
+                    size_t klen = strlen( kbuf );
+                    IOS_FSA( ios_fs_pc_miss, 1 );
+                    if ((ios_key = malloc( klen + 1 )))   /* remember it for the put below */
+                        memcpy( ios_key, kbuf, klen + 1 );
+                }
+                /* the buffer is rewritten from `pos` by find_file_in_dir(),
+                 * so nothing has to be restored here */
+            }
+        }
+#endif
     }
 
     if (!name_len)  /* empty name -> drive root doesn't exist */
+    {
+#ifdef WINE_IOS
+        free( ios_key );
+#endif
         return STATUS_OBJECT_PATH_NOT_FOUND;
+    }
     if (is_unix && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE))
         return STATUS_OBJECT_NAME_NOT_FOUND;
 
@@ -3666,6 +4354,9 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
                                                     unix_len, pos, disposition, open_reparse, is_unix, reparse_count );
                     close( reparse_fd );
                     free( reparse_name );
+#ifdef WINE_IOS
+                    free( ios_key );   /* reparse walks a different path; never cached */
+#endif
                     return status;
                 }
             }
@@ -3704,8 +4395,22 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
         pos += strlen( unix_name + pos );
         nt_pos += next - name;
         name = next;
+#ifdef WINE_IOS
+        ios_depth++;
+#endif
     }
 
+#ifdef WINE_IOS
+    IOS_FSA( ios_fs_depth[ios_depth > IOS_FS_DEPTH_MAX ? IOS_FS_DEPTH_MAX : ios_depth], 1 );
+    if (ios_key)
+    {
+        /* Only a fully resolved path is worth remembering: a NO_SUCH_FILE
+         * result ends in a name that does not exist yet, and caching that
+         * would be a negative entry with nothing cheap to invalidate it. */
+        if (status == STATUS_SUCCESS) ios_pc_put( ios_key, *buffer + ios_pos0 + 1 );
+        free( ios_key );
+    }
+#endif
     return status;
 }
 
@@ -4689,6 +5394,9 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     BOOL name_hidden = FALSE;
     BOOL created = FALSE;
     unsigned int status;
+#ifdef WINE_IOS
+    unsigned long long ios_t0 = ios_fs_now_us();
+#endif
 
     TRACE( "handle=%p access=%08x name=%s objattr=%08x root=%p sec=%p io=%p alloc_size=%p "
            "attr=%08x sharing=%08x disp=%d options=%08x ea=%p.0x%08x\n",
@@ -4867,6 +5575,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
                  ios_file_fail_logged, status, disposition, access, options,
                  unix_name ? unix_name : "(none)", nb );
     }
+    ios_fs_note( created ? IOS_OP_CREATE : IOS_OP_OPEN, ios_t0, ios_fs_now_us() );
 #endif
     free( unix_name );
     free( nt_name.Buffer );
@@ -5006,6 +5715,9 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
+#ifdef WINE_IOS
+    unsigned long long ios_t0 = ios_fs_now_us();
+#endif
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
     {
@@ -5022,6 +5734,9 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
     free( nt_name.Buffer );
+#ifdef WINE_IOS
+    ios_fs_note( IOS_OP_QFULL, ios_t0, ios_fs_now_us() );
+#endif
     return status;
 }
 
@@ -5035,6 +5750,9 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     unsigned int status;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES new_attr = *attr;
+#ifdef WINE_IOS
+    unsigned long long ios_t0 = ios_fs_now_us();
+#endif
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
     {
@@ -5051,6 +5769,9 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
     free( nt_name.Buffer );
+#ifdef WINE_IOS
+    ios_fs_note( IOS_OP_QATTR, ios_t0, ios_fs_now_us() );
+#endif
     return status;
 }
 
@@ -5058,6 +5779,9 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
 /******************************************************************************
  *              NtQueryInformationFile   (NTDLL.@)
  */
+#ifdef WINE_IOS
+#define NtQueryInformationFile ios_inner_NtQueryInformationFile
+#endif
 NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                                         void *ptr, ULONG len, FILE_INFORMATION_CLASS class )
 {
@@ -5313,6 +6037,17 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     if (status == STATUS_SUCCESS && !io->Information) io->Information = info_sizes[class];
     return io->Status = status;
 }
+#ifdef WINE_IOS
+#undef NtQueryInformationFile
+NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+                                        void *ptr, ULONG len, FILE_INFORMATION_CLASS class )
+{
+    unsigned long long t0 = ios_fs_now_us();
+    NTSTATUS status = ios_inner_NtQueryInformationFile( handle, io, ptr, len, class );
+    ios_fs_note( IOS_OP_QINFO, t0, ios_fs_now_us() );
+    return status;
+}
+#endif
 
 
 /******************************************************************************
@@ -6336,6 +7071,9 @@ static void ios_js_read_note( HANDLE handle, int unix_fd, const void *buffer, UL
 }
 #endif
 
+#ifdef WINE_IOS
+#define NtReadFile ios_inner_NtReadFile
+#endif
 NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
                             IO_STATUS_BLOCK *io, void *buffer, ULONG length,
                             LARGE_INTEGER *offset, ULONG *key )
@@ -6349,6 +7087,9 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
     enum server_fd_type type;
     ULONG_PTR cvalue = apc ? 0 : (ULONG_PTR)apc_user;
     BOOL send_completion = FALSE, async_read, timeout_init_done = FALSE;
+#ifdef WINE_IOS
+    int ios_positioned = 0;
+#endif
 
     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
            handle, event, apc, apc_user, io, buffer, length, offset, key );
@@ -6415,7 +7156,12 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
 #endif
 
     if (status == STATUS_BAD_DEVICE_TYPE)
+    {
+#ifdef WINE_IOS
+        IOS_FSA( ios_fs_read_srv, 1 );      /* wineserver round trip for the data itself */
+#endif
         return server_read_file( handle, event, apc, apc_user, io, buffer, length, offset, key );
+    }
 
     async_read = !(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT));
 
@@ -6441,6 +7187,15 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
             if (!async_read) /* update file pointer position */
                 lseek( unix_handle, offset->QuadPart + result, SEEK_SET );
 
+#ifdef WINE_IOS
+            /* ml910: the good path — one pread() straight off the cached
+             * unix fd, no wineserver round trip.  The only fixed extra cost
+             * is the lseek above, which a synchronous handle needs so that
+             * FilePositionInformation and pointer-relative reads stay
+             * correct; nothing here does a redundant fstat per read. */
+            IOS_FSA( ios_fs_read_pos, 1 );
+            ios_positioned = 1;
+#endif
             total = result;
             status = (total || !length) ? STATUS_SUCCESS : STATUS_END_OF_FILE;
             goto done;
@@ -6568,6 +7323,8 @@ done:
     if (status == STATUS_SUCCESS && total)
         ios_js_read_note( handle, unix_handle, buffer, length, total, offset );
     ios_video_read_note( handle, status, total, offset );
+    IOS_FSA( ios_fs_read_bytes, total );
+    if (!ios_positioned) IOS_FSA( ios_fs_read_sync, 1 );
 #endif
     send_completion = cvalue != 0;
 
@@ -6594,6 +7351,18 @@ err:
         add_completion( handle, cvalue, status, total, ret_status == STATUS_PENDING );
     return ret_status;
 }
+#ifdef WINE_IOS
+#undef NtReadFile
+NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
+                            IO_STATUS_BLOCK *io, void *buffer, ULONG length,
+                            LARGE_INTEGER *offset, ULONG *key )
+{
+    unsigned long long t0 = ios_fs_now_us();
+    NTSTATUS status = ios_inner_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
+    ios_fs_note( IOS_OP_READ, t0, ios_fs_now_us() );
+    return status;
+}
+#endif
 
 
 /******************************************************************************
