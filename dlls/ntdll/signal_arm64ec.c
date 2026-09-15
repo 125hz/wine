@@ -1790,12 +1790,121 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
     return status;
 }
 
+/* iOS-Madeira ml980: THE SIX REGISTERS AN x64 CONTEXT CANNOT CARRY.
+ *
+ * context_x64_to_arm() (unwind.h:144-153) writes X13 = X14 = X18 = X23 =
+ * X24 = X28 = 0 into every native context it builds, because the x64
+ * CONTEXT has no field for them. On a stock arm64ec host that is fine --
+ * they belong to the emulator, and the emulator is re-entered through
+ * KiUserEmulationDispatcher, which reloads its whole world.
+ *
+ * FEX's ARM64EC backend does not leave them spare:
+ *
+ *   x23 = the GUEST RSP    FEXCore/Source/Interface/Core/ArchHelpers/
+ *                          Arm64Emitter.cpp:142-146 -- "SP's register
+ *                          location isn't specified by the ARM64EC ABI,
+ *                          we choose to use r23"
+ *   x28 = STATE, the CpuStateFrame pointer      Arm64Emitter.h:33
+ *   x24 = REG_AF                                Arm64Emitter.h:66
+ *   x13 = TMP4                                  Arm64Emitter.h:63
+ *   x14 = a dynamically allocated GPR           Arm64Emitter.cpp:171
+ *
+ * So a Get/SetThreadContext pair that changes nothing still resumes the
+ * target with guest RSP = 0 and no CPU-state pointer whenever the resume
+ * lands NATIVELY back on emitted code. A caller cannot ask for those
+ * values through an x64 CONTEXT, so a zero arriving in one is never
+ * intent -- it is the mapping's hole. Fill it from the target's live
+ * context. A native ARM64 context (FEX's own NtContinueNative, which is a
+ * direct syscall) carries real values and never comes through here.
+ *
+ * ntdll-unix carries the same repair at the point of resume
+ * (build/ntdll-unix/signal_arm64_ios.c, signal_set_full_context), so the
+ * guarantee holds even for a context this wrapper never saw. */
+static void merge_emulator_regs( HANDLE handle, ARM64_NT_CONTEXT *arm_ctx )
+{
+    ARM64_NT_CONTEXT cur;
+
+    if (!(arm_ctx->ContextFlags & CONTEXT_ARM64_INTEGER)) return;
+    memset( &cur, 0, sizeof(cur) );
+    cur.ContextFlags = CONTEXT_ARM64_INTEGER;
+    if (syscall_NtGetContextThread( handle, &cur )) return;
+    if (!arm_ctx->X13) arm_ctx->X13 = cur.X13;
+    if (!arm_ctx->X14) arm_ctx->X14 = cur.X14;
+    if (!arm_ctx->X23) arm_ctx->X23 = cur.X23;
+    if (!arm_ctx->X24) arm_ctx->X24 = cur.X24;
+    if (!arm_ctx->X28) arm_ctx->X28 = cur.X28;
+}
+
+/* ml980: report the EMULATED Rsp/Rip for a thread parked in emitted code.
+ *
+ * Unproven on device, so opt-in: MADEIRA_CTX_EMU=1. It changes what every
+ * GetThreadContext caller sees, and SetThreadContext's meaning changes with
+ * it (an Rsp the caller was given as the guest RSP must go back as one), so
+ * the pair is deliberately behind a single switch. */
+static int ctx_emu_view(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MADEIRA_CTX_EMU" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length && buf[0] == '1');
+    }
+    return on;
+}
+
+/* FEX's CpuStateFrame is CpuArea->EmulatorData[0] and keeps the guest RIP at
+ * +0x18; x28 holds the same pointer while emitted code runs. The two are
+ * checked against each other so a stale or clobbered x28 cannot fabricate a
+ * RIP. Returns 0 when there is no trustworthy answer -- callers keep the host
+ * value rather than invent one. */
+static ULONG64 emulated_rip( HANDLE handle, ULONG64 x28 )
+{
+    CHPE_V2_CPU_AREA_INFO *cpu = NULL;
+    ULONG64 state;
+
+    if (!x28) return 0;
+    if (handle == GetCurrentThread()) cpu = get_arm64ec_cpu_area();
+    else
+    {
+        THREAD_BASIC_INFORMATION tbi;
+
+        if (NtQueryInformationThread( handle, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ))
+            return 0;
+        if (!tbi.TebBaseAddress) return 0;
+        cpu = ((TEB *)tbi.TebBaseAddress)->ChpeV2CpuAreaInfo;
+    }
+    if (!cpu) return 0;
+    state = (ULONG64)(ULONG_PTR)cpu->EmulatorData[0];
+    if (!state || state != x28) return 0;
+    return ((ULONG64 *)(ULONG_PTR)state)[0x18 / 8];
+}
+
 NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
     ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags ) };
     NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
 
     if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
+
+    /* ml980: context_arm_to_x64() maps Sp->Rsp and Pc->Rip verbatim, which is
+     * the emulated state only while the target is running genuine EC code. In
+     * FEX's emitted code the guest RSP is x23 and the guest RIP lives in the
+     * CpuStateFrame; the host sp/pc are the emulator's own and mean nothing to
+     * an x64 caller -- which then hands them straight back through
+     * SetThreadContext. Substitute the emulated pair. */
+    if (!status && ctx_emu_view() && !RtlIsEcCode( arm_ctx.Pc ) &&
+        (arm_ctx.ContextFlags & CONTEXT_ARM64_CONTROL) && arm_ctx.X23)
+    {
+        ARM64EC_NT_CONTEXT *ec = (ARM64EC_NT_CONTEXT *)context;
+        ULONG64 rip = emulated_rip( handle, arm_ctx.X28 );
+
+        ec->Sp = arm_ctx.X23;
+        if (rip) ec->Pc = rip;
+    }
 
     /* ml715: WHAT THE CALLER ACTUALLY RECEIVES.
      *
@@ -2244,6 +2353,7 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
     ARM64_NT_CONTEXT arm_ctx;
 
     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    merge_emulator_regs( handle, &arm_ctx );   /* ml980 */
     return syscall_NtSetContextThread( handle, &arm_ctx );
 }
 

@@ -78,8 +78,18 @@
  * other target the calls compile to nothing at all. */
 #ifdef WINE_IOS
 # include "ios_srv_stats.h"
+/* ml970: the spin governor's streak / time-to-progress histogram, printed
+ * by [srv-stats] in build/ntdll-unix/server_ios.c. */
+# include "ios_spin_hist.h"
 #else
 # define ios_srv_nt_count(which) ((void)0)
+# define IOS_SPIN_HIST_N 16
+struct ios_spin_snapshot
+{
+    unsigned int calls[IOS_SPIN_HIST_N], us[IOS_SPIN_HIST_N];
+    unsigned int streaks, gov_sleep0, gov_yield, sys_yield, sys_park;
+    unsigned int us_p50, us_p80, warm_hits;
+};
 #endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
@@ -327,13 +337,13 @@ static int madeira_fastsync_enabled(void)
         return __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED );
 
     if (on)
-        ERR( "[fastsync] ON rev=ml962 cells=%u cache=%u spin=%u cap=%uus - in-process event "
+        ERR( "[fastsync] ON rev=ml972 cells=%u cache=%u spin=%u cap=%uus - in-process event "
              "set/reset/wait with no wineserver round trip; unset MADEIRA_FASTSYNC to disable, "
              "MADEIRA_FASTSYNC_CAP_US=N to retune the park cap\n",
              (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)MADEIRA_FAST_CACHE_SIZE,
              (unsigned int)MADEIRA_FAST_SPIN, (unsigned int)(madeira_fast_cap_ns / 1000) );
     else
-        ERR( "[fastsync] OFF (MADEIRA_FASTSYNC=1 enables) rev=ml962\n" );
+        ERR( "[fastsync] OFF (MADEIRA_FASTSYNC=1 enables) rev=ml972\n" );
     return on;
 }
 
@@ -343,9 +353,35 @@ static inline unsigned int madeira_fast_pid(void)
     return teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
 }
 
+/* ml972 DEFECT 1, HALF A: THE BUDGET CLOCK MUST BE THE PARK CLOCK.
+ *
+ * madeira_fast_park() parks with OS_CLOCK_MACH_ABSOLUTE_TIME (and, on the
+ * pre-17.4 ladder, __ulock_wait, which is the same time base).  That clock is
+ * mach_absolute_time(): it does NOT advance while the system is asleep.
+ *
+ * ml962 measured the same interval with clock_gettime_nsec_np(
+ * CLOCK_MONOTONIC_RAW), and CLOCK_MONOTONIC_RAW is documented to be the one
+ * that DOES keep incrementing while the system is asleep (CLOCK_UPTIME_RAW is
+ * "the same as CLOCK_MONOTONIC_RAW but does not increment while the system is
+ * asleep").  So the two clocks measure the park differently by exactly the
+ * amount of time the AP spent asleep inside it, and the fall-through
+ * arithmetic below charged that sleep to the CALLER's timeout: a 300 ms
+ * WaitForSingleObject could hand server_wait a remainder of zero and come
+ * straight back with STATUS_TIMEOUT.  Use the clock the park actually counts.
+ *
+ * CLOCK_UPTIME_RAW == mach_absolute_time() converted to ns; the mach fallback
+ * below exists because clock_gettime_nsec_np() reports failure by returning 0,
+ * and a 0 here would poison every interval it is subtracted from. */
 static inline unsigned long long madeira_now_ns(void)
 {
-    return clock_gettime_nsec_np( CLOCK_MONOTONIC_RAW );
+    unsigned long long ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+
+    if (ns) return ns;
+    {
+        static mach_timebase_info_data_t tb;
+        if (!tb.denom) mach_timebase_info( &tb );
+        return mach_absolute_time() * tb.numer / tb.denom;
+    }
 }
 
 /* ml962: the seqlock WRITE side, corrected.
@@ -447,9 +483,15 @@ void madeira_fast_close( HANDLE handle )
 
 /* Returns the cell for `handle', or NULL for "use the server".  `access' is
  * the access the caller needs; if the handle does not have it we return NULL
- * so the slow path can produce the real STATUS_ACCESS_DENIED. */
+ * so the slow path can produce the real STATUS_ACCESS_DENIED.
+ *
+ * ml972: `gen_out' receives the cell generation this answer is valid for.  A
+ * caller that goes on to BLOCK on the cell must re-check it (see
+ * madeira_cell_alive() and defect 2 in madeira_fast_wait): the cell can be
+ * freed and handed to an entirely different event while the caller is parked
+ * on it, and the state word alone cannot tell the two apart. */
 static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK access,
-                                                      unsigned int *manual )
+                                                      unsigned int *manual, unsigned int *gen_out )
 {
     unsigned int h = wine_server_obj_handle( handle );
     unsigned int pid = madeira_fast_pid();
@@ -496,6 +538,7 @@ static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK
             if (__atomic_load_n( &cell->gen, __ATOMIC_ACQUIRE ) == gen)
             {
                 *manual = man;
+                *gen_out = gen;
                 return cell;
             }
             ios_srv_nt_count( IOS_FS_STALE_GEN );
@@ -571,7 +614,21 @@ static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK
 
     if ((acc & access) != access) return NULL;
     *manual = man;
+    *gen_out = gen;
     return cell;
+}
+
+/* ml972: "is this still the cell we were told about?"
+ *
+ * Cell allocation and freeing are server-side, and `gen' is bumped on BOTH, so
+ * a mismatch means the event we resolved has been destroyed and the cell has
+ * (possibly) already been handed to another event.  Every operation that can
+ * observe the cell AFTER an unbounded pause -- i.e. after a park -- has to ask
+ * again, because the state word of the NEW occupant is a perfectly ordinary
+ * RESET/SET and is indistinguishable from the old one's. */
+static inline int madeira_cell_alive( const struct madeira_sync_cell *cell, unsigned int gen )
+{
+    return __atomic_load_n( &cell->gen, __ATOMIC_ACQUIRE ) == gen;
 }
 
 /* Take the token if there is one.  A manual-reset event is never consumed; an
@@ -591,16 +648,22 @@ static inline int madeira_fast_try( struct madeira_sync_cell *cell, unsigned int
 static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, LONG *prev_state )
 {
     struct madeira_sync_cell *cell;
-    unsigned int manual = 0;
+    unsigned int manual = 0, gen = 0;
     int want = set ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET;
     int prev;
 
     if (!madeira_fastsync_enabled()) return MADEIRA_FAST_MISS;
-    if (!(cell = madeira_fast_lookup( handle, EVENT_MODIFY_STATE, &manual )))
+    if (!(cell = madeira_fast_lookup( handle, EVENT_MODIFY_STATE, &manual, &gen )))
         return MADEIRA_FAST_MISS;
 
     for (;;)
     {
+        /* ml972: a freed cell passes through DISABLED, but the server can
+         * re-allocate it to another event before we look, and then the word
+         * reads as an ordinary RESET/SET.  The generation is the only thing
+         * that separates "my event" from "the event that got my cell", so test
+         * it on every attempt rather than trusting DISABLED to still be there. */
+        if (!madeira_cell_alive( cell, gen )) return MADEIRA_FAST_MISS;
         prev = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
         if (prev == MADEIRA_CELL_DISABLED) return MADEIRA_FAST_MISS;  /* pulsed, or freed */
         /* ml962: MADEIRA_CELL_CLAIMED means the server has decided, inside
@@ -653,13 +716,13 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
                                    const LARGE_INTEGER **fallback, LARGE_INTEGER *store )
 {
     struct madeira_sync_cell *cell;
-    unsigned int manual = 0;
-    unsigned long long t0, budget_ns;
-    int i, st;
+    unsigned int manual = 0, gen = 0;
+    unsigned long long t0, spent = 0, budget_ns;
+    int i, st, rounds;
 
     *fallback = timeout;
     if (!madeira_fastsync_enabled()) return STATUS_NOT_IMPLEMENTED;
-    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual )))
+    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )))
         return STATUS_NOT_IMPLEMENTED;
 
     if (madeira_fast_try( cell, manual ))
@@ -694,10 +757,16 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
         (unsigned long long)(-timeout->QuadPart) * 100 < budget_ns)
         budget_ns = (unsigned long long)(-timeout->QuadPart) * 100;
 
+    /* ml972: `rounds' bounds the loop independently of the clock.  Every
+     * iteration either parks for the whole remaining budget or finds the word
+     * already changed, so a handful of rounds is plenty; the point of the
+     * counter is that a clock which stops, jumps or returns garbage can no
+     * longer turn this into an unbounded spin (or, with the old code, into a
+     * single pass that charged the caller a bogus amount of time). */
     t0 = madeira_now_ns();
-    for (;;)
+    for (rounds = 0; rounds < 64; rounds++)
     {
-        unsigned long long spent = madeira_now_ns() - t0;
+        spent = madeira_now_ns() - t0;
 
         if (spent >= budget_ns) break;
 
@@ -710,6 +779,39 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
              * between the load above and here does not sleep */
             madeira_fast_park( &cell->state, MADEIRA_CELL_RESET, budget_ns - spent );
         }
+
+        /* ml972 DEFECT 2: THE PARK IS THE ONE UNBOUNDED PAUSE IN HERE, AND THE
+         * CELL CAN CHANGE OWNER ACROSS IT.
+         *
+         * While this thread was parked the event it is waiting for can be
+         * destroyed (its last handle closed) and the server can hand the cell
+         * to a brand new event.  madeira_cell_free() does store DISABLED and
+         * wake everyone, but the very next create_event can re-allocate the
+         * same cell and store RESET or SET over it before this thread is
+         * scheduled -- and at that point the state word is indistinguishable
+         * from our own event's.  Two things go wrong without this check:
+         *
+         *  - madeira_fast_try() below would CONSUME the new occupant's
+         *    auto-reset token: one SetEvent delivered to a thread that never
+         *    waited on that event, and the thread that did wait never woken.
+         *    With a loader creating and closing events thousands of times a
+         *    second, cells are recycled constantly and that is a lost wakeup
+         *    on a live handshake -- a worker that never resumes.
+         *
+         *  - the `waiters' decrement would pay back a count the server has
+         *    already zeroed (madeira_cell_alloc resets it), taking the new
+         *    occupant's count to -1.  The next genuine waiter's `waiters++'
+         *    then brings it back to 0, so a setter's `if (waiters) wake' does
+         *    nothing and that waiter sleeps out the whole cap on every handoff
+         *    from then on.  Over-counting only ever costs a spurious
+         *    os_sync_wake, so leave the count alone instead.
+         *
+         * The generation is bumped on both free and alloc, so one load decides
+         * it.  A mismatch means "this handle is no longer mine to reason
+         * about": hand the wait to the server, which owns the handle table and
+         * will return the real status (including STATUS_INVALID_HANDLE if the
+         * handle really is gone). */
+        if (!madeira_cell_alive( cell, gen )) break;
         __atomic_sub_fetch( &cell->waiters, 1, __ATOMIC_SEQ_CST );
 
         /* DISABLED (pulsed/freed) or CLAIMED (a server-side waiter is being
@@ -724,7 +826,34 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
 
     if (timeout && timeout->QuadPart < 0)
     {
-        long long left = -timeout->QuadPart - (long long)((madeira_now_ns() - t0) / 100);
+        /* ml972 DEFECT 1, HALF B: THE REMAINDER IS AN INVARIANT, NOT A
+         * MEASUREMENT.
+         *
+         * budget_ns is by construction min(cap, the caller's whole timeout),
+         * and the loop above may not park past it -- so this function can only
+         * ever have consumed budget_ns of the caller's wait.  ml962 instead
+         * re-read the clock here and subtracted whatever came out, which made
+         * the caller's remaining timeout a function of the clock rather than
+         * of the policy: any overshoot (a clock that counts time the park did
+         * not, a park that overslept its own timeout, a preemption between the
+         * last loop test and here) came straight off the caller's budget, and
+         * a large enough one drove `left' to zero.  A zero relative timeout is
+         * not "no time left", it is Wine's POLL: server_wait returns
+         * STATUS_TIMEOUT without waiting at all.  That is the reported bug --
+         * WaitForSingleObject(ev, 300) returning WAIT_TIMEOUT after 0 ms --
+         * and in a program that treats a timed wait as a sleep it is also an
+         * unbounded busy loop.
+         *
+         * Clamping the elapsed time to the budget makes the failure
+         * unrepresentable: left >= |timeout| - budget_ns/100 >= 0, and it is 0
+         * only when the budget WAS the caller's whole timeout (a wait shorter
+         * than the cap, which really has expired).  Erring long is the safe
+         * direction for a timeout; erring short is a wait that never waits. */
+        long long left;
+
+        spent = madeira_now_ns() - t0;
+        if (spent > budget_ns) spent = budget_ns;
+        left = -timeout->QuadPart - (long long)(spent / 100);
         store->QuadPart = (left > 0) ? -left : 0;
         *fallback = store;
     }
@@ -3161,107 +3290,135 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
 
 
 /******************************************************************
- *              iOS-Madeira ml950: the Sleep(0) spin
+ *              iOS-Madeira ml970: ONE spin governor, for Sleep(0) AND
+ *                                 for SwitchToThread
  *
- * [prof] on a 32-bit D3D9 title put 5-21 % of ALL CPU in
- * swtch_pri <- NtDelayExecution+0x24c: the guest spins on Sleep(0) waiting
- * for another of its own threads, and every single call costs a syscall.
+ * HISTORY.  ml950 discovered that a 32-bit D3D9 title spins on Sleep(0) and
+ * gave it a pause/yield ladder; ml951 turned the periodic yield into a bounded
+ * futex park once a streak was unambiguously a spin; ml960 made the park
+ * length escalate (10/50/200 us at streaks 512/4096/32768) because one rung
+ * was still 33 k syscalls/s.  All three tuned the SMALLER of this process's
+ * two spins.
  *
- * The Windows semantic that must survive is "a zero-timeout sleep lets other
- * runnable threads have the CPU".  A spin that never yields can livelock two
- * guest threads that the scheduler has put on the same core, so this does not
- * simply delete the yield: it makes the FIRST IOS_SLEEP0_FREE_SPINS calls of
- * a streak a userspace pause (~200 ns of `isb sy`, which is a pipeline drain,
- * not a busy loop that the core can speculate through) and then yields for
- * real once every IOS_SLEEP0_YIELD_EVERY calls.  Worst-case added latency
- * before the first real yield is ~3 us, and the syscall rate falls from
- * 1000 per 1000 Sleep(0) to (1000 - 16)/8 + 1 = 124.
+ * ml970 MEASUREMENT (log 46: 10 min of the same title at 40-60 fps; per 10 s
+ * [srv-stats] window, 20 windows):
  *
- * "Streak" means back-to-back: a Sleep(0) issued once per frame is pacing,
- * not spinning, and must keep yielding, so the counter resets if more than
- * IOS_SLEEP0_WINDOW passes between calls, and ios_spin_reset() clears it from
- * any real wait (server_wait in server_ios.c) or any non-zero sleep.  State
- * is native __thread — no TEB, so threads created by FEX/CEF are safe.
+ *     sleep0   = 1.27 - 2.01 M     (127 - 201 k Sleep(0)/s)
+ *     park     = 108 - 196 k       ( 11 -  20 k futex parks/s -- the ladder)
+ *     yield_sc = 8.2  - 14.3 M     (0.8 - 1.4 M sched_yield/s)   <-- the find
+ *
+ * and [prof] localises the yields to a single thread:
+ *
+ *     swtch_pri     <- Madeira`NtYieldExecution+0x28    13.9 - 15.2 % of ALL CPU
+ *       kern by thread: -> tid=00c0 = 100 %             (one thread, no others)
+ *     __ulock_wait2 <- Madeira`NtDelayExecution+0x3f4    6.6 -  8.6 %
+ *     swtch_pri     <- Madeira`NtDelayExecution+0x410    2.8 -  3.7 %
+ *
+ * The two NtDelayExecution entries ARE the old ladder: ios_delay_zero is
+ * inlined into NtDelayExecution, so both its park and its yield carry
+ * NtDelayExecution return addresses.  NtYieldExecution+0x28 therefore cannot
+ * be the ladder -- it is the EXPORTED entry point, i.e. callers from outside
+ * this file.  There are only three: win32u's message pump (ml940, hard-capped
+ * at 5 k/s), server_wait's zero-timeout poll streak (the whole process issues
+ * 3.7 k server requests/s, so at most that), and the guest's own
+ * SwitchToThread through wow64.  The ladder can account for at most ~60 k of
+ * the 11.5 M yields in a window.  So ~99.5 % of 1.15 M sched_yield/s is ONE
+ * 32-bit guest thread -- the render thread -- calling SwitchToThread in a spin
+ * loop, and it had no throttle of any kind: every call was a syscall.  That is
+ * 7x more Sleep(0)-equivalent spinning than Sleep(0) itself, and it is the
+ * single largest kernel entry in the process.
+ *
+ * WHAT THE OLD LADDER GOT WRONG, besides missing that caller.  Its rungs are
+ * indexed by CALL COUNT, so how deep a spinner gets depends on how fast its
+ * loop happens to iterate, not on how long it has been waiting: a tight
+ * SwitchToThread loop reaches rung 3 in microseconds while a loop with real
+ * work between polls never leaves rung 0.  And its syscall rate is
+ * 1-in-IOS_SLEEP0_YIELD_EVERY *calls*, which is a rate the ladder cannot bound
+ * -- 1.15 M calls/s at 1-in-8 would still be 144 k syscalls/s.
+ *
+ * THE POLICY.  Index everything by ELAPSED SPIN TIME, and bound the KERNEL
+ * ENTRY RATE directly instead of the call rate:
+ *
+ *   - between kernel entries the thread spins in userspace with an `isb sy'
+ *     pause whose length doubles every 8 calls (8 -> 256 isb, ~100 ns -> ~3 us).
+ *     A userspace poll adds NO handoff latency and costs no syscall, which is
+ *     exactly the trade a spin-wait wants; the reason to leave userspace at all
+ *     is fairness, not latency.
+ *   - the thread enters the kernel at most once per GAP, where GAP grows with
+ *     how long this streak has already run:
+ *
+ *         spun <  50 us : gap  20 us     park  15 us
+ *         spun < 500 us : gap 100 us     park  15 us
+ *         spun <   5 ms : gap 300 us     park  30 us
+ *         spun >=  5 ms : gap 500 us     park  60 us
+ *
+ *     so a permanently spinning thread costs 1/500 us = 2 k syscalls/s, and the
+ *     two spinning threads in this workload cost ~4 k/s together (target: 5 k).
+ *   - the FIRST kernel entry of a streak is a real sched_yield(), every later
+ *     one is a bounded futex park.  An isolated SwitchToThread or Sleep(0) --
+ *     one that is pacing, not spinning -- therefore still performs a real,
+ *     immediate yield, byte for byte the old semantics; only the 2nd and later
+ *     calls of a back-to-back streak are governed.
+ *   - PARK LENGTH IS DELIBERATELY SHORT and does NOT grow to fill the gap.
+ *     The park exists to hand the core to whoever we are waiting for, not to
+ *     sleep through the handoff: a 15-60 us park inside a 500 us gap means the
+ *     probability that the peer's progress lands inside a park at all is
+ *     60/500 = 12 %, so the ADDED handoff latency is 0 at the p50 and <= 60 us
+ *     at the p88 -- against the old ladder's 200 us park reached after a
+ *     quarter second of spinning.  The 1 ms hard cap the brief asks for is
+ *     IOS_SPIN_PARK_MAX_NS below; nothing in the table comes near it.
+ *
+ * WHY IT STILL CANNOT LIVELOCK.  The classic failure is two guest threads on
+ * one core where A polls a flag only B can set.  Rung 0's gap is 20 us, so a
+ * brand-new streak reaches the kernel within 20 us of starting and A's first
+ * kernel entry is a real yield; after that every kernel entry is a park, which
+ * is a genuine deschedule, not a hint a loaded scheduler may ignore.  The
+ * invariant is therefore stronger than the old ladder's: no governed thread
+ * ever spins more than 500 us of wall time without descheduling, at ANY rung
+ * and at any loop rate, where the old one only promised "every 8th call".
+ *
+ * PER-CALL-SITE LEARNING.  The brief asks for the streak distribution keyed by
+ * the guest RIP.  That key is not cheaply available here and would be a lie if
+ * it were: the wow64 CPU area's Eip is only valid after FEX flushes its JIT
+ * state into it (see Context::FlushThreadStateContext), which is itself a
+ * server round trip, and the unix-side return address is the syscall
+ * dispatcher for every 32-bit caller alike.  What IS free and, on this
+ * workload, equivalent is a PER-THREAD estimator: each spinning thread has one
+ * dominant spin site (tid 00c0 is 100 % of the yields).  So the governor keeps
+ * an EWMA of this thread's finished streak durations and, when history says
+ * this thread's spins run long, starts one rung in instead of paying the
+ * cheap-rung syscalls again -- the "park length that would have covered ~80 %
+ * of past streaks" idea, applied to the gap rather than the park because the
+ * gap is what the syscall rate is a function of.  The FULL distribution goes
+ * to the log as `[sleep0] hist:' (ios_spin_hist.h) so the next capture either
+ * justifies these constants or replaces them; if it shows several distinct
+ * modes per thread, that is the evidence that a real per-site key is worth its
+ * cost, and not before.
  */
-/*
- * iOS-Madeira ml951: the ladder above stops the syscall STORM but not the
- * SPIN.  sched_yield() on Darwin is swtch_pri(0): if the core has nothing else
- * runnable it returns immediately and the thread keeps the core, so a guest
- * thread parked in "PeekMessage; Sleep(0)" until the render thread finishes
- * still burns a full core competing with the very thread it is waiting for.
- * [srv-stats] measured sleep0=747177 and yield_sc=95627 in one 10 s window —
- * the throttle is working, the spin is not being paid for.
- *
- * So once a streak is unambiguously a spin and not pacing — IOS_SLEEP0_DEEP
- * consecutive Sleep(0)s inside the 2 ms window, i.e. several ms of continuous
- * polling — the periodic action becomes a BOUNDED PARK instead of a yield:
- * a wait on a private per-thread word that nothing ever wakes, with a
- * IOS_SLEEP0_PARK_NS timeout.  Same syscall count as the yield it replaces
- * (one per IOS_SLEEP0_YIELD_EVERY calls), but the thread is actually
- * descheduled for the duration, so the core goes to whoever it is waiting for.
- *
- * Semantics: Sleep(0) promises "other runnable threads may have the CPU", not
- * "return within X ns", and the park is capped at 10 us — two orders of
- * magnitude below the 1 ms Sleep(1) a guest would otherwise use, and only
- * reached after the thread has already spun for milliseconds.  Worst case the
- * loop is slowed to IOS_SLEEP0_YIELD_EVERY iterations per 10 us.  Any real
- * wait, any non-zero sleep and any gap longer than the window still reset the
- * streak through ios_spin_reset(), so a once-per-frame pacing Sleep(0) never
- * reaches the deep rung at all.
- */
-/*
- * iOS-Madeira ml960: the park is now a LADDER, because one rung was still
- * 33k syscalls/s.
- *
- * Measured on a 32-bit D3D9 title at ~30 fps, per 10 s window:
- * [srv-stats] sleep0=2878873 yield_sc=55406 park=334447 — i.e. 288k Sleep(0)/s,
- * of which 33.4k reach the park and 5.5k the yield, so ~39k syscalls/s just to
- * spin. [prof] agrees: __ulock_wait2 <- NtDelayExecution was 8.7-14.5 % of ALL
- * CPU, the single largest kernel entry in the process.
- *
- * A single 10 us rung cannot fix that, because the streak grows by
- * IOS_SLEEP0_YIELD_EVERY per park and the park is the only thing slowing the
- * loop down: one full park cycle is 7 userspace pauses (~20 us measured:
- * 29.9 us per park minus the 10 us park) plus the park itself, so the spinner
- * simply runs the same rung forever. Escalating the park DURATION with the
- * streak converts a longer spin into proportionally fewer syscalls:
- *
- *   streak >  512   park  10 us   cycle ~30 us    (as before)
- *   streak > 4096   park  50 us   cycle ~70 us
- *   streak >32768   park 200 us   cycle ~220 us
- *
- * Expected steady state on the measured workload: the spinner climbs to the top
- * rung in ~265 ms of uninterrupted spinning (3584 calls at 10 us rungs, then
- * 28672 at 50 us) and then issues 1/0.22 ms = ~4.5k park syscalls/s instead of
- * 33.4k — a 7.4x reduction, ~39k -> ~10k total syscalls/s counting the yields.
- * WORST-CASE ADDED HANDOFF LATENCY: one park interval, so the peer's progress
- * can go unnoticed for up to 200 us (220 us including the spin segment) versus
- * ~30 us today. At 30 fps that is 0.66 % of a frame, and the ladder only
- * reaches that rung after the thread has already polled for a quarter second
- * without a single real wait — a handoff that actually completes resets the
- * streak through ios_spin_reset() long before then.
- *
- * WHY Sleep(0) MUST STILL YIELD AT ALL, at every rung: the classic case here is
- * a TWO-THREAD PING-PONG ON ONE CORE. Thread A polls a flag that only thread B
- * can set, and the scheduler has put both on the same core. If A's Sleep(0)
- * never leaves userspace, B never runs, so the flag is never set and A polls
- * until its quantum expires — a livelock that is invisible on a multi-core test
- * device and fatal on a loaded one. Every rung therefore ends in a real
- * deschedule (futex_wait with a timeout, or sched_yield); the ladder only
- * changes HOW LONG the core is given away for, never WHETHER it is.
- */
-#define IOS_SLEEP0_FREE_SPINS   16
-#define IOS_SLEEP0_YIELD_EVERY   8
-#define IOS_SLEEP0_WINDOW    20000ull   /* 2 ms, in 100 ns Win32 ticks */
-#define IOS_SLEEP0_DEEP        512      /* consecutive Sleep(0) before escalating */
-#define IOS_SLEEP0_DEEPER     4096      /* ml960: second rung */
-#define IOS_SLEEP0_DEEPEST   32768      /* ml960: third rung */
-#define IOS_SLEEP0_PARK_NS   10000ull   /* 10 us bounded park  (rung 1) */
-#define IOS_SLEEP0_PARK2_NS  50000ull   /* 50 us bounded park  (rung 2) */
-#define IOS_SLEEP0_PARK3_NS 200000ull   /* 200 us bounded park (rung 3) */
+#define IOS_SPIN_WINDOW      20000ull   /* 2 ms, in 100 ns ticks: gap that ends a streak */
+#define IOS_SPIN_T1            500ull   /* 50 us  */
+#define IOS_SPIN_T2           5000ull   /* 500 us */
+#define IOS_SPIN_T3          50000ull   /* 5 ms   */
+#define IOS_SPIN_PARK_MAX_NS 1000000ull /* hard cap: never park past 1 ms */
 
-static __thread unsigned int ios_sleep0_streak;
-static __thread ULONGLONG    ios_sleep0_last;
+/* kernel-entry gap per rung, in 100 ns ticks */
+static const ULONGLONG ios_spin_gap_ticks[4]  = {   200ull,  1000ull,  3000ull,  5000ull };
+/* park length per rung, in ns */
+static const ULONGLONG ios_spin_park_ns[4]    = { 15000ull, 15000ull, 30000ull, 60000ull };
+
+static __thread ULONGLONG    ios_spin_t0;        /* streak start, ticks           */
+static __thread ULONGLONG    ios_spin_last;      /* last governed call, ticks     */
+static __thread ULONGLONG    ios_spin_sys;       /* last kernel entry, 0 = none   */
+static __thread ULONGLONG    ios_spin_ewma;      /* EWMA of past streak durations */
+static __thread unsigned int ios_spin_calls;     /* calls in the current streak   */
+static __thread unsigned int ios_spin_syscalls;  /* kernel entries in this streak */
+static __thread unsigned int ios_spin_pause_shift;
+
+/* ml970: the distribution, for [srv-stats].  See build/ntdll-unix/shims/ios_spin_hist.h. */
+static unsigned int       ios_spin_h_calls[IOS_SPIN_HIST_N];
+static unsigned int       ios_spin_h_us[IOS_SPIN_HIST_N];
+static unsigned int       ios_spin_n_streaks, ios_spin_n_sleep0, ios_spin_n_yield;
+static unsigned int       ios_spin_n_sys_yield, ios_spin_n_sys_park, ios_spin_n_warm;
 
 static inline void ios_cpu_pause( unsigned int loops )
 {
@@ -3272,62 +3429,158 @@ static inline void ios_cpu_pause( unsigned int loops )
 #endif
 }
 
+static inline void ios_raw_yield(void)
+{
+#ifdef HAVE_SCHED_YIELD
+    ios_srv_nt_count( IOS_NT_YIELD_SYSCALL );
+    __atomic_fetch_add( &ios_spin_n_sys_yield, 1, __ATOMIC_RELAXED );
+    sched_yield();
+#endif
+}
+
 /* bounded deschedule: wait on a private word nothing ever wakes, so this
  * always returns by timeout.  futex_wait() maps to
  * os_sync_wait_on_address_with_timeout()/__ulock_wait() on Darwin.
- * ml960: `ns` is the rung's timeout; park= still counts every park so the
- * before/after syscall rate stays directly comparable in [srv-stats]. */
+ * ml970: `ns' is the rung's park length and is clamped to the 1 ms cap here,
+ * so no future table edit can smuggle a longer sleep past the invariant. */
 static void ios_cpu_park( ULONGLONG ns )
 {
 #ifdef USE_FUTEX
     static __thread LONG park_word;
-    struct timespec ts = { 0, (long)ns };
+    struct timespec ts;
 
+    if (ns > IOS_SPIN_PARK_MAX_NS) ns = IOS_SPIN_PARK_MAX_NS;
+    ts.tv_sec  = 0;
+    ts.tv_nsec = (long)ns;
     ios_srv_nt_count( IOS_NT_SLEEP0_PARK );
+    __atomic_fetch_add( &ios_spin_n_sys_park, 1, __ATOMIC_RELAXED );
     futex_wait( &park_word, 0, &ts );
 #else
     (void)ns;
-    NtYieldExecution();
+    ios_raw_yield();
 #endif
+}
+
+static inline int ios_spin_log2b( unsigned long long v )
+{
+    int b = 0;
+    while (v > 1 && b < IOS_SPIN_HIST_N - 1) { v >>= 1; b++; }
+    return b;
+}
+
+/* A streak ends when the thread makes progress: a real wait (server_wait calls
+ * ios_spin_reset), a non-zero sleep, or a gap longer than the 2 ms window.
+ * That is why the duration recorded here IS the time-to-progress. */
+static void ios_spin_end_streak(void)
+{
+    ULONGLONG dur_us;
+
+    if (!ios_spin_calls) return;
+    dur_us = (ios_spin_last - ios_spin_t0) / 10;
+    __atomic_fetch_add( &ios_spin_h_calls[ios_spin_log2b( ios_spin_calls )], 1, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &ios_spin_h_us[ios_spin_log2b( dur_us + 1 )], 1, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &ios_spin_n_streaks, 1, __ATOMIC_RELAXED );
+    /* EWMA with a 1/4 weight: fast enough to follow a phase change (loading ->
+     * gameplay), slow enough that one long stall does not pin the thread on a
+     * deep rung for the next thousand streaks. */
+    ios_spin_ewma = ios_spin_ewma ? (ios_spin_ewma * 3 + (ios_spin_last - ios_spin_t0)) / 4
+                                  : (ios_spin_last - ios_spin_t0);
+    ios_spin_calls = 0;
+    ios_spin_syscalls = 0;
+    ios_spin_pause_shift = 0;
+    ios_spin_sys = 0;
 }
 
 /* called from server_ios.c's server_wait, and from the non-zero delay path */
 void ios_spin_reset(void)
 {
-    ios_sleep0_streak = 0;
+    ios_spin_end_streak();
 }
 
-static NTSTATUS ios_delay_zero(void)
+/* ml950 name kept: build/ntdll-unix/server_ios.c calls ios_spin_reset(). */
+
+/* from_yield: 1 = NtYieldExecution (SwitchToThread), 0 = Sleep(0). */
+static NTSTATUS ios_spin_governor( int from_yield )
 {
-    ULONGLONG now = monotonic_counter();
+    ULONGLONG now = monotonic_counter(), spun, gap;
+    int rung, warm;
 
-    if (now - ios_sleep0_last > IOS_SLEEP0_WINDOW) ios_sleep0_streak = 0;
-    ios_sleep0_last = now;
-    ios_sleep0_streak++;
-    /* ml960: never let the counter wrap back onto a cheap rung. Fold by a
-     * multiple of IOS_SLEEP0_YIELD_EVERY so the "every 8th call" phase below is
-     * preserved, and land well above IOS_SLEEP0_DEEPEST so the rung does not
-     * change either. (Reachable only after hours of uninterrupted spinning.) */
-    if (ios_sleep0_streak > 0x40000000u) ios_sleep0_streak -= 0x20000000u;
-
-    if (ios_sleep0_streak <= IOS_SLEEP0_FREE_SPINS ||
-        (ios_sleep0_streak - IOS_SLEEP0_FREE_SPINS) % IOS_SLEEP0_YIELD_EVERY)
+    if (now - ios_spin_last > IOS_SPIN_WINDOW)
     {
-        ios_cpu_pause( 16 );
+        ios_spin_end_streak();
+        ios_spin_t0 = now;
+    }
+    ios_spin_last = now;
+    ios_spin_calls++;
+    __atomic_fetch_add( from_yield ? &ios_spin_n_yield : &ios_spin_n_sleep0, 1, __ATOMIC_RELAXED );
+
+    spun = now - ios_spin_t0;
+    rung = spun >= IOS_SPIN_T3 ? 3 : spun >= IOS_SPIN_T2 ? 2 : spun >= IOS_SPIN_T1 ? 1 : 0;
+
+    /* Learned start (see the note above): a thread whose spins have
+     * historically run for milliseconds gains nothing from the 20 us rung but
+     * its syscalls, so skip ahead.  Never past rung 2, so every thread still
+     * reaches the kernel inside 300 us of a streak starting no matter what the
+     * estimator believes. */
+    warm = ios_spin_ewma >= IOS_SPIN_T3 ? 2 : ios_spin_ewma >= IOS_SPIN_T2 ? 1 : 0;
+    if (rung < warm)
+    {
+        rung = warm;
+        if (ios_spin_calls == 1) __atomic_fetch_add( &ios_spin_n_warm, 1, __ATOMIC_RELAXED );
+    }
+    gap = ios_spin_gap_ticks[rung];
+
+    if (!ios_spin_sys || now - ios_spin_sys >= gap)
+    {
+        ios_spin_sys = now;
+        if (!ios_spin_syscalls++)
+        {
+            /* First kernel entry of a streak: a real yield, exactly as an
+             * ungoverned Sleep(0)/SwitchToThread would have done.  This is the
+             * whole of the Windows-observable semantics ("other runnable
+             * threads may have the CPU"), and it is what a pacing caller --
+             * one call per frame, one per queue drain -- gets every time,
+             * because a 16 ms gap always starts a fresh streak. */
+            ios_raw_yield();
+        }
+        else ios_cpu_park( ios_spin_park_ns[rung] );
         return STATUS_SUCCESS;
     }
-    /* ml951: a streak this long is a spin, not pacing — give the core away
-     * for real instead of asking a scheduler that has nobody else to run.
-     * ml960: and the longer it has been spinning without one real wait, the
-     * longer it is worth giving away for — see the ladder above. */
-    if (ios_sleep0_streak > IOS_SLEEP0_DEEP)
+
+    ios_cpu_pause( 8u << ios_spin_pause_shift );
+    if (ios_spin_pause_shift < 5 && !(ios_spin_calls & 7)) ios_spin_pause_shift++;
+    return STATUS_SUCCESS;
+}
+
+/* [srv-stats] pulls the window's distribution through here once per 10 s. */
+void ios_spin_hist_snapshot( struct ios_spin_snapshot *out )
+{
+    unsigned int i, total = 0, acc = 0;
+
+    for (i = 0; i < IOS_SPIN_HIST_N; i++)
     {
-        ios_cpu_park( ios_sleep0_streak > IOS_SLEEP0_DEEPEST ? IOS_SLEEP0_PARK3_NS :
-                      ios_sleep0_streak > IOS_SLEEP0_DEEPER  ? IOS_SLEEP0_PARK2_NS :
-                                                               IOS_SLEEP0_PARK_NS );
-        return STATUS_SUCCESS;
+        out->calls[i] = __atomic_exchange_n( &ios_spin_h_calls[i], 0, __ATOMIC_RELAXED );
+        out->us[i]    = __atomic_exchange_n( &ios_spin_h_us[i], 0, __ATOMIC_RELAXED );
+        total += out->us[i];
     }
-    return NtYieldExecution();
+    out->streaks    = __atomic_exchange_n( &ios_spin_n_streaks, 0, __ATOMIC_RELAXED );
+    out->gov_sleep0 = __atomic_exchange_n( &ios_spin_n_sleep0, 0, __ATOMIC_RELAXED );
+    out->gov_yield  = __atomic_exchange_n( &ios_spin_n_yield, 0, __ATOMIC_RELAXED );
+    out->sys_yield  = __atomic_exchange_n( &ios_spin_n_sys_yield, 0, __ATOMIC_RELAXED );
+    out->sys_park   = __atomic_exchange_n( &ios_spin_n_sys_park, 0, __ATOMIC_RELAXED );
+    out->warm_hits  = __atomic_exchange_n( &ios_spin_n_warm, 0, __ATOMIC_RELAXED );
+
+    /* Bucket-resolution percentiles: bucket i holds durations in
+     * [2^(i-1), 2^i) us, and the reported value is that bucket's low edge.
+     * Coarse on purpose -- the policy's rungs are decades apart, so a decade
+     * is the precision the decision actually needs. */
+    out->us_p50 = out->us_p80 = 0;
+    for (i = 0; i < IOS_SPIN_HIST_N && total; i++)
+    {
+        acc += out->us[i];
+        if (!out->us_p50 && acc * 2 >= total)  out->us_p50 = i ? (1u << i) : 0;
+        if (!out->us_p80 && acc * 5 >= total * 4) { out->us_p80 = i ? (1u << i) : 0; break; }
+    }
 }
 
 
@@ -3393,13 +3646,18 @@ NTSTATUS WINAPI NtYieldExecution(void)
      * kernelbase's SwitchToThread (dlls/kernelbase/thread.c:707), whose
      * BOOL is advisory.
      *
-     * The cost the [prof] sampler sees is not this heuristic, it is the
-     * syscall itself, so the fix is at the callers: NtDelayExecution below
-     * no longer yields for non-zero delays, and the two spin-detecting
-     * callers (server_wait, and the win32u message pump) now rate-limit. */
-    ios_srv_nt_count( IOS_NT_YIELD_SYSCALL );
-    sched_yield();
-    return STATUS_SUCCESS;
+     * iOS-Madeira ml970: and the syscall itself now goes through the spin
+     * governor above.  [prof] measured 1.15 M sched_yield/s arriving HERE,
+     * from one 32-bit guest thread's SwitchToThread spin loop -- 13.9-15.2 %
+     * of all CPU, the largest kernel entry in the process and seven times the
+     * Sleep(0) traffic the ml950-ml960 ladder was built for.  The return value
+     * is unchanged (STATUS_SUCCESS, never STATUS_NO_YIELD_PERFORMED) and an
+     * isolated call still issues a real, immediate sched_yield(); what the
+     * governor removes is the 2nd..Nth syscall of a back-to-back streak.
+     * Callers that are themselves rate limited (win32u's ios_pump_yield,
+     * server_wait's poll streak) are unaffected in practice: their own limits
+     * are far below the governor's first rung. */
+    return ios_spin_governor( 1 );
 #else
     return STATUS_NO_YIELD_PERFORMED;
 #endif
@@ -3463,7 +3721,7 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         if (!when)
         {
             ios_srv_nt_count( IOS_NT_DELAY_ZERO );
-            return ios_delay_zero();
+            return ios_spin_governor( 0 );
         }
         ios_srv_nt_count( IOS_NT_DELAY_NONZERO );
         ios_spin_reset();
