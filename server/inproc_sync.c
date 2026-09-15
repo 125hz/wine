@@ -37,6 +37,10 @@
 # include <linux/ntsync.h>
 #endif
 
+#ifdef WINE_IOS
+# include "ios_fastsync.h"
+#endif
+
 #ifdef NTSYNC_IOC_EVENT_READ
 
 #include <fcntl.h>
@@ -298,6 +302,27 @@ DECL_HANDLER(get_inproc_sync_fd)
     if (!(obj = get_handle_obj( current->process, req->handle, 0, NULL ))) return;
 
     reply->access = get_handle_access( current->process, req->handle );
+
+#ifdef WINE_IOS
+    /* iOS-Madeira ml952 fastsync: there is no /dev/ntsync here, so this
+     * request never has an fd to send and upstream always answered
+     * STATUS_NOT_IMPLEMENTED.  It is reused verbatim as the handle -> cell
+     * learn request: bit 30 of `type' (free -- the field otherwise carries a
+     * small enum inproc_sync_type) says "a cell index follows, no fd is in
+     * flight".  No protocol.def change, so no regenerated headers.  The
+     * client asks once per handle and caches the answer. */
+    {
+        int manual = 0, idx = madeira_event_cell_index( obj, &manual );
+
+        if (idx >= 0)
+        {
+            reply->type = MADEIRA_FAST_REPLY_FLAG |
+                          (manual ? MADEIRA_FAST_REPLY_MANUAL : 0) | idx;
+            release_object( obj );
+            return;
+        }
+    }
+#endif
 
     if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
     else send_client_fd( current->process, fd, req->handle );
