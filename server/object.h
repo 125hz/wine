@@ -224,6 +224,13 @@ struct keyed_event;
 
 extern struct event_sync *create_server_internal_sync( int manual, int signaled );
 extern struct object *create_internal_sync( int manual, int signaled );
+#ifdef WINE_IOS
+/* iOS-Madeira ml952 fastsync (build/ntdll-unix/shims/ios_fastsync.h) */
+extern void madeira_event_sync_unclaim( struct object *sync );
+extern void madeira_event_sync_wake_queue( struct object *sync );
+extern int madeira_event_cell_index( struct object *obj, int *manual );
+extern int madeira_fastsync_cells_live(void);
+#endif
 extern void signal_sync( struct object *sync );
 extern void reset_sync( struct object *sync );
 

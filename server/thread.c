@@ -1172,6 +1172,18 @@ static int object_sync_signaled( struct object *obj, struct wait_queue_entry *en
     return ret;
 }
 
+#ifdef WINE_IOS
+/* iOS-Madeira ml952 fastsync: give back a token that object_sync_signaled()
+ * claimed on behalf of a wait-all that then turned out not to be satisfiable.
+ * A no-op for every object except a cell-backed auto-reset event. */
+static void object_sync_unclaim( struct object *obj )
+{
+    struct object *sync = get_obj_sync( obj );
+    madeira_event_sync_unclaim( sync );
+    release_object( sync );
+}
+#endif
+
 void signal_sync( struct object *obj )
 {
     obj->ops->signal( obj, 0, 1 );
@@ -1308,6 +1320,16 @@ static int check_wait( struct thread *thread )
         for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
             not_ok |= !object_sync_signaled( entry->obj, entry );
         if (!not_ok) return STATUS_WAIT_0;
+#ifdef WINE_IOS
+        /* ml952 fastsync: on the WaitAny path a signaled object is satisfied
+         * immediately (wake_thread calls end_wait with the index it just got),
+         * so a claim taken in `signaled' is always consumed.  Here it is not:
+         * the wait is not satisfiable, nothing calls satisfied, and any
+         * auto-reset event that claimed its token would keep it forever.
+         * Hand every claim back. */
+        for (i = 0, entry = wait->queues; i < wait->count; i++, entry++)
+            object_sync_unclaim( entry->obj );
+#endif
     }
     else
     {

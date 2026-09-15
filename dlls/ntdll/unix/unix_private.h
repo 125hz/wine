@@ -395,6 +395,14 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
 extern void dbg_init(void);
 
 extern void close_inproc_sync( HANDLE handle );
+#ifdef WINE_IOS
+/* iOS-Madeira ml952 fastsync: drop a handle from the handle -> cell cache.
+ * Must be called wherever close_inproc_sync() is, i.e. everywhere a handle
+ * stops meaning what it used to mean. */
+extern void madeira_fast_close( HANDLE handle );
+#else
+#define madeira_fast_close(handle) ((void)0)
+#endif
 
 extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );

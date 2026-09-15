@@ -210,6 +210,531 @@ static inline int futex_wake_one( const LONG *addr )
 
 #endif /* __APPLE__ */
 
+
+/***********************************************************************
+ *   iOS-Madeira ml952: the in-process event fast path ("fastsync")
+ *
+ * The wineserver is a thread in this same Mach task, so every event_op and
+ * every single-object wait is a socket write, two scheduler hops and a socket
+ * write back: [srv-stats] on log 41 measured 50 us per request, 2900 event ops
+ * and 900 single-object waits a second, all of it between the 32-bit title's
+ * main thread and its render/worker threads -- about 150 us of latency on each
+ * handoff between the two threads that pace the frame.
+ *
+ * Upstream already has the shape of the fix: the inproc_set_event() /
+ * inproc_wait() hooks above, which on Linux push the operation into
+ * /dev/ntsync and never reach the server.  They are dead here
+ * (inproc_device_fd < 0).  This is the iOS substitute, and it exploits the one
+ * thing this port has that upstream does not: the server's own object state is
+ * at an address this thread can read.  Each handle-reachable event gets a cell
+ * (build/ntdll-unix/shims/ios_fastsync.h) whose state word IS the event state
+ * -- the server's event_sync_signaled()/_satisfied() read and clear the same
+ * word -- so a set or a wait can be a compare-and-swap plus, at most, one
+ * os_sync_wake_by_address.
+ *
+ * What is deliberately NOT fast-pathed, because the server is still the only
+ * thing that can do it correctly:
+ *   - alertable waits, wait-all, and any wait on more than one handle;
+ *   - NtSignalAndWaitForSingleObject and keyed events;
+ *   - PulseEvent, which takes its event out of the fast path for good;
+ *   - a set on an event that has a server-side waiter, which still issues the
+ *     event_op request so the server wakes its own queue (the cell update
+ *     happens first either way, so the request's reply is ignored).
+ * And a fast wait is capped at ~2 ms and then falls through to the real
+ * server_wait, so APCs, alerts, suspension and thread termination are never
+ * delayed by more than that cap.
+ ***********************************************************************/
+
+#ifdef WINE_IOS
+
+#include "ios_fastsync.h"
+
+#define MADEIRA_FAST_CACHE_SIZE  2048          /* power of two, direct mapped   */
+#define MADEIRA_FAST_SPIN        96            /* isb ladder before parking     */
+#define MADEIRA_FAST_CAP_NS      2000000ull    /* 2 ms default, then the server */
+
+/* Handle -> cell, learnt lazily with one get_inproc_sync_fd request and then
+ * answered from here.  Direct-mapped on the handle index; collisions simply
+ * re-learn, which is also what keeps this correct across pseudo-processes:
+ * every guest process in this task shares this array, so the owning process id
+ * is part of the key and a colliding handle value from another process misses
+ * rather than aliasing.  `cell == -1' is the negative answer ("this handle is
+ * not a fast event"), which is what stops a wait on a file or a mutex from
+ * paying the learn request more than once.
+ *
+ * Entries are published with a seqlock: writers (always on a cache miss, never
+ * on the hot path) serialise on madeira_fast_mutex and bump `seq' to odd,
+ * store, then to even; readers take seq, read, take seq again and retry on any
+ * change.  A stale entry that survives all of that is still caught by the
+ * generation check against the cell itself. */
+struct madeira_fast_entry
+{
+    unsigned int seq;      /* seqlock, odd while being written */
+    unsigned int handle;   /* obj_handle_t value, 0 = empty     */
+    unsigned int pid;      /* owning guest process              */
+    unsigned int access;   /* handle access rights              */
+    unsigned int gen;      /* cell generation when learnt       */
+    unsigned int manual;   /* manual-reset event                */
+    int          cell;     /* cell index, -1 = "no cell"        */
+};
+
+static BOOL is_pseudo_handle( HANDLE handle );   /* defined with the inproc cache below */
+
+static struct madeira_fast_entry madeira_fast_cache[MADEIRA_FAST_CACHE_SIZE];
+static pthread_mutex_t madeira_fast_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int madeira_fast_on = -1;
+
+/* How long a fast wait may park before it gives the wait back to the server.
+ * This is the one number that trades handoff latency against how late a system
+ * APC, a suspend or a thread termination can be noticed by a thread that is
+ * parked on a cell, so it is reachable from a device run without a rebuild:
+ * MADEIRA_FASTSYNC_CAP_US, clamped to [50 us, 50 ms].  If the next [srv-stats]
+ * still shows a large `w1 inf', the handoffs are simply longer than the cap
+ * and this is the knob to raise. */
+static unsigned long long madeira_fast_cap_ns = MADEIRA_FAST_CAP_NS;
+
+enum madeira_fast_result
+{
+    MADEIRA_FAST_MISS,    /* not handled at all, run the original path      */
+    MADEIRA_FAST_DONE,    /* handled completely, no server round trip       */
+    MADEIRA_FAST_SERVER   /* cell updated, but the server call is still due */
+};
+
+static int madeira_fastsync_enabled(void)
+{
+    int on = __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED ), expect = -1;
+    const char *e;
+
+    if (on >= 0) return on;
+
+    /* ml962: DEFAULT OFF.  ml952 shipped enabled-by-default and three
+     * unrelated programs died the same way on the first device snapshot, so
+     * the opt-in was inverted: unset or "0" is off and off is the pre-ml952
+     * code path byte for byte (no cell is allocated by the server, so nothing
+     * on either side ever touches the table).  MADEIRA_FASTSYNC=1 turns it on,
+     * which is what Documents/madeira-env.txt is for. */
+    e = getenv( "MADEIRA_FASTSYNC" );
+    on = (e && (!strcmp( e, "1" ) || !strcmp( e, "on" ))) ? 1 : 0;
+    if ((e = getenv( "MADEIRA_FASTSYNC_CAP_US" )))
+    {
+        unsigned long us = strtoul( e, NULL, 10 );
+        if (us < 50) us = 50;
+        if (us > 50000) us = 50000;
+        madeira_fast_cap_ns = (unsigned long long)us * 1000;
+    }
+    if (!__atomic_compare_exchange_n( &madeira_fast_on, &expect, on, 0,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        return __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED );
+
+    if (on)
+        ERR( "[fastsync] ON rev=ml962 cells=%u cache=%u spin=%u cap=%uus - in-process event "
+             "set/reset/wait with no wineserver round trip; unset MADEIRA_FASTSYNC to disable, "
+             "MADEIRA_FASTSYNC_CAP_US=N to retune the park cap\n",
+             (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)MADEIRA_FAST_CACHE_SIZE,
+             (unsigned int)MADEIRA_FAST_SPIN, (unsigned int)(madeira_fast_cap_ns / 1000) );
+    else
+        ERR( "[fastsync] OFF (MADEIRA_FASTSYNC=1 enables) rev=ml962\n" );
+    return on;
+}
+
+static inline unsigned int madeira_fast_pid(void)
+{
+    TEB *teb = NtCurrentTeb();
+    return teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
+}
+
+static inline unsigned long long madeira_now_ns(void)
+{
+    return clock_gettime_nsec_np( CLOCK_MONOTONIC_RAW );
+}
+
+/* ml962: the seqlock WRITE side, corrected.
+ *
+ * The ml952 version was
+ *
+ *     __atomic_store_n( &e->seq, s + 1, __ATOMIC_RELEASE );   // odd
+ *     e->handle = handle; e->pid = pid; e->cell = cell; ...   // plain stores
+ *     __atomic_thread_fence( __ATOMIC_RELEASE );
+ *     __atomic_store_n( &e->seq, s + 2, __ATOMIC_RELEASE );   // even
+ *
+ * and that is NOT a seqlock.  A release store is a one-way barrier: it orders
+ * everything BEFORE it, and places no constraint at all on the stores that
+ * come AFTER it.  Both the compiler and an arm64 core may therefore publish
+ * `e->handle' (a plain STR) before the STLR that marks the entry as being
+ * written -- so a concurrent reader can see
+ *
+ *     seq   = s      (even: "stable", the odd marker has not landed yet)
+ *     handle= NEW    (already landed)
+ *     pid   = NEW
+ *     cell/gen = OLD (have not landed yet)
+ *
+ * take the second seq read as s again, conclude the entry is consistent, and
+ * use ANOTHER EVENT'S CELL for this handle.  The generation check does not
+ * catch it: the old cell is a perfectly live cell belonging to a perfectly
+ * live event, so its gen still matches the old gen that was read with it.
+ *
+ * The consequence is exactly the reported failure signature: NtWaitForSingle-
+ * Object( B ) returns STATUS_SUCCESS the moment some unrelated event A is set
+ * (and NtSetEvent( B ) sets A), so the waiter runs before its producer has
+ * published anything and reads a pointer that is still NULL.  It needs no
+ * pathological program -- just two threads, one learning a handle into a slot
+ * while another looks the same slot up, which is what "a worker starts a new
+ * thread and both touch the same events" does.
+ *
+ * The fix is the standard C11 seqlock write side: a RELEASE FENCE between the
+ * odd marker and the data, which is what actually forbids the data stores from
+ * floating above the marker. */
+static void madeira_fast_publish( struct madeira_fast_entry *e, unsigned int handle,
+                                  unsigned int pid, int cell, unsigned int gen,
+                                  unsigned int access, unsigned int manual )
+{
+    sigset_t sigset;
+    unsigned int s;
+
+    server_enter_uninterrupted_section( &madeira_fast_mutex, &sigset );
+    s = __atomic_load_n( &e->seq, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->seq, s + 1, __ATOMIC_RELAXED );   /* odd: writing */
+    __atomic_thread_fence( __ATOMIC_RELEASE );              /* ... and it lands FIRST */
+    /* relaxed atomics rather than plain stores so the compiler cannot sink
+     * them past the fences either */
+    __atomic_store_n( &e->handle, handle, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->pid,    pid,    __ATOMIC_RELAXED );
+    __atomic_store_n( &e->cell,   cell,   __ATOMIC_RELAXED );
+    __atomic_store_n( &e->gen,    gen,    __ATOMIC_RELAXED );
+    __atomic_store_n( &e->access, access, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->manual, manual, __ATOMIC_RELAXED );
+    __atomic_thread_fence( __ATOMIC_RELEASE );
+    __atomic_store_n( &e->seq, s + 2, __ATOMIC_RELAXED );   /* even: readable */
+    server_leave_uninterrupted_section( &madeira_fast_mutex, &sigset );
+}
+
+/* Drop a handle from the cache.  Called from NtClose and from the
+ * DUPLICATE_CLOSE_SOURCE half of NtDuplicateObject, next to the existing
+ * close_inproc_sync(), and deliberately ignoring the pid: a close of a
+ * colliding handle value in another pseudo-process only forces a re-learn.
+ *
+ * ml962: the "is this slot even mine" test now happens INSIDE the section, so
+ * it cannot race a publish into the same slot and decide not to evict an entry
+ * that was installed a nanosecond later. */
+void madeira_fast_close( HANDLE handle )
+{
+    unsigned int h = wine_server_obj_handle( handle );
+    struct madeira_fast_entry *e;
+    sigset_t sigset;
+    unsigned int s;
+
+    if (!h || __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED ) <= 0) return;
+    e = &madeira_fast_cache[(h >> 2) & (MADEIRA_FAST_CACHE_SIZE - 1)];
+
+    server_enter_uninterrupted_section( &madeira_fast_mutex, &sigset );
+    if (__atomic_load_n( &e->handle, __ATOMIC_RELAXED ) == h)
+    {
+        s = __atomic_load_n( &e->seq, __ATOMIC_RELAXED );
+        __atomic_store_n( &e->seq, s + 1, __ATOMIC_RELAXED );
+        __atomic_thread_fence( __ATOMIC_RELEASE );
+        __atomic_store_n( &e->handle, 0u, __ATOMIC_RELAXED );
+        __atomic_store_n( &e->pid,    0u, __ATOMIC_RELAXED );
+        __atomic_store_n( &e->cell,   -1, __ATOMIC_RELAXED );
+        __atomic_store_n( &e->gen,    0u, __ATOMIC_RELAXED );
+        __atomic_store_n( &e->access, 0u, __ATOMIC_RELAXED );
+        __atomic_store_n( &e->manual, 0u, __ATOMIC_RELAXED );
+        __atomic_thread_fence( __ATOMIC_RELEASE );
+        __atomic_store_n( &e->seq, s + 2, __ATOMIC_RELAXED );
+        ios_srv_nt_count( IOS_FS_EVICT );
+    }
+    server_leave_uninterrupted_section( &madeira_fast_mutex, &sigset );
+}
+
+/* Returns the cell for `handle', or NULL for "use the server".  `access' is
+ * the access the caller needs; if the handle does not have it we return NULL
+ * so the slow path can produce the real STATUS_ACCESS_DENIED. */
+static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK access,
+                                                      unsigned int *manual )
+{
+    unsigned int h = wine_server_obj_handle( handle );
+    unsigned int pid = madeira_fast_pid();
+    struct madeira_fast_entry *e;
+    unsigned int s1, s2, gen = 0, acc = 0, man = 0, type = 0;
+    struct madeira_sync_cell *cell;
+    unsigned int ret;
+    int idx;
+
+    if (!h || is_pseudo_handle( handle )) return NULL;
+    /* ml962: the owning process id is half the cache key, and a thread with no
+     * Wine TEB (a DXMT/pthread-created one that reached an Nt* entry point)
+     * reports 0 for it.  Caching under pid 0 would put every such thread of
+     * every pseudo-process into one namespace where the same handle VALUE means
+     * different objects, so those callers simply keep the server path. */
+    if (!pid) return NULL;
+    e = &madeira_fast_cache[(h >> 2) & (MADEIRA_FAST_CACHE_SIZE - 1)];
+
+    /* ml962: the READ side, matching the corrected write side above.  Every
+     * field is read with a relaxed atomic (so the compiler cannot re-load one
+     * after the validating seq read) and the ACQUIRE fence keeps all of them
+     * ordered before it -- including `handle' and `pid', which the ml952 code
+     * compared before the fence and therefore before the entry was known to be
+     * stable. */
+    s1 = __atomic_load_n( &e->seq, __ATOMIC_ACQUIRE );
+    if (!(s1 & 1) &&
+        __atomic_load_n( &e->handle, __ATOMIC_RELAXED ) == h &&
+        __atomic_load_n( &e->pid, __ATOMIC_RELAXED ) == pid)
+    {
+        idx = __atomic_load_n( &e->cell,   __ATOMIC_RELAXED );
+        gen = __atomic_load_n( &e->gen,    __ATOMIC_RELAXED );
+        acc = __atomic_load_n( &e->access, __ATOMIC_RELAXED );
+        man = __atomic_load_n( &e->manual, __ATOMIC_RELAXED );
+        __atomic_thread_fence( __ATOMIC_ACQUIRE );
+        s2 = __atomic_load_n( &e->seq, __ATOMIC_ACQUIRE );
+        if (s1 == s2)
+        {
+            if (idx < 0) return NULL;                       /* known: no cell */
+            if ((acc & access) != access) return NULL;
+            cell = &madeira_sync_cells[idx];
+            /* the cell may have been freed and handed to another event since
+             * we cached it; that can only happen after this handle was closed,
+             * but check anyway rather than mutate a stranger's event */
+            if (__atomic_load_n( &cell->gen, __ATOMIC_ACQUIRE ) == gen)
+            {
+                *manual = man;
+                return cell;
+            }
+            ios_srv_nt_count( IOS_FS_STALE_GEN );
+        }
+    }
+
+    /* Learn it.  One request per handle, ever -- unless the slot is being
+     * fought over, which is what IOS_FS_RELEARN measures: a learn for a handle
+     * whose own entry is still in the slot means the entry was rejected (pid
+     * mismatch or a recycled cell), and a large count there is cache thrash,
+     * not cold misses. */
+    if (__atomic_load_n( &e->handle, __ATOMIC_RELAXED ) == h) ios_srv_nt_count( IOS_FS_RELEARN );
+    SERVER_START_REQ( get_inproc_sync_fd )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        if (!(ret = wine_server_call( req )))
+        {
+            type = reply->type;
+            acc  = reply->access;
+        }
+    }
+    SERVER_END_REQ;
+    if (ret)
+    {
+        /* ml962: STATUS_NOT_IMPLEMENTED is this request's "that object has no
+         * in-process sync" answer, and on iOS it is the ONLY answer for
+         * anything that is not a live cell-backed event -- there is no
+         * /dev/ntsync, so get_obj_inproc_sync() always fails and the success
+         * reply below is unreachable.  Without caching it here the negative
+         * answer was never stored at all and every single wait on a thread,
+         * process, mutex, semaphore, timer, file or pulsed event paid an extra
+         * round trip on top of the select it was going to do anyway.
+         *
+         * A negative entry is fail-SAFE in a way a positive one is not: the
+         * only thing it can ever do is send a caller to the server.  So it
+         * does not need the invalidation guarantees the positive entries get
+         * from madeira_fast_close() -- a handle value recycled behind our back
+         * (a server-side close at process exit, say) costs the fast path for
+         * that handle and nothing else.
+         *
+         * Every other status (a bad handle, above all) stays uncached so the
+         * caller's slow path raises the real error. */
+        if (ret == STATUS_NOT_IMPLEMENTED)
+        {
+            madeira_fast_publish( e, h, pid, -1, 0, 0, 0 );
+            ios_srv_nt_count( IOS_FS_LEARN_NONE );
+        }
+        return NULL;
+    }
+
+    if (!(type & MADEIRA_FAST_REPLY_FLAG))
+    {
+        madeira_fast_publish( e, h, pid, -1, 0, acc, 0 );
+        ios_srv_nt_count( IOS_FS_LEARN_NONE );
+        return NULL;
+    }
+    idx  = MADEIRA_FAST_REPLY_IDX( type );
+    man  = !!(type & MADEIRA_FAST_REPLY_MANUAL);
+    /* the index comes off the wire; a value the table cannot hold would index
+     * out of bounds, so treat it as "no cell" rather than trusting it */
+    if (idx >= MADEIRA_SYNC_CELLS)
+    {
+        madeira_fast_publish( e, h, pid, -1, 0, acc, 0 );
+        ios_srv_nt_count( IOS_FS_LEARN_NONE );
+        return NULL;
+    }
+    ios_srv_nt_count( IOS_FS_LEARN_EVENT );
+    cell = &madeira_sync_cells[idx];
+    /* the handle we hold pins the event, which pins the cell, so this
+     * generation cannot go stale between here and the store below */
+    gen  = __atomic_load_n( &cell->gen, __ATOMIC_ACQUIRE );
+    madeira_fast_publish( e, h, pid, idx, gen, acc, man );
+
+    if ((acc & access) != access) return NULL;
+    *manual = man;
+    return cell;
+}
+
+/* Take the token if there is one.  A manual-reset event is never consumed; an
+ * auto-reset one is consumed with a CAS, which is what makes "exactly one
+ * waiter is released" true no matter how many threads and the server race. */
+static inline int madeira_fast_try( struct madeira_sync_cell *cell, unsigned int manual )
+{
+    int st = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+
+    if (st != MADEIRA_CELL_SET) return 0;
+    if (manual) return 1;
+    return __atomic_compare_exchange_n( &cell->state, &st, MADEIRA_CELL_RESET, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+/* NtSetEvent / NtResetEvent. */
+static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, LONG *prev_state )
+{
+    struct madeira_sync_cell *cell;
+    unsigned int manual = 0;
+    int want = set ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET;
+    int prev;
+
+    if (!madeira_fastsync_enabled()) return MADEIRA_FAST_MISS;
+    if (!(cell = madeira_fast_lookup( handle, EVENT_MODIFY_STATE, &manual )))
+        return MADEIRA_FAST_MISS;
+
+    for (;;)
+    {
+        prev = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+        if (prev == MADEIRA_CELL_DISABLED) return MADEIRA_FAST_MISS;  /* pulsed, or freed */
+        /* ml962: MADEIRA_CELL_CLAIMED means the server has decided, inside
+         * event_sync_signaled(), to hand this auto-reset token to one of its
+         * own queued waiters and has not yet run event_sync_satisfied().
+         * Writing over it here LOSES the operation: satisfied() stores RESET
+         * unconditionally, so a CAS CLAIMED->SET would be swallowed and the
+         * SetEvent would release nobody at all.  The server is single-threaded
+         * and cannot process a request between its own signaled() and
+         * satisfied(), so handing this to the server is exactly right -- the
+         * event_op below is applied strictly after the claim is resolved. */
+        if (prev == MADEIRA_CELL_CLAIMED) return MADEIRA_FAST_MISS;
+        if (prev == want) break;                                      /* no transition */
+        if (__atomic_compare_exchange_n( &cell->state, &prev, want, 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST )) break;
+    }
+    if (prev_state) *prev_state = (prev != MADEIRA_CELL_RESET);
+
+    /* A reset can never release anybody, so it is always complete here --
+     * including for the server, whose event_sync_signaled() reads this word. */
+    if (!set) return MADEIRA_FAST_DONE;
+
+    /* Dekker, client half #2: the state store above and this load are both
+     * seq_cst, and a parking waiter does `waiters++; load state' with the same
+     * ordering, so the two cannot miss each other. */
+    if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
+    {
+        madeira_fast_wake( &cell->state, manual );
+        ios_srv_nt_count( IOS_NT_FAST_WAKE );
+    }
+
+    /* Dekker, client half #1: if the server has anybody queued on this object
+     * it is the only thing that can wake them, so the request still has to go.
+     * The cell is already updated, so the reply's `state' is stale and the
+     * caller ignores it -- and the request the caller sends is
+     * MADEIRA_EVENT_OP_WAKE, NOT SET_EVENT: see ios_fastsync.h.  A second
+     * server-side set here is what released two waiters for one SetEvent. */
+    if (__atomic_load_n( &cell->srv_waiters, __ATOMIC_SEQ_CST )) return MADEIRA_FAST_SERVER;
+    return MADEIRA_FAST_DONE;
+}
+
+/* A single-handle, non-alertable, non-wait-all wait.
+ *
+ * Returns STATUS_SUCCESS when the wait was satisfied with no server call, or
+ * STATUS_NOT_IMPLEMENTED for "fall through to server_wait", in which case
+ * *fallback is the timeout the caller must use from here (a relative timeout
+ * is reduced by the time this function spent, so the total wait is unchanged;
+ * an absolute one needs no adjustment). */
+static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
+                                   const LARGE_INTEGER **fallback, LARGE_INTEGER *store )
+{
+    struct madeira_sync_cell *cell;
+    unsigned int manual = 0;
+    unsigned long long t0, budget_ns;
+    int i, st;
+
+    *fallback = timeout;
+    if (!madeira_fastsync_enabled()) return STATUS_NOT_IMPLEMENTED;
+    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual )))
+        return STATUS_NOT_IMPLEMENTED;
+
+    if (madeira_fast_try( cell, manual ))
+    {
+        ios_srv_nt_count( IOS_NT_FAST_HIT );
+        return STATUS_SUCCESS;
+    }
+
+    /* A zero timeout is a state query.  It has just been answered "no", and
+     * the server is what has to turn that into STATUS_TIMEOUT (and deliver any
+     * pending kernel APC on the way), so do not fake it here. */
+    if (timeout && !timeout->QuadPart)
+    {
+        ios_srv_nt_count( IOS_NT_FAST_MISS );
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    for (i = 0; i < MADEIRA_FAST_SPIN; i++)
+    {
+        __asm__ __volatile__( "isb" ::: "memory" );
+        if (madeira_fast_try( cell, manual ))
+        {
+            ios_srv_nt_count( IOS_NT_FAST_HIT );
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* Never park past the caller's own relative timeout: doing so would turn a
+     * 200 us WaitForSingleObject into a 2 ms one. */
+    budget_ns = madeira_fast_cap_ns;
+    if (timeout && timeout->QuadPart < 0 &&
+        (unsigned long long)(-timeout->QuadPart) * 100 < budget_ns)
+        budget_ns = (unsigned long long)(-timeout->QuadPart) * 100;
+
+    t0 = madeira_now_ns();
+    for (;;)
+    {
+        unsigned long long spent = madeira_now_ns() - t0;
+
+        if (spent >= budget_ns) break;
+
+        __atomic_add_fetch( &cell->waiters, 1, __ATOMIC_SEQ_CST );
+        st = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+        if (st == MADEIRA_CELL_RESET)
+        {
+            ios_srv_nt_count( IOS_NT_FAST_SLEEP );
+            /* the value is re-tested inside the syscall, so a set landing
+             * between the load above and here does not sleep */
+            madeira_fast_park( &cell->state, MADEIRA_CELL_RESET, budget_ns - spent );
+        }
+        __atomic_sub_fetch( &cell->waiters, 1, __ATOMIC_SEQ_CST );
+
+        /* DISABLED (pulsed/freed) or CLAIMED (a server-side waiter is being
+         * handed this token right now) both mean "queue with the server". */
+        if (st != MADEIRA_CELL_RESET && st != MADEIRA_CELL_SET) break;
+        if (madeira_fast_try( cell, manual ))
+        {
+            ios_srv_nt_count( IOS_NT_FAST_HIT );
+            return STATUS_SUCCESS;
+        }
+    }
+
+    if (timeout && timeout->QuadPart < 0)
+    {
+        long long left = -timeout->QuadPart - (long long)((madeira_now_ns() - t0) / 100);
+        store->QuadPart = (left > 0) ? -left : 0;
+        *fallback = store;
+    }
+    ios_srv_nt_count( IOS_NT_FAST_MISS );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+#endif /* WINE_IOS */
+
+
 /* create a struct security_descriptor and contained information in one contiguous piece of memory */
 unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
                                       data_size_t *ret_len )
@@ -1293,11 +1818,35 @@ int madeira_get_eco(void) { ios_eco_init(); return ios_eco_on > 0; }
 NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
 {
     unsigned int ret;
+#ifdef WINE_IOS
+    int op = SET_EVENT;
+#endif
 
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
     __sync_fetch_and_add( &ios_xp_set_event, 1 );   /* ml1131 */
 
     ios_srv_nt_count( IOS_NT_SET_EVENT );
+
+#ifdef WINE_IOS
+    switch (madeira_fast_event_op( handle, 1, prev_state ))
+    {
+    case MADEIRA_FAST_DONE:
+        ios_srv_nt_count( IOS_NT_FAST_HIT );
+        return STATUS_SUCCESS;
+    case MADEIRA_FAST_SERVER:
+        /* ml962: the cell (and prev_state) are already right, so this request
+         * must NOT signal the event again -- a fast waiter may have taken the
+         * token in the meantime and a server-side SET_EVENT on top of that
+         * releases a second waiter for one SetEvent.  MADEIRA_EVENT_OP_WAKE
+         * only runs wake_up(), which re-reads the cell.  See ios_fastsync.h. */
+        ios_srv_nt_count( IOS_NT_FAST_MISS );
+        prev_state = NULL;
+        op = MADEIRA_EVENT_OP_WAKE;
+        break;
+    default:
+        break;
+    }
+#endif
 
     if ((ret = inproc_set_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -1305,7 +1854,11 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
     SERVER_START_REQ( event_op )
     {
         req->handle = wine_server_obj_handle( handle );
+#ifdef WINE_IOS
+        req->op     = op;
+#else
         req->op     = SET_EVENT;
+#endif
         ret = wine_server_call( req );
         if (!ret && prev_state) *prev_state = reply->state;
     }
@@ -1334,6 +1887,16 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
     __sync_fetch_and_add( &ios_xp_reset_event, 1 );   /* ml1131 */
 
     ios_srv_nt_count( IOS_NT_RESET_EVENT );
+
+#ifdef WINE_IOS
+    /* A reset releases nobody, so a cell update is the whole operation --
+     * including for the server, whose event_sync_signaled() reads that word. */
+    if (madeira_fast_event_op( handle, 0, prev_state ) != MADEIRA_FAST_MISS)
+    {
+        ios_srv_nt_count( IOS_NT_FAST_HIT );
+        return STATUS_SUCCESS;
+    }
+#endif
 
     if ((ret = inproc_reset_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -2460,6 +3023,10 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
     union select_op select_op;
     UINT i, flags = SELECT_INTERRUPTIBLE;
     unsigned int ret;
+#ifdef WINE_IOS
+    LARGE_INTEGER madeira_store;   /* ml952: a relative timeout, less whatever
+                                    * the fast path spent, when it falls through */
+#endif
 
     IOS_ECO_POLL();   /* ml1133 */
 
@@ -2492,6 +3059,20 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
         return ret;
     }
 
+#ifdef WINE_IOS
+    /* ml952: a one-handle WaitAny is a NtWaitForSingleObject in disguise and
+     * is the only multi-object shape the fast path may take -- wait-all and
+     * anything with a second handle need the server's atomic evaluation. */
+    if (count == 1 && type != WaitAll && !alertable)
+    {
+        const LARGE_INTEGER *left;
+
+        if ((ret = madeira_fast_wait( handles[0], timeout, &left, &madeira_store )) != STATUS_NOT_IMPLEMENTED)
+            return ret;
+        timeout = left;   /* madeira_store has function scope: see above */
+    }
+#endif
+
     if (alertable) flags |= SELECT_ALERTABLE;
     select_op.wait.op = type == WaitAll ? SELECT_WAIT_ALL : SELECT_WAIT;
     for (i = 0; i < count; i++) select_op.wait.handles[i] = wine_server_obj_handle( handles[i] );
@@ -2509,6 +3090,9 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     union select_op select_op;
     UINT flags = SELECT_INTERRUPTIBLE;
     unsigned int ret;
+#ifdef WINE_IOS
+    LARGE_INTEGER madeira_store;   /* ml952: see NtWaitForMultipleObjects */
+#endif
 
     IOS_ECO_POLL();   /* ml1133 */
 
@@ -2526,6 +3110,20 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
         TRACE( "-> %#x\n", ret );
         return ret;
     }
+
+#ifdef WINE_IOS
+    if (!alertable)
+    {
+        const LARGE_INTEGER *left;
+
+        if ((ret = madeira_fast_wait( handle, timeout, &left, &madeira_store )) != STATUS_NOT_IMPLEMENTED)
+        {
+            TRACE( "-> %#x\n", ret );
+            return ret;
+        }
+        timeout = left;   /* madeira_store has function scope: see above */
+    }
+#endif
 
     if (alertable) flags |= SELECT_ALERTABLE;
     select_op.wait.op = SELECT_WAIT;
@@ -2611,11 +3209,56 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
  * streak through ios_spin_reset(), so a once-per-frame pacing Sleep(0) never
  * reaches the deep rung at all.
  */
+/*
+ * iOS-Madeira ml960: the park is now a LADDER, because one rung was still
+ * 33k syscalls/s.
+ *
+ * Measured on a 32-bit D3D9 title at ~30 fps, per 10 s window:
+ * [srv-stats] sleep0=2878873 yield_sc=55406 park=334447 — i.e. 288k Sleep(0)/s,
+ * of which 33.4k reach the park and 5.5k the yield, so ~39k syscalls/s just to
+ * spin. [prof] agrees: __ulock_wait2 <- NtDelayExecution was 8.7-14.5 % of ALL
+ * CPU, the single largest kernel entry in the process.
+ *
+ * A single 10 us rung cannot fix that, because the streak grows by
+ * IOS_SLEEP0_YIELD_EVERY per park and the park is the only thing slowing the
+ * loop down: one full park cycle is 7 userspace pauses (~20 us measured:
+ * 29.9 us per park minus the 10 us park) plus the park itself, so the spinner
+ * simply runs the same rung forever. Escalating the park DURATION with the
+ * streak converts a longer spin into proportionally fewer syscalls:
+ *
+ *   streak >  512   park  10 us   cycle ~30 us    (as before)
+ *   streak > 4096   park  50 us   cycle ~70 us
+ *   streak >32768   park 200 us   cycle ~220 us
+ *
+ * Expected steady state on the measured workload: the spinner climbs to the top
+ * rung in ~265 ms of uninterrupted spinning (3584 calls at 10 us rungs, then
+ * 28672 at 50 us) and then issues 1/0.22 ms = ~4.5k park syscalls/s instead of
+ * 33.4k — a 7.4x reduction, ~39k -> ~10k total syscalls/s counting the yields.
+ * WORST-CASE ADDED HANDOFF LATENCY: one park interval, so the peer's progress
+ * can go unnoticed for up to 200 us (220 us including the spin segment) versus
+ * ~30 us today. At 30 fps that is 0.66 % of a frame, and the ladder only
+ * reaches that rung after the thread has already polled for a quarter second
+ * without a single real wait — a handoff that actually completes resets the
+ * streak through ios_spin_reset() long before then.
+ *
+ * WHY Sleep(0) MUST STILL YIELD AT ALL, at every rung: the classic case here is
+ * a TWO-THREAD PING-PONG ON ONE CORE. Thread A polls a flag that only thread B
+ * can set, and the scheduler has put both on the same core. If A's Sleep(0)
+ * never leaves userspace, B never runs, so the flag is never set and A polls
+ * until its quantum expires — a livelock that is invisible on a multi-core test
+ * device and fatal on a loaded one. Every rung therefore ends in a real
+ * deschedule (futex_wait with a timeout, or sched_yield); the ladder only
+ * changes HOW LONG the core is given away for, never WHETHER it is.
+ */
 #define IOS_SLEEP0_FREE_SPINS   16
 #define IOS_SLEEP0_YIELD_EVERY   8
 #define IOS_SLEEP0_WINDOW    20000ull   /* 2 ms, in 100 ns Win32 ticks */
 #define IOS_SLEEP0_DEEP        512      /* consecutive Sleep(0) before escalating */
-#define IOS_SLEEP0_PARK_NS   10000ull   /* 10 us bounded park */
+#define IOS_SLEEP0_DEEPER     4096      /* ml960: second rung */
+#define IOS_SLEEP0_DEEPEST   32768      /* ml960: third rung */
+#define IOS_SLEEP0_PARK_NS   10000ull   /* 10 us bounded park  (rung 1) */
+#define IOS_SLEEP0_PARK2_NS  50000ull   /* 50 us bounded park  (rung 2) */
+#define IOS_SLEEP0_PARK3_NS 200000ull   /* 200 us bounded park (rung 3) */
 
 static __thread unsigned int ios_sleep0_streak;
 static __thread ULONGLONG    ios_sleep0_last;
@@ -2631,16 +3274,19 @@ static inline void ios_cpu_pause( unsigned int loops )
 
 /* bounded deschedule: wait on a private word nothing ever wakes, so this
  * always returns by timeout.  futex_wait() maps to
- * os_sync_wait_on_address_with_timeout()/__ulock_wait() on Darwin. */
-static void ios_cpu_park( void )
+ * os_sync_wait_on_address_with_timeout()/__ulock_wait() on Darwin.
+ * ml960: `ns` is the rung's timeout; park= still counts every park so the
+ * before/after syscall rate stays directly comparable in [srv-stats]. */
+static void ios_cpu_park( ULONGLONG ns )
 {
 #ifdef USE_FUTEX
     static __thread LONG park_word;
-    struct timespec ts = { 0, (long)IOS_SLEEP0_PARK_NS };
+    struct timespec ts = { 0, (long)ns };
 
     ios_srv_nt_count( IOS_NT_SLEEP0_PARK );
     futex_wait( &park_word, 0, &ts );
 #else
+    (void)ns;
     NtYieldExecution();
 #endif
 }
@@ -2658,6 +3304,11 @@ static NTSTATUS ios_delay_zero(void)
     if (now - ios_sleep0_last > IOS_SLEEP0_WINDOW) ios_sleep0_streak = 0;
     ios_sleep0_last = now;
     ios_sleep0_streak++;
+    /* ml960: never let the counter wrap back onto a cheap rung. Fold by a
+     * multiple of IOS_SLEEP0_YIELD_EVERY so the "every 8th call" phase below is
+     * preserved, and land well above IOS_SLEEP0_DEEPEST so the rung does not
+     * change either. (Reachable only after hours of uninterrupted spinning.) */
+    if (ios_sleep0_streak > 0x40000000u) ios_sleep0_streak -= 0x20000000u;
 
     if (ios_sleep0_streak <= IOS_SLEEP0_FREE_SPINS ||
         (ios_sleep0_streak - IOS_SLEEP0_FREE_SPINS) % IOS_SLEEP0_YIELD_EVERY)
@@ -2666,10 +3317,14 @@ static NTSTATUS ios_delay_zero(void)
         return STATUS_SUCCESS;
     }
     /* ml951: a streak this long is a spin, not pacing — give the core away
-     * for real instead of asking a scheduler that has nobody else to run. */
+     * for real instead of asking a scheduler that has nobody else to run.
+     * ml960: and the longer it has been spinning without one real wait, the
+     * longer it is worth giving away for — see the ladder above. */
     if (ios_sleep0_streak > IOS_SLEEP0_DEEP)
     {
-        ios_cpu_park();
+        ios_cpu_park( ios_sleep0_streak > IOS_SLEEP0_DEEPEST ? IOS_SLEEP0_PARK3_NS :
+                      ios_sleep0_streak > IOS_SLEEP0_DEEPER  ? IOS_SLEEP0_PARK2_NS :
+                                                               IOS_SLEEP0_PARK_NS );
         return STATUS_SUCCESS;
     }
     return NtYieldExecution();
