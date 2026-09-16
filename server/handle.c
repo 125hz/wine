@@ -38,6 +38,16 @@
 #include "security.h"
 #include "request.h"
 
+/* iOS-Madeira ml805: events are wrappers whose close_handle is no_close_handle,
+ * so event.c cannot see duplicate or close. Record them from here, where they
+ * actually happen, or the [evt-hist] history would silently omit exactly the
+ * two operations that could explain a waiter left on a dead object. */
+extern void ios_evt_record( void *obj, void *sync, int op, int state );
+extern int ios_obj_is_event( struct object *obj );
+extern void *ios_evt_sync_of( struct object *obj );
+#define IOS_EVT_DUP   4
+#define IOS_EVT_CLOSE 5
+
 struct handle_entry
 {
     struct object *ptr;       /* object */
@@ -433,6 +443,9 @@ unsigned int close_handle( struct process *process, obj_handle_t handle )
     if (!(entry = get_handle( process, handle ))) return STATUS_INVALID_HANDLE;
     if (entry->access & RESERVED_CLOSE_PROTECT) return STATUS_HANDLE_NOT_CLOSABLE;
     obj = entry->ptr;
+    /* ml805: a close is one of the two ways a waiter can be left on an object
+     * nobody will ever signal again, and event.c cannot observe it. */
+    if (ios_obj_is_event( obj )) ios_evt_record( obj, ios_evt_sync_of( obj ), IOS_EVT_CLOSE, -1 );
     if (!obj->ops->close_handle( obj, process, handle )) return STATUS_HANDLE_NOT_CLOSABLE;
 
     table = handle_is_global(handle) ? global_table : process->handles;
@@ -576,6 +589,10 @@ obj_handle_t duplicate_handle( struct process *src, obj_handle_t src_handle, str
     struct handle_entry *entry;
     unsigned int src_access, src_flags;
     struct object *obj = get_handle_obj( src, src_handle, 0, NULL );
+
+    /* ml805: record duplication too -- a duplicated handle means the producer
+     * may be signalling through a different handle than the waiter holds. */
+    if (ios_obj_is_event( obj )) ios_evt_record( obj, ios_evt_sync_of( obj ), IOS_EVT_DUP, -1 );
 
     if (!obj) return 0;
     if ((entry = get_handle( src, src_handle )))

@@ -473,6 +473,76 @@ static void ios_cs_report_bad( RTL_CRITICAL_SECTION *crit, const char *where )
         ERR( "[cs-bad] ml672   RW view: (not in any anon-RWX alias -- plain guest memory)\n" );
 }
 
+/* iOS-Madeira ml810: per-thread critical-section acquire/release history.
+ *
+ * PoolThread 1 owns a section (LockCount=7, RecursionCount=1) and then waits
+ * indefinitely on its own private worker event, while six other pool threads
+ * block on that section forever. Nothing so far says WHY it went to sleep still
+ * holding it. The three candidates need different fixes:
+ *
+ *   - the guest genuinely waits inside the locked region (engine behaviour)
+ *   - a RtlLeaveCriticalSection was lost or skipped (our bug)
+ *   - the section bookkeeping was corrupted (different bug again)
+ *
+ * A record of the acquire, its guest caller, and whether a matching leave ever
+ * happened separates them.
+ *
+ * ⛔ THIS IS THE HOTTEST PATH IN THE PROCESS. ml807 instrumented the server's
+ * wait_on/end_wait and wedged startup before FEX even initialised. So: fixed
+ * storage, no allocation, no locks, no stdio, and a bucket per thread id. Two
+ * threads sharing a bucket can interleave and lose a record; they cannot
+ * corrupt anything, because every write is a whole fixed-size slot. */
+#define IOS_CS_BUCKETS 256
+#define IOS_CS_DEPTH   8
+struct ios_cs_rec
+{
+    void         *crit;
+    void         *caller;
+    unsigned int  tid;
+    int           lock_count;
+    int           recursion;
+    unsigned int  seq;
+    unsigned char op;        /* 1 = enter, 2 = leave */
+};
+static struct ios_cs_rec ios_cs_hist[IOS_CS_BUCKETS][IOS_CS_DEPTH];
+static unsigned char ios_cs_next[IOS_CS_BUCKETS];
+static LONG ios_cs_seq;
+
+static void ios_cs_note( RTL_CRITICAL_SECTION *crit, int op, void *caller )
+{
+    unsigned int tid = GetCurrentThreadId();
+    unsigned int b = tid & (IOS_CS_BUCKETS - 1);
+    unsigned char slot = ios_cs_next[b];
+    struct ios_cs_rec *r = &ios_cs_hist[b][slot & (IOS_CS_DEPTH - 1)];
+
+    r->crit = crit;
+    r->caller = caller;
+    r->tid = tid;
+    r->lock_count = crit->LockCount;
+    r->recursion = crit->RecursionCount;
+    r->seq = (unsigned int)InterlockedIncrement( &ios_cs_seq );
+    r->op = (unsigned char)op;
+    ios_cs_next[b] = (unsigned char)(slot + 1);
+}
+
+/* Print one thread's recorded acquires/releases, oldest first. */
+static void ios_cs_dump( unsigned int tid, const char *what )
+{
+    unsigned int b = tid & (IOS_CS_BUCKETS - 1);
+    unsigned int i;
+
+    for (i = 0; i < IOS_CS_DEPTH; i++)
+    {
+        struct ios_cs_rec *r = &ios_cs_hist[b][(ios_cs_next[b] + i) & (IOS_CS_DEPTH - 1)];
+        if (!r->seq) continue;
+        /* The bucket is shared by tid & 0xff, so say whose record this is. */
+        ERR( "[cs-hist] %s bucket=%02x seq=%u tid=%04x %s crit=%p caller=%p lock=%d recursion=%d%s\n",
+             what, b, r->seq, r->tid, r->op == 1 ? "ENTER" : "leave",
+             r->crit, r->caller, r->lock_count, r->recursion,
+             r->tid == tid ? "" : "   (different thread, same bucket)" );
+    }
+}
+
 /******************************************************************************
  *      RtlpWaitForCriticalSection   (NTDLL.@)
  */
@@ -497,6 +567,19 @@ NTSTATUS WINAPI RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit )
 
         timeout = (TRACE_ON(relay) ? 300 : 60);
 
+        /* ml810: whoever owns this has been holding it for a minute. Dump its
+         * acquire/release history and ours -- the owner's last ENTER names the
+         * guest caller that took the lock, and the absence of a matching leave
+         * is what distinguishes a lost release from a deliberate wait inside
+         * the locked region. */
+        {
+            static LONG dumped;
+            if (InterlockedIncrement( &dumped ) <= 8)
+            {
+                ios_cs_dump( HandleToULong(crit->OwningThread), "owner" );
+                ios_cs_dump( GetCurrentThreadId(), "waiter" );
+            }
+        }
         ERR( "section %p %s wait timed out in thread %04lx, blocked by %04lx, retrying (%u sec)\n",
              crit, debugstr_a(crit_section_get_name(crit)), GetCurrentThreadId(), HandleToULong(crit->OwningThread), timeout );
     }
@@ -599,6 +682,7 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 done:
     crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
     crit->RecursionCount = 1;
+    ios_cs_note( crit, 1, __builtin_return_address(0) );   /* ml810 */
     return STATUS_SUCCESS;
 }
 
@@ -613,6 +697,7 @@ BOOL WINAPI RtlTryEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
     {
         crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
         crit->RecursionCount = 1;
+        ios_cs_note( crit, 1, __builtin_return_address(0) );   /* ml810 */
         ret = TRUE;
     }
     else if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
@@ -656,6 +741,7 @@ NTSTATUS WINAPI RtlLeaveCriticalSection( RTL_CRITICAL_SECTION *crit )
     }
     else
     {
+        ios_cs_note( crit, 2, __builtin_return_address(0) );   /* ml810 */
         crit->OwningThread = 0;
         if (InterlockedDecrement( &crit->LockCount ) >= 0)
         {

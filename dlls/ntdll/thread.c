@@ -237,6 +237,20 @@ void WINAPI RtlExitUserThread( ULONG status )
 {
     ULONG last;
 
+    /* iOS-Madeira ml806: name the SELF-shutdown path.
+     *
+     * A render thread exits while still owning a critical section and eight
+     * threads deadlock behind it permanently. The unix-side NtTerminateThread
+     * probe sees the tail of this (line below, with self=1), but only here are
+     * the exit STATUS and the CALLER visible -- and only here is it before
+     * LdrShutdownThread, which is the last point at which anything could still
+     * release what this thread holds. "It shut itself down after a timeout" and
+     * "something told it to stop" need different fixes, and the wineserver's
+     * violent=0 distinguishes neither. */
+    ERR( "[thr-exit] ml806 RtlExitUserThread tid=%04x status=%08x caller=%p\n",
+         (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+         (unsigned)status, __builtin_return_address(0) );
+
     NtQueryInformationThread( GetCurrentThread(), ThreadAmILastThread, &last, sizeof(last), NULL );
     if (last) RtlExitUserProcess( status );
     LdrShutdownThread();

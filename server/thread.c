@@ -1183,6 +1183,16 @@ void reset_sync( struct object *obj )
 }
 
 /* finish waiting */
+/* iOS-Madeira ml808: the ml807 wait-begin/end hooks were REMOVED from here.
+ *
+ * wait_on/end_wait are the hottest and earliest paths in the server -- they run
+ * long before any guest code -- and instrumenting them wedged startup outright:
+ * FEX never reached ProcessInit, the log stopped after the first send_client_fd,
+ * and the app sat at 8 threads. The per-object SET/reset counters in event.c
+ * answer the primary question ("was this event ever signalled") without
+ * touching this path at all. If wait timing is needed later it must be
+ * collected somewhere cold, not here. */
+
 static unsigned int end_wait( struct thread *thread, unsigned int status )
 {
     struct thread_wait *wait = thread->wait;
