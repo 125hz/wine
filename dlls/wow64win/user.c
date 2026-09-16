@@ -1893,6 +1893,15 @@ NTSTATUS WINAPI wow64_NtUserCallTwoParam( UINT *args )
                                                    * to the 32-bit side -- not offset */
         return NtUserCallTwoParam( arg1, (ULONG_PTR)guest_ptr32( arg2 ), code );
 
+    /* ml668: arg2 is the guest's XINPUT_STATE / XINPUT_CAPABILITIES output
+     * buffer; arg1 packs the user index and the NtUserGamepadOp_* selector and
+     * is a pure scalar. Both payloads are pointer-free and laid out identically
+     * in 32-bit and 64-bit (16 and 20 bytes, natural alignment), so the
+     * translation below is the WHOLE marshalling -- win32u writes into the
+     * guest buffer directly. */
+    case NtUserCallTwoParam_GetGamepadState:      /* XINPUT_STATE * / XINPUT_CAPABILITIES * (out) */
+        return NtUserCallTwoParam( arg1, (ULONG_PTR)guest_ptr32( arg2 ), code );
+
     /* arg1 is a pointer, arg2 a scalar */
     case NtUserCallTwoParam_MonitorFromRect:      /* const RECT * (in) */
     case NtUserCallTwoParam_GetVirtualScreenRect: /* RECT * (out) */

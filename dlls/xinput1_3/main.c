@@ -42,6 +42,11 @@
 #include "devguid.h"
 #include "xinput.h"
 
+/* Madeira (ml668): NtUserCallTwoParam_GetGamepadState and its inline wrapper.
+ * win32u.dll is in IMPORTS for this module and for every module that shares
+ * this source through PARENTSRC (xinput1_1/1_2/1_4/xinputuap). */
+#include "ntuser.h"
+
 #include "wine/debug.h"
 
 DEFINE_GUID(GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47,0x67,0x50,0xc5,0xe1,0xa6);
@@ -789,6 +794,64 @@ static void controller_unlock(struct xinput_controller *controller)
     LeaveCriticalSection(&controller->crit);
 }
 
+/* ==========================================================================
+ * Madeira (ml668) - A CONTROLLER PAIRED TO THE PHONE, AS AN XInput USER.
+ *
+ * WHAT IS DIFFERENT HERE. Everything above this line exists to reach a HID
+ * device across a process boundary: setupapi enumerates
+ * GUID_DEVINTERFACE_WINEXINPUT, each match is opened with CreateFile, and a
+ * dedicated thread sits in an overlapped read so reports arrive without
+ * polling. On this port there is no boundary to cross. The controller is a
+ * GameController object in the SAME Mach task as the game thread (every
+ * Windows process here is a thread of one task - WOW64_DESIGN.md section 2),
+ * the app samples it at 250 Hz into a shared struct, and win32u reads that
+ * struct with no lock and no server round trip. Reproducing the device stack
+ * to move sixteen bytes between two pages of one address space would cost a
+ * service, a driver, a pipe, a thread and a poll loop, and would be slower
+ * than the thing it wraps.
+ *
+ * WHY THERE IS NO #ifdef. NtUserGetGamepadState is NtUserCallTwoParam with a
+ * code appended to the end of the enum in wine/include/ntuser.h. A win32u that
+ * does not implement it falls into the default: arm and returns 0 - which is
+ * bit-for-bit the same answer as "no pad in that slot". So on a stock Wine
+ * every call below is one cheap syscall that says no, and the HID path
+ * underneath runs exactly as before. The host path is tried FIRST and the HID
+ * path is the fallback, never the other way round: an iOS pad must not have to
+ * wait on a HID enumeration that will never find anything.
+ *
+ * AND WHY IT MUST NOT START THE UPDATE THREAD. start_update_thread() creates a
+ * thread, a window, a device-notification registration and a setupapi
+ * enumeration. On a phone that finds nothing, every time, in every process
+ * that so much as calls XInputGetState once. The host path answers before it,
+ * so a game that finds its controller never pays for the device stack.
+ * ========================================================================== */
+
+/* Per-index edge state for XInputGetKeystroke on the host path. The HID path
+ * keeps the same thing in controller->last_keystroke; the host path has no
+ * struct xinput_controller at all, so it needs its own. */
+static XINPUT_GAMEPAD host_last_keystroke[XUSER_MAX_COUNT];
+
+/* Fill state from the host slot. TRUE means a pad is connected there. */
+static BOOL host_pad_state(DWORD index, XINPUT_STATE *state)
+{
+    memset(state, 0, sizeof(*state));
+    if (index >= XUSER_MAX_COUNT) return FALSE;
+    return NtUserGetGamepadState(index, NtUserGamepadOp_State, state);
+}
+
+/* Is the host publishing ANY pad? Deliberately not cached: a controller can be
+ * paired halfway through a session, and four syscalls into a memory read is
+ * cheaper than the staleness bug a cache would buy. */
+static BOOL host_pad_any(void)
+{
+    XINPUT_STATE state;
+    DWORD i;
+
+    for (i = 0; i < XUSER_MAX_COUNT; i++)
+        if (host_pad_state(i, &state)) return TRUE;
+    return FALSE;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     TRACE("inst %p, reason %lu, reserved %p.\n", inst, reason, reserved);
@@ -813,6 +876,12 @@ void WINAPI DECLSPEC_HOTPATCH XInputEnable(BOOL enable)
     to the controllers. Setting to true will send the last vibration
     value (sent to XInputSetState) to the controller and allow messages to
     be sent */
+    /* ml668: a host pad has no enable/disable to forward - it has no motors and
+     * its reports are a struct the app overwrites whether anyone reads them or
+     * not. Returning here is the point: it keeps a game's XInputEnable() out of
+     * the HID device stack, which on a phone finds nothing. */
+    if (host_pad_any()) return;
+
     start_update_thread();
 
     for (index = 0; index < XUSER_MAX_COUNT; index++)
@@ -826,13 +895,23 @@ void WINAPI DECLSPEC_HOTPATCH XInputEnable(BOOL enable)
 
 DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vibration)
 {
+    XINPUT_STATE host_state;
     DWORD ret;
 
     TRACE("index %lu, vibration %p.\n", index, vibration);
 
+    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+
+    /* ml668: a host pad accepts vibration and does nothing with it. iOS cannot
+     * drive a controller's motors (Core Haptics addresses the PHONE's taptic
+     * engine, not the pad), and there is no XInput answer that means "connected
+     * but no motors" - ERROR_DEVICE_NOT_CONNECTED here would make a game
+     * conclude the whole controller had vanished mid-frame, which is far worse
+     * than a rumble nobody feels. */
+    if (host_pad_state(index, &host_state)) return ERROR_SUCCESS;
+
     start_update_thread();
 
-    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
     if (!controller_lock(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
 
     ret = HID_set_state(&controllers[index], vibration);
@@ -847,10 +926,15 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputSetState(DWORD index, XINPUT_VIBRATION *vib
 static DWORD xinput_get_state(DWORD index, XINPUT_STATE *state)
 {
     if (!state) return ERROR_BAD_ARGUMENTS;
+    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+
+    /* ml668: the host pad first, and before start_update_thread() - see the
+     * banner above. This is the hot path: a game may call it once per frame per
+     * pad, or in a spin loop at 1 kHz. */
+    if (host_pad_state(index, state)) return ERROR_SUCCESS;
 
     start_update_thread();
 
-    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
     if (!controller_lock(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
 
     *state = controllers[index].state;
@@ -973,10 +1057,13 @@ static BOOL trigger_is_on(const BYTE value)
     return value > 30;
 }
 
-static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke)
+/* ml668: the keystroke edge detector, over a state and an edge-memory the
+ * CALLER owns. Split out of check_for_keystroke below so the host path can run
+ * exactly the same state machine over its own pair - a second copy of this
+ * logic would be two places for VK_PAD_* edges to disagree. */
+static DWORD keystroke_from_state(const DWORD index, XINPUT_KEYSTROKE *keystroke,
+                                  const XINPUT_GAMEPAD *cur, XINPUT_GAMEPAD *last)
 {
-    struct xinput_controller *controller = &controllers[index];
-    const XINPUT_GAMEPAD *cur;
     DWORD ret = ERROR_EMPTY;
     int i;
 
@@ -1002,26 +1089,22 @@ static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke)
         /* note: guide button does not send an event */
     };
 
-    if (!controller_lock(controller)) return ERROR_DEVICE_NOT_CONNECTED;
-
-    cur = &controller->state.Gamepad;
-
     /*** buttons ***/
     for (i = 0; i < ARRAY_SIZE(buttons); ++i)
     {
-        if ((cur->wButtons & buttons[i].mask) ^ (controller->last_keystroke.wButtons & buttons[i].mask))
+        if ((cur->wButtons & buttons[i].mask) ^ (last->wButtons & buttons[i].mask))
         {
             keystroke->VirtualKey = buttons[i].vk;
             keystroke->Unicode = 0; /* unused */
             if (cur->wButtons & buttons[i].mask)
             {
                 keystroke->Flags = XINPUT_KEYSTROKE_KEYDOWN;
-                controller->last_keystroke.wButtons |= buttons[i].mask;
+                last->wButtons |= buttons[i].mask;
             }
             else
             {
                 keystroke->Flags = XINPUT_KEYSTROKE_KEYUP;
-                controller->last_keystroke.wButtons &= ~buttons[i].mask;
+                last->wButtons &= ~buttons[i].mask;
             }
             keystroke->UserIndex = index;
             keystroke->HidCode = 0;
@@ -1031,46 +1114,60 @@ static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke)
     }
 
     /*** triggers ***/
-    if (trigger_is_on(cur->bLeftTrigger) ^ trigger_is_on(controller->last_keystroke.bLeftTrigger))
+    if (trigger_is_on(cur->bLeftTrigger) ^ trigger_is_on(last->bLeftTrigger))
     {
         keystroke->VirtualKey = VK_PAD_LTRIGGER;
         keystroke->Unicode = 0; /* unused */
         keystroke->Flags = trigger_is_on(cur->bLeftTrigger) ? XINPUT_KEYSTROKE_KEYDOWN : XINPUT_KEYSTROKE_KEYUP;
         keystroke->UserIndex = index;
         keystroke->HidCode = 0;
-        controller->last_keystroke.bLeftTrigger = cur->bLeftTrigger;
+        last->bLeftTrigger = cur->bLeftTrigger;
         ret = ERROR_SUCCESS;
         goto done;
     }
 
-    if (trigger_is_on(cur->bRightTrigger) ^ trigger_is_on(controller->last_keystroke.bRightTrigger))
+    if (trigger_is_on(cur->bRightTrigger) ^ trigger_is_on(last->bRightTrigger))
     {
         keystroke->VirtualKey = VK_PAD_RTRIGGER;
         keystroke->Unicode = 0; /* unused */
         keystroke->Flags = trigger_is_on(cur->bRightTrigger) ? XINPUT_KEYSTROKE_KEYDOWN : XINPUT_KEYSTROKE_KEYUP;
         keystroke->UserIndex = index;
         keystroke->HidCode = 0;
-        controller->last_keystroke.bRightTrigger = cur->bRightTrigger;
+        last->bRightTrigger = cur->bRightTrigger;
         ret = ERROR_SUCCESS;
         goto done;
     }
 
     /*** joysticks ***/
     ret = check_joystick_keystroke(index, keystroke, &cur->sThumbLX, &cur->sThumbLY,
-            &controller->last_keystroke.sThumbLX,
-            &controller->last_keystroke.sThumbLY, VK_PAD_LTHUMB_UP);
+            &last->sThumbLX, &last->sThumbLY, VK_PAD_LTHUMB_UP);
     if (ret == ERROR_SUCCESS)
         goto done;
 
     ret = check_joystick_keystroke(index, keystroke, &cur->sThumbRX, &cur->sThumbRY,
-            &controller->last_keystroke.sThumbRX,
-            &controller->last_keystroke.sThumbRY, VK_PAD_RTHUMB_UP);
+            &last->sThumbRX, &last->sThumbRY, VK_PAD_RTHUMB_UP);
     if (ret == ERROR_SUCCESS)
         goto done;
 
 done:
-    controller_unlock(controller);
+    return ret;
+}
 
+static DWORD check_for_keystroke(const DWORD index, XINPUT_KEYSTROKE *keystroke)
+{
+    struct xinput_controller *controller = &controllers[index];
+    XINPUT_STATE host_state;
+    DWORD ret;
+
+    /* ml668: the host pad answers first, with its own edge memory. */
+    if (host_pad_state(index, &host_state))
+        return keystroke_from_state(index, keystroke, &host_state.Gamepad,
+                                    &host_last_keystroke[index]);
+
+    if (!controller_lock(controller)) return ERROR_DEVICE_NOT_CONNECTED;
+    ret = keystroke_from_state(index, keystroke, &controller->state.Gamepad,
+                               &controller->last_keystroke);
+    controller_unlock(controller);
     return ret;
 }
 
@@ -1110,18 +1207,32 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetDSoundAudioDeviceGuids(DWORD index, GUID
           debugstr_guid(capture_guid));
 
     if (index >= XUSER_MAX_COUNT || !render_guid || !capture_guid) return ERROR_BAD_ARGUMENTS;
-    if (!controllers[index].device) return ERROR_DEVICE_NOT_CONNECTED;
+    if (!host_pad_any() && !controllers[index].device) return ERROR_DEVICE_NOT_CONNECTED;
 
     return ERROR_NOT_SUPPORTED;
 }
 
 DWORD WINAPI DECLSPEC_HOTPATCH XInputGetBatteryInformation(DWORD index, BYTE type, XINPUT_BATTERY_INFORMATION* battery)
 {
+    XINPUT_STATE host_state;
     static int once;
 
     if (!once++) FIXME("index %lu, type %u, battery %p.\n", index, type, battery);
 
     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+
+    /* ml668: iOS exposes no battery level for a paired controller, and a game
+     * that asks must get an answer it can render. WIRED/FULL is what a wired
+     * Xbox pad reports and is the one combination that never draws a low-battery
+     * warning for a pad whose charge we cannot see. */
+    if (host_pad_state(index, &host_state))
+    {
+        if (!battery) return ERROR_BAD_ARGUMENTS;
+        battery->BatteryType = BATTERY_TYPE_WIRED;
+        battery->BatteryLevel = BATTERY_LEVEL_FULL;
+        return ERROR_SUCCESS;
+    }
+
     if (!controllers[index].device) return ERROR_DEVICE_NOT_CONNECTED;
 
     return ERROR_NOT_SUPPORTED;
@@ -1134,9 +1245,27 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilitiesEx(DWORD unk, DWORD index, D
 
     TRACE("unk %lu, index %lu, flags %#lx, capabilities %p.\n", unk, index, flags, caps);
 
-    start_update_thread();
+    if (index >= XUSER_MAX_COUNT || !caps) return ERROR_BAD_ARGUMENTS;
 
-    if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+    /* ml668: the host pad's capability block is built in win32u
+     * (build/win32u-unix/driver_ios.c, ios_gamepad_query, NtUserGamepadOp_Caps)
+     * because that is where the shape of the device is known. The vendor and
+     * product reported here are the standard XInput pad's: a game that switches
+     * button glyphs on the VID/PID must see a device it recognises as one, and
+     * every controller iOS routes through GCExtendedGamepad presents exactly
+     * that layout regardless of what it says on the plastic. */
+    if (NtUserGetGamepadState(index, NtUserGamepadOp_Caps, &caps->Capabilities))
+    {
+        if (flags & XINPUT_FLAG_GAMEPAD &&
+            caps->Capabilities.SubType != XINPUT_DEVSUBTYPE_GAMEPAD)
+            return ERROR_DEVICE_NOT_CONNECTED;
+        caps->VendorId = 0x045e;        /* Microsoft */
+        caps->ProductId = 0x028e;       /* Controller (XBOX 360 For Windows) */
+        caps->VersionNumber = 0x0114;
+        return ERROR_SUCCESS;
+    }
+
+    start_update_thread();
 
     if (!controller_lock(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
 

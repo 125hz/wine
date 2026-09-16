@@ -974,12 +974,33 @@ NTSTATUS WINAPI wow64_NtSetInformationProcess( UINT *args )
     case ProcessPriorityClass:   /* PROCESS_PRIORITY_CLASS */
     case ProcessBasePriority:   /* ULONG */
     case ProcessPriorityBoost:  /* ULONG */
-    case ProcessExecuteFlags:   /* ULONG */
     case ProcessPagePriority:   /* MEMORY_PRIORITY_INFORMATION */
     case ProcessPowerThrottlingState:   /* PROCESS_POWER_THROTTLING_STATE */
     case ProcessLeapSecondInformation:   /* PROCESS_LEAP_SECOND_INFO */
     case ProcessWineGrantAdminToken:   /* NULL */
         return NtSetInformationProcess( handle, class, ptr, len );
+
+    case ProcessExecuteFlags:   /* ULONG */
+        /* MADEIRA: DEP policy has to reach the CPU backend, not just the host ntdll.
+         *
+         * On real Windows the backend decides nothing about executability - the MMU does - so
+         * wow64.dll forwarding this class was enough.  Here the backend IS the MMU for guest
+         * code: FEX answers "may this guest address be executed?" from its own interval lists,
+         * and a page that is not in them decodes as NOEXEC, raises a synthetic execute fault and
+         * kills the thread.  A program running with DEP off (any image without
+         * IMAGE_DLLCHARACTERISTICS_NX_COMPAT - i.e. most pre-Vista 32-bit software, and anything
+         * that unpacks or decrypts itself at run time) therefore has to be told to the backend
+         * explicitly, or its first jump into its own PAGE_READWRITE buffer dies.
+         *
+         * Notify only after a successful set.  The handle is deliberately not examined: ntdll's
+         * own implementation of this class ignores it too and always updates the calling
+         * process's flags, so testing it here would make the notification disagree with the
+         * state it is reporting.  Upstream's behaviour is preserved exactly when the backend
+         * does not export the hook. */
+        status = NtSetInformationProcess( handle, class, ptr, len );
+        if (!status && pBTCpuNotifyProcessExecuteFlagsChange && len == sizeof(ULONG))
+            pBTCpuNotifyProcessExecuteFlagsChange( *(ULONG *)ptr );
+        return status;
 
     case ProcessAccessToken: /* PROCESS_ACCESS_TOKEN */
         if (len == sizeof(PROCESS_ACCESS_TOKEN32))

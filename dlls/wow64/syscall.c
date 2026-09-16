@@ -167,6 +167,7 @@ void     (WINAPI *pBTCpuNotifyMemoryAlloc)( void *, SIZE_T, ULONG, ULONG, BOOL, 
 void     (WINAPI *pBTCpuNotifyMemoryDirty)( void *, SIZE_T ) = NULL;
 void     (WINAPI *pBTCpuNotifyMemoryFree)( void *, SIZE_T, ULONG, BOOL, NTSTATUS ) = NULL;
 void     (WINAPI *pBTCpuNotifyMemoryProtect)( void *, SIZE_T, ULONG, BOOL, NTSTATUS ) = NULL;
+void     (WINAPI *pBTCpuNotifyProcessExecuteFlagsChange)( ULONG ) = NULL;
 void     (WINAPI *pBTCpuNotifyReadFile)( HANDLE, void *, SIZE_T, BOOL, NTSTATUS ) = NULL;
 void     (WINAPI *pBTCpuNotifyUnmapViewOfSection)( void *, BOOL, NTSTATUS ) = NULL;
 NTSTATUS (WINAPI *pBTCpuResetToConsistentState)( EXCEPTION_POINTERS * ) = NULL;
@@ -1175,6 +1176,14 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     GET_PTR( BTCpuNotifyMemoryDirty );
     GET_PTR( BTCpuNotifyMemoryFree );
     GET_PTR( BTCpuNotifyMemoryProtect );
+    /* MADEIRA: the CPU backend's DEP hook.  Upstream never resolved or called it, so
+     * NtSetInformationProcess(ProcessExecuteFlags) - which the 32-bit loader issues for every
+     * image without IMAGE_DLLCHARACTERISTICS_NX_COMPAT (dlls/ntdll/loader.c:1930), and which
+     * SetProcessDEPPolicy issues at runtime - reached the host ntdll and stopped there.  The
+     * emulator therefore never learned that DEP is off and kept refusing to translate code the
+     * program had written into its own PAGE_READWRITE memory.  Optional like every other hook:
+     * a backend that does not export it is simply not told. */
+    GET_PTR( BTCpuNotifyProcessExecuteFlagsChange );
     GET_PTR( BTCpuNotifyReadFile );
     GET_PTR( BTCpuNotifyUnmapViewOfSection );
     GET_PTR( BTCpuUpdateProcessorInformation );
@@ -1211,6 +1220,7 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
     XLATE_PTR( BTCpuNotifyMemoryDirty );
     XLATE_PTR( BTCpuNotifyMemoryFree );
     XLATE_PTR( BTCpuNotifyMemoryProtect );
+    XLATE_PTR( BTCpuNotifyProcessExecuteFlagsChange );
     XLATE_PTR( BTCpuNotifyReadFile );
     XLATE_PTR( BTCpuNotifyUnmapViewOfSection );
     XLATE_PTR( BTCpuUpdateProcessorInformation );
