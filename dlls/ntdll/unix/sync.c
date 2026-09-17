@@ -3251,10 +3251,61 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
 #define IOS_SPIN_T3          50000ull   /* 5 ms   */
 #define IOS_SPIN_PARK_MAX_NS 1000000ull /* hard cap: never park past 1 ms */
 
+/* iOS-Madeira ml998: THE DEEP RUNGS WERE SPINNING, NOT PARKING.
+ *
+ * `gap' is the minimum time between kernel entries and `park' is how long the
+ * thread is descheduled at each one, so the fraction of a streak this thread
+ * is NOT burning a core is park/gap.  The ml970 tables read as an escalation
+ * but they are the opposite of one:
+ *
+ *      rung 0   park 15 us / gap  20 us  =  75 % parked
+ *      rung 1   park 15 us / gap 100 us  =  15 % parked
+ *      rung 2   park 30 us / gap 300 us  =  10 % parked
+ *      rung 3   park 60 us / gap 500 us  =  12 % parked
+ *
+ * The longer the spin had already run -- that is, the more certain it was that
+ * this thread had nothing to do -- the larger the share of the time it spent
+ * in ios_cpu_pause() burning the core.  The escalation removed SYSCALLS, but
+ * the syscall is the only part of a rung that gives the CPU back, so removing
+ * it removed the saving and kept the cost.
+ *
+ * What that cost, measured: [prof] names `ios_spin_governor+0x320' -- the ISB
+ * delay loop -- as the single hottest PC in the process in almost every
+ * 10 s window of the qp4.txt capture, at 23.6-31.7 % of all CPU mid-game and
+ * 50.6-60.8 % during level loads, more than the JIT and more than the file
+ * lookups.  [sleep0] explains why: 2.6 M governed calls per 10 s window from
+ * ~500 streaks, i.e. ~2 us of ISB per call for the entire length of a streak.
+ *
+ * The retune sets park just under gap on every rung, so a thread that is
+ * waiting is parked ~95 % of the time instead of ~10 %.  It is exactly the
+ * same ladder and the same policy; only the duty cycle changes.
+ *
+ * The latency this costs is bounded by the rung's park length, and [sleep0]'s
+ * own distribution says what that is worth: `hist us' puts 96 % of finished
+ * streaks at >= 2 ms and the p50 time-to-progress at 8 ms with p80 at 16 ms,
+ * with fewer than 5 % finishing under 1 ms.  So the deepest rung's 380 us
+ * granularity is under 5 % of the median wait it applies to, against giving
+ * back ~0.7 of a core.  The short rungs stay short precisely because a spin
+ * that has not yet run 500 us might still be a genuine quick handoff.
+ *
+ * The syscall rate barely moves, which is the part worth being explicit
+ * about: the gaps shrank by only ~20 %, so a p50 8 ms streak still takes on
+ * the order of 25 kernel entries rather than the ~22 it took before.  What
+ * changes is what those entries do with the time between them -- ~7.5 ms of
+ * the 8 ms is now spent descheduled instead of ~1 ms.  [srv-stats] `park'
+ * should therefore read ~3.0-3.2 k/s where it read ~2.5 k/s, while [sleep0]
+ * `sleep0'+`yield' collapse from ~2.6 M per 10 s window to ~130 k, because a
+ * parked thread is not calling the governor at all.
+ *
+ * Unchanged: the first kernel entry of a streak is still a real sched_yield(),
+ * so Sleep(0)/SwitchToThread keeps its Windows-observable semantics, and
+ * IOS_SPIN_PARK_MAX_NS still caps every park at 1 ms. */
+
 /* kernel-entry gap per rung, in 100 ns ticks */
-static const ULONGLONG ios_spin_gap_ticks[4]  = {   200ull,  1000ull,  3000ull,  5000ull };
-/* park length per rung, in ns */
-static const ULONGLONG ios_spin_park_ns[4]    = { 15000ull, 15000ull, 30000ull, 60000ull };
+static const ULONGLONG ios_spin_gap_ticks[4]  = {   200ull,  1000ull,  2500ull,   4000ull };
+/* park length per rung, in ns -- just under the rung's gap, so the thread is
+ * descheduled for essentially the whole of it */
+static const ULONGLONG ios_spin_park_ns[4]    = { 15000ull, 80000ull, 240000ull, 380000ull };
 
 static __thread ULONGLONG    ios_spin_t0;        /* streak start, ticks           */
 static __thread ULONGLONG    ios_spin_last;      /* last governed call, ticks     */

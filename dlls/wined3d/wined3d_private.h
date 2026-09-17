@@ -2079,6 +2079,10 @@ struct wined3d_pixel_format
 enum wined3d_pci_vendor
 {
     HW_VENDOR_SOFTWARE              = 0x0000,
+    /* MADEIRA: Apple's PCI vendor ID. Used only by the no3d adapter on this
+     * port, so that the 2D/DirectDraw side reports the same GPU identity as
+     * the Metal-backed D3D9 frontend. */
+    HW_VENDOR_APPLE                 = 0x106b,
     HW_VENDOR_AMD                   = 0x1002,
     HW_VENDOR_NVIDIA                = 0x10de,
     HW_VENDOR_VMWARE                = 0x15ad,
@@ -2089,6 +2093,9 @@ enum wined3d_pci_vendor
 enum wined3d_pci_device
 {
     CARD_WINE                       = 0x0000,
+    /* MADEIRA: see HW_VENDOR_APPLE. Non-zero on purpose -- a device ID of 0
+     * is what an application's GPU table reads as "no adapter". */
+    CARD_APPLE_GPU                  = 0x0001,
 
     CARD_AMD_RAGE_128PRO            = 0x5246,
     CARD_AMD_RADEON_7200            = 0x5144,

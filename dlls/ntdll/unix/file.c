@@ -321,6 +321,18 @@ static unsigned long long ios_fs_open_srv_us, ios_fs_open_srv_n;
 static unsigned long long ios_fs_xa_hit, ios_fs_xa_miss, ios_fs_xa_skip, ios_fs_xa_write;
 /* ml913: whole-path negative cache */
 static unsigned long long ios_fs_np_hit, ios_fs_np_put, ios_fs_np_stale, ios_fs_np_evict;
+/* ml915: directory-contents cache.  hit/miss are probes, scan is a table
+ * actually built, stale/inval/evict/big are the four ways one dies. */
+static unsigned long long ios_fs_dc_hit, ios_fs_dc_miss, ios_fs_dc_scan;
+static unsigned long long ios_fs_dc_stale, ios_fs_dc_inval, ios_fs_dc_evict, ios_fs_dc_big;
+/* ml915: the whole-path fast path built on the table -- `fast` answered a
+ * never-seen-before name in one fstatat, `fexact` short-circuited an open of
+ * a file that is there, `fmiss` had no parent resolution or no table yet. */
+static unsigned long long ios_fs_dc_fast, ios_fs_dc_fexact, ios_fs_dc_fmiss;
+/* live gauges, maintained under ios_dc_lock and read relaxed by the report */
+static unsigned int ios_dc_ndirs, ios_dc_nents, ios_dc_bytes;
+/* ml915: how many of `lookup`'s microseconds bought a failing open */
+static unsigned long long ios_fs_open_lk_fail_us;
 
 static inline unsigned long long ios_fs_now_us(void)
 {
@@ -343,6 +355,8 @@ static inline unsigned long long ios_fs_now_us(void)
  *           prefix parse, the config_dir/dosdevices assembly, get_dos_device
  *           and the non-drive prefix lstat.
  *   wneg    the whole-path NEGATIVE cache probe and its one validating stat.
+ *   wdir    ml915: the parent-resolution probe, its one validating stat and
+ *           the two directory-table probes that answer the leaf.
  *   wpath   the whole-path exact-case shortcut stat + the whole-path
  *           POSITIVE cache probe and its validating stat.
  *   exact   find_file_in_dir's per-component exact-case fstatat.
@@ -353,10 +367,10 @@ static inline unsigned long long ios_fs_now_us(void)
  *   reparse lookup_unix_name's `<name>?` handling minus the nested
  *           find_file_in_dir (which lands in the phases above).
  */
-enum ios_fs_ph { IOS_PH_PREFIX, IOS_PH_WNEG, IOS_PH_WPATH, IOS_PH_EXACT,
+enum ios_fs_ph { IOS_PH_PREFIX, IOS_PH_WNEG, IOS_PH_WDIR, IOS_PH_WPATH, IOS_PH_EXACT,
                  IOS_PH_PCACHE, IOS_PH_NEG, IOS_PH_SCAN, IOS_PH_REPARSE, IOS_PH_COUNT };
 static const char * const ios_fs_phname[IOS_PH_COUNT] =
-    { "prefix", "wneg", "wpath", "exact", "pcache", "neg", "scan", "reparse" };
+    { "prefix", "wneg", "wdir", "wpath", "exact", "pcache", "neg", "scan", "reparse" };
 static unsigned long long ios_fs_ph[IOS_PH_COUNT];
 
 static inline void ios_ph_add( int p, unsigned long long t0 )
@@ -417,6 +431,7 @@ static inline ssize_t ios_c_fgetxattr( int fd, const char *n, void *v, size_t s,
 #endif
 
 static int ios_np_disabled(void);   /* ml914: defined with the cache below */
+static int ios_dc_disabled(void);   /* ml915: defined with the cache below */
 
 /* ---- the 10 s [fs-stats] report ----------------------------------- */
 
@@ -453,11 +468,13 @@ static void ios_fs_report( unsigned long long now )
     static unsigned long long p_bytes, p_sync, p_srv, p_pos, p_depth[IOS_FS_DEPTH_MAX + 1];
     static unsigned long long p_exact, p_scan, p_hit, p_miss, p_stale, p_put, p_evict;
     static unsigned long long p_nhit, p_nput, p_nstale, p_mroot, p_mkey, p_mstamp;
-    static unsigned long long p_lkus, p_lkn, p_lkfail, p_srvus, p_srvn;
+    static unsigned long long p_lkus, p_lkn, p_lkfail, p_lkfus, p_srvus, p_srvn;
+    static unsigned long long p_dchit, p_dcmiss, p_dcscan, p_dcstale, p_dcinval, p_dcevict, p_dcbig;
+    static unsigned long long p_dcfast, p_dcfex, p_dcfmiss;
     static unsigned long long p_cshit, p_csmiss, p_xahit, p_xamiss, p_xaskip, p_xawr;
     static unsigned long long p_ph[IOS_PH_COUNT];
     static unsigned long long p_nphit, p_npput, p_npstale, p_npevict;
-    unsigned long long d_lkus, d_srvus, d_ph[IOS_PH_COUNT], d_phsum;
+    unsigned long long d_lkus, d_srvus, d_lkfail, d_lkfus, d_ph[IOS_PH_COUNT], d_phsum;
     char line[700];
     int i, n = 0;
     unsigned long long win_us = now - ios_fs_window_t0;
@@ -486,10 +503,15 @@ static void ios_fs_report( unsigned long long now )
      * server at all, so `lkfail` says how much of `lookup` bought nothing. */
     d_lkus  = IOS_D( ios_fs_open_lk_us,  p_lkus );
     d_srvus = IOS_D( ios_fs_open_srv_us, p_srvus );
-    dprintf( 2, "[fs-stats]   open: lookup=%llu.%03llums/%llu (fail=%llu) server=%llu.%03llums/%llu "
-                "other=%llu.%03llums\n",
+    /* ml915: fail_avg_us is the number the directory-contents cache exists to
+     * move -- the mean cost of ONE open that ends in "not found".  Before it,
+     * q66 measured 2060 us of that; one fstatat plus a hash probe is ~155. */
+    d_lkfail = IOS_D( ios_fs_open_lk_fail,    p_lkfail );
+    d_lkfus  = IOS_D( ios_fs_open_lk_fail_us, p_lkfus );
+    dprintf( 2, "[fs-stats]   open: lookup=%llu.%03llums/%llu (fail=%llu fail_avg_us=%llu) "
+                "server=%llu.%03llums/%llu other=%llu.%03llums\n",
              d_lkus / 1000, d_lkus % 1000, IOS_D( ios_fs_open_lk_n, p_lkn ),
-             IOS_D( ios_fs_open_lk_fail, p_lkfail ),
+             d_lkfail, d_lkfail ? d_lkfus / d_lkfail : 0,
              d_srvus / 1000, d_srvus % 1000, IOS_D( ios_fs_open_srv_n, p_srvn ),
              (d_opus[IOS_OP_OPEN] + d_opus[IOS_OP_CREATE] > d_lkus + d_srvus
               ? d_opus[IOS_OP_OPEN] + d_opus[IOS_OP_CREATE] - d_lkus - d_srvus : 0) / 1000,
@@ -512,9 +534,27 @@ static void ios_fs_report( unsigned long long now )
     dprintf( 2, "[fs-stats]   phase:%s rest=%llu.%03llums | wholeneg=%s h%llu/p%llu/s%llu/e%llu\n",
              line, (d_lkus > d_phsum ? d_lkus - d_phsum : 0) / 1000,
              (d_lkus > d_phsum ? d_lkus - d_phsum : 0) % 1000,
-             ios_np_disabled() ? "OFF(MADEIRA_FS_NEGCACHE=1 enables)" : "ON",
+             ios_np_disabled() ? "OFF(MADEIRA_FS_NEGCACHE=1 enables)"
+                               : "ON(MADEIRA_FS_NEGCACHE=0 disables)",
              IOS_D( ios_fs_np_hit, p_nphit ), IOS_D( ios_fs_np_put, p_npput ),
              IOS_D( ios_fs_np_stale, p_npstale ), IOS_D( ios_fs_np_evict, p_npevict ) );
+
+    /* ml915: dirs/entries/bytes are the LIVE table, the rest are per-window
+     * deltas.  scans is how many directories were read end to end in this
+     * window; once a directory is in the table that number stays at 0 and
+     * hits climb, which is the whole claim this cache makes. */
+    dprintf( 2, "[fs-stats]   dircache=%s: dirs=%u entries=%u bytes=%u hits=%llu misses=%llu "
+                "scans=%llu evict=%llu stale=%llu inval=%llu big=%llu\n",
+             ios_dc_disabled() ? "OFF(MADEIRA_FS_DIRCACHE unset or =1 enables)"
+                               : "ON(MADEIRA_FS_DIRCACHE=0 disables)",
+             IOS_FSL( ios_dc_ndirs ), IOS_FSL( ios_dc_nents ), IOS_FSL( ios_dc_bytes ),
+             IOS_D( ios_fs_dc_hit, p_dchit ), IOS_D( ios_fs_dc_miss, p_dcmiss ),
+             IOS_D( ios_fs_dc_scan, p_dcscan ), IOS_D( ios_fs_dc_evict, p_dcevict ),
+             IOS_D( ios_fs_dc_stale, p_dcstale ), IOS_D( ios_fs_dc_inval, p_dcinval ),
+             IOS_D( ios_fs_dc_big, p_dcbig ) );
+    dprintf( 2, "[fs-stats]   dirfast: notfound=%llu exact=%llu nocache=%llu\n",
+             IOS_D( ios_fs_dc_fast, p_dcfast ), IOS_D( ios_fs_dc_fexact, p_dcfex ),
+             IOS_D( ios_fs_dc_fmiss, p_dcfmiss ) );
 
     d_bytes = IOS_D( ios_fs_read_bytes, p_bytes );
     d_sync  = IOS_D( ios_fs_read_sync,  p_sync );
@@ -778,9 +818,13 @@ static void ios_pc_put( const char *key, const char *val )
  *   - the stamp must have been read BEFORE the work that proved the name
  *     absent; see ios_dir_stamp_ok below.
  *
- * MADEIRA_FS_NEGCACHE=1 turns this cache ON.  It is OFF by default: with it
- * off, the other two caches are untouched and this file behaves exactly as
- * the build before ml914 did.
+ * ml915: this cache is now ON by default and MADEIRA_FS_NEGCACHE=0 turns it
+ * off (it was default-off while it was unproven; it has since passed the
+ * fs-x86.exe host model and phases 1-6 on device).  With the
+ * directory-contents cache below doing the heavy lifting it is no longer the
+ * main win, but a repeated probe of the same absent path is still answered
+ * here without even reaching find_file_in_dir, so it stays as cheap
+ * insurance.  With it off, the other caches are untouched.
  *
  * Sizing: a title probing package paths across many directories generates
  * thousands of distinct misses, and unlike the positive cache EVERY miss is
@@ -904,10 +948,10 @@ static __thread struct ios_pc_neg ios_dir_stamp;
 static __thread int ios_dir_stamp_ok;
 
 /* ml914: MADEIRA_FS_NEGCACHE gates the whole-path negative cache and only
- * that one -- the per-directory case memo and the per-component
- * resolved-name/negative cache are unaffected either way, so with it off
- * this file behaves as the device-proven ml912 build did.  DEFAULT OFF:
- * =1 enables, unset or =0 disables.  [fs-stats] prints which. */
+ * that one -- the per-directory case memo, the per-component resolved-name/
+ * negative cache and the directory-contents cache are unaffected either way.
+ * ml915: DEFAULT ON: =0 disables, unset or =1 enables.  [fs-stats] prints
+ * which. */
 static int ios_np_off_mode = -1;
 
 static int ios_np_disabled(void)
@@ -916,7 +960,7 @@ static int ios_np_disabled(void)
     if (v < 0)
     {
         const char *s = getenv( "MADEIRA_FS_NEGCACHE" );
-        v = (s && s[0] == '1') ? 0 : 1;
+        v = (s && s[0] == '0') ? 1 : 0;
         __atomic_store_n( &ios_np_off_mode, v, __ATOMIC_RELAXED );
     }
     return v;
@@ -983,6 +1027,403 @@ static long long ios_stat_mtime( const struct stat *st )
     v += st->st_mtimespec.tv_nsec;
 #endif
     return v ? v : 1;
+}
+
+/* ---- directory-contents cache -------------------------------------- */
+/*
+ * ml915: the two negative caches above answer "this NAME is not there", one
+ * entry per name.  The q66 device log says that is the wrong shape for what a
+ * 32-bit UE3 title does while it loads a level: ~4800 FAILING opens per 10 s,
+ * 9.9 s of every 10 s spent inside lookup_unix_name, ~2.06 ms per failing
+ * lookup -- and the names are almost all DISTINCT (an engine probing
+ * localised and variant package spellings: <pkg>_INT.upk, <pkg>_LOC_INT.upk,
+ * <pkg>.xxx, one set per language directory).  A per-NAME entry is written
+ * once and never read again, so essentially every probe still paid a full
+ * case-insensitive scan of a directory holding thousands of entries.
+ *
+ * So cache the DIRECTORY, not the name.  The first scan of a directory is
+ * read into an in-memory table -- the exact on-disk spellings plus a hash of
+ * each name's case-folded UTF-16 form -- keyed by the directory's (dev, ino)
+ * and stamped with its nanosecond mtime AND ctime.  After that, ANY name in
+ * that directory, present or absent, is answered by one fstatat of the
+ * directory (to re-validate the stamp) plus a hash probe.  4800 distinct
+ * misses cost 4800 fstatat instead of 4800 getdirentries walks.
+ *
+ * Semantics are upstream's, unchanged:
+ *   - the exact-case fstatat at the top of find_file_in_dir still runs first
+ *     and still wins, so a file whose spelling the caller got right is never
+ *     resolved through here;
+ *   - the table is only consulted where upstream would have scanned, i.e.
+ *     AFTER the is_legal_8dot3_name and get_dir_case_sensitivity gates;
+ *   - a candidate is confirmed with a real wcsnicmp against the stored
+ *     spelling, and the hash is taken over ntdll_towupper() of the same
+ *     UTF-16 form that wcsnicmp folds, so equal-under-wcsnicmp implies equal
+ *     hash: an empty probe really does mean "nothing in this directory
+ *     matches", which is what makes a miss sound;
+ *   - entries are kept in readdir order and the LOWEST-indexed match wins,
+ *     which is the entry upstream's loop would have stopped on, so two files
+ *     differing only in case resolve exactly as they do today;
+ *   - 8.3 short-name lookups bypass the table.  They interleave a second
+ *     match rule (hash_short_file_name) with the first inside one readdir
+ *     pass, and on this platform they are vanishingly rare anyway (no
+ *     VFAT_IOCTL_READDIR_BOTH, so the name must be >= 8 chars with '~' at
+ *     index 4).  Such a lookup still BUILDS the table for everyone else.
+ *
+ * Invalidation is the stamp.  Creating, renaming, linking or unlinking a name
+ * in a directory moves its mtime and its ctime on APFS, so the next probe
+ * sees a different stamp, drops the table and rescans.  The stamp is always
+ * read from the directory fd BEFORE the getdirentries walk, so a change that
+ * lands during the scan can only make the table look stale -- never the other
+ * way round.  That is the same rule ios_pc's negative entries and ios_np
+ * follow (see ios_dir_stamp_ok).  Because a timestamp cannot be relied on to
+ * advance WITHIN one clock tick, the create paths in this process also drop
+ * the table for the directory they wrote into, by path
+ * (ios_dc_invalidate_path from NtCreateFile/NtDeleteFile/rename/link), so a
+ * create-then-open in the same tick can never read a table older than the
+ * create.
+ *
+ * Bounds: at most 64 directories and 4 MB in total; at most 1 MB and 65536
+ * names for a single directory (a bigger one is scanned and simply not
+ * cached).  When a new table does not fit, tables are dropped least-recently-
+ * used first to get under the directory count and largest-first to get under
+ * the byte budget, so one huge directory cannot hold the budget hostage.  A
+ * 3000-entry directory costs ~40 bytes per name, ~120 KB.
+ *
+ * Concurrency: one mutex over the whole table, taken for the probe and for
+ * the install, exactly as ios_pc/ios_np do.  A probe copies the spelling out
+ * under the lock, so no entry can be freed while a caller still points at it;
+ * the scan that builds a table runs entirely outside the lock.
+ *
+ * MADEIRA_FS_DIRCACHE=0 disables it; unset or =1 enables.
+ */
+#define IOS_DC_MAX_DIRS      64
+#define IOS_DC_MAX_BYTES     (4u * 1024 * 1024)
+#define IOS_DC_MAX_DIR_BYTES (1u * 1024 * 1024)
+#define IOS_DC_MAX_NAMES     65536u
+#define IOS_DC_NOIDX         (~0u)
+
+struct ios_dc_stamp
+{
+    dev_t dev;
+    ino_t ino;
+    long long mtime;                           /* ns; 0 = no usable stamp */
+    long long ctime;                           /* ns */
+};
+
+struct ios_dc_ent
+{
+    unsigned int hash;                         /* over ntdll_towupper of the UTF-16 form */
+    unsigned int off;                          /* byte offset into ->names */
+    unsigned int wlen;                         /* what ntdll_umbstowcs returned */
+};
+
+struct ios_dc_dir
+{
+    struct ios_dc_stamp st;                    /* st.mtime == 0 => slot unused */
+    struct ios_dc_ent *ents;                   /* readdir order */
+    unsigned int *slots;                       /* open-addressed ents indices */
+    char *names;                               /* NUL-terminated d_names */
+    char *path;                                /* absolute unix path, or NULL */
+    unsigned int n, nslots, names_len, bytes;
+    unsigned long long lru;
+};
+
+static struct ios_dc_dir ios_dc[IOS_DC_MAX_DIRS];
+static pthread_mutex_t ios_dc_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long long ios_dc_clock;
+static int ios_dc_off_mode = -1;
+
+static int ios_dc_disabled(void)
+{
+    int v = __atomic_load_n( &ios_dc_off_mode, __ATOMIC_RELAXED );
+    if (v < 0)
+    {
+        const char *s = getenv( "MADEIRA_FS_DIRCACHE" );
+        v = (s && s[0] == '0') ? 1 : 0;
+        __atomic_store_n( &ios_dc_off_mode, v, __ATOMIC_RELAXED );
+    }
+    return v;
+}
+
+static void ios_dc_stamp_of( struct ios_dc_stamp *st, const struct stat *s )
+{
+    st->dev = s->st_dev;
+    st->ino = s->st_ino;
+    st->mtime = S_ISDIR( s->st_mode ) ? ios_stat_mtime( s ) : 0;
+    st->ctime = ios_stat_ctime( s );
+}
+
+/* FNV-1a over the case-folded UTF-16 form.  MUST fold with the same function
+ * ntdll_wcsnicmp() does, or a name that compares equal could hash elsewhere
+ * and a miss would be a lie. */
+static unsigned int ios_dc_hash( const WCHAR *w, unsigned int len )
+{
+    unsigned int h = 2166136261u, i;
+
+    for (i = 0; i < len; i++)
+    {
+        h ^= (unsigned int)ntdll_towupper( w[i] );
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* both callers hold ios_dc_lock */
+static void ios_dc_drop( unsigned int i )
+{
+    struct ios_dc_dir *d = &ios_dc[i];
+
+    if (!d->st.mtime) return;
+    ios_dc_bytes -= d->bytes;
+    ios_dc_nents -= d->n;
+    ios_dc_ndirs--;
+    free( d->ents );
+    free( d->slots );
+    free( d->names );
+    free( d->path );
+    memset( d, 0, sizeof(*d) );
+}
+
+/* by_size = 0: least recently used.  by_size = 1: largest. */
+static unsigned int ios_dc_victim( int by_size )
+{
+    unsigned int i, best = IOS_DC_MAX_DIRS;
+
+    for (i = 0; i < IOS_DC_MAX_DIRS; i++)
+    {
+        if (!ios_dc[i].st.mtime) continue;
+        if (best == IOS_DC_MAX_DIRS) best = i;
+        else if (by_size ? (ios_dc[i].bytes > ios_dc[best].bytes)
+                         : (ios_dc[i].lru < ios_dc[best].lru)) best = i;
+    }
+    return best;
+}
+
+/* takes ownership of *nd; frees its buffers if there is no room for it */
+static void ios_dc_install( struct ios_dc_dir *nd )
+{
+    unsigned int i, v, slot = IOS_DC_MAX_DIRS;
+
+    mutex_lock( &ios_dc_lock );
+
+    for (i = 0; i < IOS_DC_MAX_DIRS; i++)               /* replace our own older table */
+        if (ios_dc[i].st.mtime && ios_dc[i].st.dev == nd->st.dev &&
+            ios_dc[i].st.ino == nd->st.ino) { ios_dc_drop( i ); break; }
+
+    while (ios_dc_ndirs >= IOS_DC_MAX_DIRS)
+    {
+        if ((v = ios_dc_victim( 0 )) >= IOS_DC_MAX_DIRS) break;
+        ios_dc_drop( v );
+        IOS_FSA( ios_fs_dc_evict, 1 );
+    }
+    while (ios_dc_bytes + nd->bytes > IOS_DC_MAX_BYTES)
+    {
+        if ((v = ios_dc_victim( 1 )) >= IOS_DC_MAX_DIRS) break;
+        ios_dc_drop( v );
+        IOS_FSA( ios_fs_dc_evict, 1 );
+    }
+    if (ios_dc_ndirs < IOS_DC_MAX_DIRS && ios_dc_bytes + nd->bytes <= IOS_DC_MAX_BYTES)
+        for (i = 0; i < IOS_DC_MAX_DIRS; i++) if (!ios_dc[i].st.mtime) { slot = i; break; }
+
+    if (slot < IOS_DC_MAX_DIRS)
+    {
+        ios_dc[slot] = *nd;
+        ios_dc[slot].lru = ++ios_dc_clock;
+        ios_dc_bytes += nd->bytes;
+        ios_dc_nents += nd->n;
+        ios_dc_ndirs++;
+        memset( nd, 0, sizeof(*nd) );
+    }
+    mutex_unlock( &ios_dc_lock );
+
+    free( nd->ents );
+    free( nd->slots );
+    free( nd->names );
+    free( nd->path );
+    memset( nd, 0, sizeof(*nd) );
+}
+
+/*  2 = a match whose BYTES are exactly `exact` (only asked for when non-NULL)
+ *  1 = the directory is cached and holds a match (spelling copied to `out`)
+ *  0 = the directory is cached and holds NO match: the name is absent
+ * -1 = nothing usable is cached: the caller must scan
+ *
+ * `exact` exists because this resolver prefers the caller's own spelling over
+ * readdir order at every component: a caller that needs to act on a match
+ * rather than merely rule one out has to know which of the two it got. */
+static int ios_dc_lookup( const struct ios_dc_stamp *st, const WCHAR *name, unsigned int length,
+                          const char *exact, char *out, size_t outsize )
+{
+    WCHAR wbuf[MAX_DIR_ENTRY_LEN];
+    struct ios_dc_dir *d = NULL;
+    unsigned int i, h, slot, idx, best = IOS_DC_NOIDX;
+    int ret = -1, found_exact = 0;
+
+    if (!st->mtime) return -1;
+    h = ios_dc_hash( name, length );
+
+    mutex_lock( &ios_dc_lock );
+    for (i = 0; i < IOS_DC_MAX_DIRS; i++)
+        if (ios_dc[i].st.mtime && ios_dc[i].st.dev == st->dev && ios_dc[i].st.ino == st->ino)
+        { d = &ios_dc[i]; break; }
+
+    if (!d)
+    {
+        mutex_unlock( &ios_dc_lock );
+        IOS_FSA( ios_fs_dc_miss, 1 );
+        return -1;
+    }
+    if (d->st.mtime != st->mtime || d->st.ctime != st->ctime)
+    {
+        /* something was created, renamed or removed in there: the whole table
+         * is worthless, and keeping it would only delay the rescan. */
+        ios_dc_drop( i );
+        mutex_unlock( &ios_dc_lock );
+        IOS_FSA( ios_fs_dc_stale, 1 );
+        IOS_FSA( ios_fs_dc_miss, 1 );
+        return -1;
+    }
+
+    d->lru = ++ios_dc_clock;
+    for (slot = h & (d->nslots - 1); (idx = d->slots[slot]) != IOS_DC_NOIDX;
+         slot = (slot + 1) & (d->nslots - 1))
+    {
+        const struct ios_dc_ent *e = &d->ents[idx];
+        const char *nm;
+
+        if (e->hash != h || e->wlen != length) continue;
+        nm = d->names + e->off;
+        if ((unsigned int)ntdll_umbstowcs( nm, strlen(nm), wbuf, MAX_DIR_ENTRY_LEN ) != length) continue;
+        if (wcsnicmp( wbuf, name, length )) continue;
+        if (exact && !strcmp( nm, exact )) found_exact = 1;
+        if (idx < best) best = idx;             /* readdir order: lowest wins */
+    }
+
+    if (best == IOS_DC_NOIDX) ret = 0;
+    else
+    {
+        const char *s = d->names + d->ents[best].off;
+        size_t len = strlen( s );
+        if (len < outsize) { memcpy( out, s, len + 1 ); ret = found_exact ? 2 : 1; }
+    }
+    mutex_unlock( &ios_dc_lock );
+    IOS_FSA( ios_fs_dc_hit, 1 );
+    return ret;
+}
+
+/* ---- building one, from the scan find_file_in_dir was going to do anyway -- */
+
+struct ios_dc_build
+{
+    struct ios_dc_ent *ents;
+    char *names;
+    unsigned int n, cap, names_len, names_cap;
+    int failed;
+};
+
+/* `w`/`wlen` are exactly what the caller's own ntdll_umbstowcs() produced for
+ * this entry, so the table can never disagree with the live scan. */
+static void ios_dc_build_add( struct ios_dc_build *b, const char *name, const WCHAR *w, unsigned int wlen )
+{
+    size_t nlen = strlen( name );
+
+    if (b->failed) return;
+    if (b->n >= IOS_DC_MAX_NAMES) { b->failed = 1; IOS_FSA( ios_fs_dc_big, 1 ); return; }
+    if (b->n == b->cap)
+    {
+        unsigned int cap = b->cap ? b->cap * 2 : 256;
+        struct ios_dc_ent *p = realloc( b->ents, cap * sizeof(*p) );
+        if (!p) { b->failed = 1; return; }
+        b->ents = p;
+        b->cap = cap;
+    }
+    if (b->names_len + nlen + 1 > b->names_cap)
+    {
+        unsigned int cap = b->names_cap ? b->names_cap : 4096;
+        char *p;
+        while (cap < b->names_len + nlen + 1) cap *= 2;
+        if (!(p = realloc( b->names, cap ))) { b->failed = 1; return; }
+        b->names = p;
+        b->names_cap = cap;
+    }
+    b->ents[b->n].hash = ios_dc_hash( w, wlen );
+    b->ents[b->n].off  = b->names_len;
+    b->ents[b->n].wlen = wlen;
+    b->n++;
+    memcpy( b->names + b->names_len, name, nlen + 1 );
+    b->names_len += (unsigned int)(nlen + 1);
+    if (b->names_len + b->n * (unsigned int)sizeof(struct ios_dc_ent) > IOS_DC_MAX_DIR_BYTES)
+    {
+        b->failed = 1;                          /* too big to be worth 1/4 of the budget */
+        IOS_FSA( ios_fs_dc_big, 1 );
+    }
+}
+
+static void ios_dc_build_abort( struct ios_dc_build *b )
+{
+    free( b->ents );
+    free( b->names );
+    memset( b, 0, sizeof(*b) );
+}
+
+static void ios_dc_build_finish( struct ios_dc_build *b, const struct ios_dc_stamp *st, const char *path )
+{
+    struct ios_dc_dir nd;
+    unsigned int nslots = 8, i;
+
+    if (b->failed || !st->mtime) { ios_dc_build_abort( b ); return; }
+
+    while (nslots < b->n * 2) nslots *= 2;      /* load factor <= 1/2 => a probe always terminates */
+    memset( &nd, 0, sizeof(nd) );
+    if (!(nd.slots = malloc( nslots * sizeof(unsigned int) ))) { ios_dc_build_abort( b ); return; }
+    memset( nd.slots, 0xff, nslots * sizeof(unsigned int) );
+    for (i = 0; i < b->n; i++)
+    {
+        unsigned int s = b->ents[i].hash & (nslots - 1);
+        while (nd.slots[s] != IOS_DC_NOIDX) s = (s + 1) & (nslots - 1);
+        nd.slots[s] = i;
+    }
+    nd.st = *st;
+    nd.ents = b->ents;
+    nd.names = b->names;
+    nd.n = b->n;
+    nd.nslots = nslots;
+    nd.names_len = b->names_len;
+    if (path && (nd.path = malloc( strlen( path ) + 1 ))) strcpy( nd.path, path );
+    nd.bytes = (unsigned int)(b->n * sizeof(struct ios_dc_ent) + nslots * sizeof(unsigned int) +
+                              b->names_len + (nd.path ? strlen( nd.path ) + 1 : 0) + sizeof(nd));
+    memset( b, 0, sizeof(*b) );
+    ios_dc_install( &nd );
+}
+
+/* ml915: belt for the brace the stamp already is.  A create that lands inside
+ * the same timestamp tick as the stamp we hold would be invisible to it, so
+ * every path in THIS process that adds or removes a name drops the table for
+ * the directory it wrote into.  Matching is on the resolved unix path, which
+ * is the same spelling find_file_in_dir cached the table under; a directory
+ * reached through a relative root_fd has no stored path and relies on the
+ * stamp alone. */
+static void ios_dc_invalidate_path( const char *unix_file )
+{
+    const char *slash;
+    size_t dlen;
+    unsigned int i;
+
+    if (!unix_file || ios_dc_disabled()) return;
+    if (!(slash = strrchr( unix_file, '/' ))) return;
+    dlen = (size_t)(slash - unix_file);
+    if (!dlen) dlen = 1;                        /* "/name" -> "/" */
+
+    mutex_lock( &ios_dc_lock );
+    for (i = 0; i < IOS_DC_MAX_DIRS; i++)
+        if (ios_dc[i].st.mtime && ios_dc[i].path && !ios_dc[i].path[dlen] &&
+            !strncmp( ios_dc[i].path, unix_file, dlen ))
+        {
+            ios_dc_drop( i );
+            IOS_FSA( ios_fs_dc_inval, 1 );
+            break;
+        }
+    mutex_unlock( &ios_dc_lock );
 }
 #endif  /* WINE_IOS */
 
@@ -3952,6 +4393,13 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     struct ios_pc_neg ios_stamp = { 0 };        /* stamp taken before our own scan */
     int ios_have_neg = 0, ios_have_stamp = 0, ios_scan_errno = 0;
     unsigned long long ios_ph0 = 0, ios_sc0 = 0;
+    /* ml915: the directory-contents cache.  ios_pst is the parent's stat,
+     * shared by the per-component negative check and the dircache probe so
+     * the two never stat the same directory twice. */
+    struct stat ios_pst;
+    struct ios_dc_stamp ios_dcst = { 0 };
+    struct ios_dc_build ios_dcb = { 0 };
+    int ios_pst_ok = 0, ios_dcb_on = 0, ios_matched = 0;
 
     ios_dir_stamp.mtime = 0;
     ios_dir_stamp_ok = 0;
@@ -4036,6 +4484,8 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
         ok = !fstatat( root_fd, unix_name, &dst, 0 );
         if (ok)
         {
+            ios_pst = dst;                      /* ml915: the dircache probe reuses this */
+            ios_pst_ok = 1;
             /* ml913: whatever the answer, we now know this directory's
              * identity — hand it to lookup_unix_name for the whole-path
              * negative entry rather than making it stat the same path again. */
@@ -4071,6 +4521,52 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
 #endif
 
     if (!is_name_8_dot_3 && !get_dir_case_sensitivity( root_fd, unix_name )) goto not_found;
+
+#ifdef WINE_IOS
+    /* ml915: upstream is about to read this whole directory to answer one
+     * name.  If we have already read it and its (dev, ino, mtime, ctime) has
+     * not moved, one fstatat plus a hash probe answers instead -- for a name
+     * that is there AND for one that is not, which is the case that dominates
+     * a level load.  Deliberately after both gates above, so what is answered
+     * from the table is exactly what the scan below would have answered.
+     * 8.3 lookups are not: they run a second match rule interleaved with this
+     * one inside the same readdir pass (see the header note).  They still
+     * BUILD the table. */
+    if (!ios_dc_disabled())
+    {
+        if (!ios_pst_ok && !fstatat( root_fd, unix_name, &ios_pst, 0 )) ios_pst_ok = 1;
+        if (ios_pst_ok && S_ISDIR( ios_pst.st_mode ))
+        {
+            int ios_r = -1;
+
+            ios_dc_stamp_of( &ios_dcst, &ios_pst );
+            if (!is_name_8_dot_3)
+                ios_r = ios_dc_lookup( &ios_dcst, name, length, NULL,
+                                       unix_name + pos, MAX_DIR_ENTRY_LEN + 1 );
+            if (ios_r >= 0)
+            {
+                /* ml914's rule: the stamp was read BEFORE the work that
+                 * proved the answer, and it still matches the one the table
+                 * was built under -- proof and stamp are effectively this one
+                 * syscall, so lookup_unix_name may record a whole-path
+                 * negative entry against it. */
+                ios_dir_stamp.dev = ios_dcst.dev;
+                ios_dir_stamp.ino = ios_dcst.ino;
+                ios_dir_stamp.mtime = ios_dcst.mtime;
+                ios_dir_stamp_ok = 1;
+                if (ios_r >= 1)
+                {
+                    unix_name[pos - 1] = '/';
+                    if (ios_cacheable) ios_pc_put( ios_key, unix_name + pos );
+                    ios_ph_add( IOS_PH_SCAN, ios_sc0 );
+                    return STATUS_SUCCESS;
+                }
+                goto not_found;                 /* charges IOS_PH_SCAN itself */
+            }
+            ios_dcb_on = 1;                     /* build the table from the scan below */
+        }
+    }
+#endif
 
     /* now look for it through the directory */
 
@@ -4143,7 +4639,7 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
      * entry created during the scan could be stamped as "definitely absent";
      * taken before, such a change only makes the stamp look stale and the
      * next lookup rescans. */
-    if (ios_cacheable)
+    if (ios_cacheable || ios_dcb_on)
     {
         struct stat dst;
         if (!fstat( fd, &dst ))
@@ -4154,9 +4650,18 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
             ios_have_stamp = 1;
             ios_dir_stamp = ios_stamp;          /* ml913: free stamp for a whole-path entry */
             ios_dir_stamp_ok = 1;               /* ml914: read before the scan */
+            /* ml915: and the same read, on the fd we are about to walk, is
+             * the stamp the directory table is built under. */
+            ios_dc_stamp_of( &ios_dcst, &dst );
+            if (!ios_dcst.mtime) ios_dcb_on = 0;
         }
-        else IOS_FSA( ios_fs_pc_m_nostamp, 1 );
+        else
+        {
+            if (ios_cacheable) IOS_FSA( ios_fs_pc_m_nostamp, 1 );
+            ios_dcb_on = 0;                     /* no stamp, no table */
+        }
     }
+    if (ios_dcb_on) IOS_FSA( ios_fs_dc_scan, 1 );
     /* ml914: readdir() returns NULL both at end-of-directory and on error,
      * and an error means the scan is TRUNCATED, not that the name is absent.
      * Upstream pays for that once; a cached negative would pay forever. */
@@ -4167,9 +4672,21 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
     while ((de = readdir( dir )))
     {
         ret = ntdll_umbstowcs( de->d_name, strlen(de->d_name), buffer, MAX_DIR_ENTRY_LEN );
+#ifdef WINE_IOS
+        /* ml915: record the entry with the very conversion the match below
+         * uses, then -- once the answer is known -- keep reading, because a
+         * table that stops at the match is no use to the next name.  That
+         * costs the rest of one walk, once per directory, and removes every
+         * later walk of it. */
+        if (ios_dcb_on) ios_dc_build_add( &ios_dcb, de->d_name, buffer, ret );
+        if (ios_matched) continue;
+#endif
         if (ret == length && !wcsnicmp( buffer, name, ret ))
         {
             strcpy( unix_name + pos, de->d_name );
+#ifdef WINE_IOS
+            if (ios_dcb_on) { ios_matched = 1; continue; }
+#endif
             closedir( dir );
 #ifdef WINE_IOS
             if (ios_cacheable) ios_pc_put( ios_key, unix_name + pos );
@@ -4187,6 +4704,9 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
             if (ret == length && !wcsnicmp( short_nameW, name, length ))
             {
                 strcpy( unix_name + pos, de->d_name );
+#ifdef WINE_IOS
+                if (ios_dcb_on) { ios_matched = 1; continue; }
+#endif
                 closedir( dir );
 #ifdef WINE_IOS
                 if (ios_cacheable) ios_pc_put( ios_key, unix_name + pos );
@@ -4201,6 +4721,26 @@ static NTSTATUS find_file_in_dir( int root_fd, char *unix_name, int pos, const W
 #endif
     closedir( dir );
 #ifdef WINE_IOS
+    /* ml915: hand the completed table over.  unix_name currently reads
+     * "<parent>/<found name>", so the parent is restored for the moment it
+     * takes to record the path the table is keyed on.  A truncated scan
+     * (readdir error) cannot be cached in either direction. */
+    if (ios_dcb_on)
+    {
+        unsigned int ios_cut = pos > 1 ? (unsigned int)pos - 1 : 1;
+        char ios_save = unix_name[ios_cut];
+
+        unix_name[ios_cut] = 0;
+        if (ios_scan_errno) ios_dc_build_abort( &ios_dcb );
+        else ios_dc_build_finish( &ios_dcb, &ios_dcst, root_fd == AT_FDCWD ? unix_name : NULL );
+        unix_name[ios_cut] = ios_save;
+    }
+    if (ios_matched)                            /* the scan DID match; it just kept reading */
+    {
+        if (ios_cacheable) ios_pc_put( ios_key, unix_name + pos );
+        ios_ph_add( IOS_PH_SCAN, ios_sc0 );
+        return STATUS_SUCCESS;
+    }
     /* ml912: the scan read the whole directory and found nothing.  Remember
      * that, stamped with what the directory looked like when we started, so
      * the next lookup of this name costs one fstatat instead of another
@@ -4691,7 +5231,11 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
      * note at the key construction below. */
     char ios_kbuf[IOS_PC_KEYMAX];       /* '\1' + case-folded path -> ios_pc */
     char ios_nbuf[IOS_PC_KEYMAX];       /* exact-case path         -> ios_np */
-    int ios_have_key = 0;
+    /* ml915: '\2' + the exact-case path of this path's PARENT -> ios_pc, whose
+     * value is the resolved on-disk directory.  See the probe below. */
+    char ios_pdbuf[IOS_PC_KEYMAX];
+    unsigned int ios_pdlen = 0;         /* bytes of the parent, inside unix_name */
+    int ios_have_key = 0, ios_have_pd = 0;
     struct ios_pc_neg ios_cstamp = { 0 };   /* deepest-existing-dir stamp */
     int ios_cstamp_ok = 0;
     unsigned long long ios_ph0 = 0;
@@ -4770,9 +5314,31 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
         if (root_fd == AT_FDCWD && !is_unix &&
             ios_pc_key( ios_kbuf + 1, sizeof(ios_kbuf) - 1, unix_name, pos + 1 + ret, pos + 1 ))
         {
+            const char *ios_ls;
+
             ios_kbuf[0] = '\1';
             memcpy( ios_nbuf, unix_name, pos + 1 + ret + 1 );
             ios_have_key = 1;
+
+            /* ml915: and the key for this path's PARENT.  Exact spelling, for
+             * the same reason ios_np's key is exact: a folded key would hand
+             * one directory's resolution to a case sibling.  '\2' keeps it out
+             * of the '\1' whole-path and the unprefixed per-component key
+             * spaces in the same table. */
+            /* ios_ls[1] rejects a trailing separator: there is then no leaf,
+             * `pos` below stops at the GRANDparent, and the entry would map a
+             * directory that does not exist onto one that does. */
+            if ((ios_ls = strrchr( unix_name + pos + 1, '/' )) && ios_ls[1])
+            {
+                ios_pdlen = (unsigned int)(ios_ls - unix_name);
+                if (ios_pdlen + 2 < sizeof(ios_pdbuf))
+                {
+                    ios_pdbuf[0] = '\2';
+                    memcpy( ios_pdbuf + 1, unix_name, ios_pdlen );
+                    ios_pdbuf[1 + ios_pdlen] = 0;
+                    ios_have_pd = 1;
+                }
+            }
         }
 
         if (ios_have_key && !open_reparse && !ios_np_disabled())
@@ -4800,6 +5366,102 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
                 IOS_FSA( ios_fs_np_stale, 1 );
             }
             ios_ph_add( IOS_PH_WNEG, ios_ph0 );
+        }
+
+        /* ml915: the case the whole-path negative cache above cannot serve --
+         * a leaf this process has NEVER asked for before.  That is what the
+         * q66 log is made of: ~4800 failing opens per 10 s of mostly DISTINCT
+         * names (localised and variant package spellings), so a per-path entry
+         * is written once and read never, and each miss walked the path
+         * component by component and then scanned a directory of thousands.
+         *
+         * Split the question in two and cache each half where it repeats:
+         *   - the PARENT resolution, keyed on the exact requested spelling of
+         *     everything up to the last separator (one entry per directory,
+         *     hit by every name in it);
+         *   - the leaf, answered by that directory's contents table.
+         * One fstatat of the resolved parent validates BOTH: it proves the
+         * directory is still there and it is the stamp the table is checked
+         * against.  A failing open is then one syscall and two hash probes,
+         * instead of ~11 fstatat plus two getdirentries walks.
+         *
+         * What is returned here is exactly what the code below would return:
+         *   absent -- the walk would resolve every component but the last
+         *     (the parent exists: we just stat'd it), find_file_in_dir would
+         *     fail the exact-case stat and then the case-insensitive scan,
+         *     upstream's `<leaf>?` reparse probe would fail the same way, and
+         *     with FILE_OPEN/FILE_OVERWRITE the leaf miss stays
+         *     STATUS_OBJECT_NAME_NOT_FOUND.  Both probes must say absent.
+         *   present in the caller's own spelling, in a directory whose
+         *     resolved spelling IS the requested one -- then the path in the
+         *     buffer is already the resolved path and the shortcut stat below
+         *     would have returned STATUS_SUCCESS with it unchanged.  Any other
+         *     kind of match falls through and is resolved the long way, so the
+         *     "exact case wins over readdir order" rule is untouched.
+         *
+         * Guards, all of them the ones ios_np already carries: never for
+         * open_reparse (it changes what a `<leaf>?` match means), never for a
+         * create disposition (those want the constructed name back with
+         * STATUS_NO_SUCH_FILE), never for a leaf that is a legal 8.3 name (a
+         * scan matches those a second way, by short-name hash, which the table
+         * does not model), and never with a relative root_fd. */
+        if (ios_have_pd && !open_reparse && !ios_dc_disabled() &&
+            (disposition == FILE_OPEN || disposition == FILE_OVERWRITE))
+        {
+            const WCHAR *ios_leaf = name + name_len;
+            unsigned int ios_leaflen;
+            BOOLEAN ios_l83;
+
+            while (ios_leaf > name && ios_leaf[-1] != '\\') ios_leaf--;
+            ios_leaflen = (unsigned int)(name + name_len - ios_leaf);
+            ios_l83 = ios_leaflen ? is_legal_8dot3_name( ios_leaf, ios_leaflen ) : TRUE;
+#ifndef VFAT_IOCTL_READDIR_BOTH
+            ios_l83 = ios_l83 && ios_leaflen >= 8 && ios_leaf[4] == '~';
+#endif
+            if (ios_leaflen && ios_leaflen <= MAX_DIR_ENTRY_LEN && !ios_l83)
+            {
+                char ios_dbuf[IOS_PC_KEYMAX];
+
+                ios_ph0 = ios_fs_now_us();
+                if (ios_pc_get( ios_pdbuf, ios_dbuf, sizeof(ios_dbuf) ))
+                {
+                    struct stat ios_dst;
+
+                    if (!fstatat( root_fd, ios_dbuf, &ios_dst, 0 ) && S_ISDIR( ios_dst.st_mode ))
+                    {
+                        struct ios_dc_stamp ios_ds;
+                        WCHAR ios_lw[MAX_DIR_ENTRY_LEN + 1];
+                        char ios_tmp[MAX_DIR_ENTRY_LEN + 2];
+                        size_t ios_dl = strlen( ios_dbuf );
+                        int ios_fr;
+
+                        ios_dc_stamp_of( &ios_ds, &ios_dst );
+                        memcpy( ios_lw, ios_leaf, ios_leaflen * sizeof(WCHAR) );
+                        ios_fr = ios_dc_lookup( &ios_ds, ios_lw, ios_leaflen,
+                                                unix_name + ios_pdlen + 1, ios_tmp, sizeof(ios_tmp) );
+                        if (!ios_fr)
+                        {
+                            ios_lw[ios_leaflen] = '?';
+                            if (!ios_dc_lookup( &ios_ds, ios_lw, ios_leaflen + 1, NULL,
+                                                ios_tmp, sizeof(ios_tmp) ))
+                            {
+                                IOS_FSA( ios_fs_dc_fast, 1 );
+                                ios_ph_add( IOS_PH_WDIR, ios_ph0 );
+                                return STATUS_OBJECT_NAME_NOT_FOUND;
+                            }
+                        }
+                        else if (ios_fr == 2 && ios_dl == ios_pdlen &&
+                                 !memcmp( ios_dbuf, unix_name, ios_pdlen ))
+                        {
+                            IOS_FSA( ios_fs_dc_fexact, 1 );
+                            ios_ph_add( IOS_PH_WDIR, ios_ph0 );
+                            return STATUS_SUCCESS;
+                        }
+                    }
+                }
+                else IOS_FSA( ios_fs_dc_fmiss, 1 );
+                ios_ph_add( IOS_PH_WDIR, ios_ph0 );
+            }
         }
         ios_ph0 = ios_fs_now_us();
 #endif
@@ -5020,6 +5682,22 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             ios_np_put( ios_nbuf, nb, &ios_cstamp, status );
             nb[pos] = save;
         }
+    }
+    /* ml915: and the half of that answer the NEXT name in this directory can
+     * reuse.  STATUS_OBJECT_NAME_NOT_FOUND is precisely "every component but
+     * the last resolved", and every path through this function leaves `pos` at
+     * the end of the last component that exists -- so (*buffer)[0..pos) is the
+     * requested parent's resolved on-disk spelling.  PATH_NOT_FOUND stops
+     * higher up and NO_SUCH_FILE has already moved `pos` past a constructed
+     * leaf, so neither is recorded. */
+    if (ios_have_pd && status == STATUS_OBJECT_NAME_NOT_FOUND)
+    {
+        char *nb = *buffer;
+        char save = nb[pos];
+
+        nb[pos] = 0;
+        ios_pc_put( ios_pdbuf, nb );
+        nb[pos] = save;
     }
 #endif
     return status;
@@ -6048,7 +6726,13 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
         ios_lk1 = ios_fs_now_us();
         IOS_FSA( ios_fs_open_lk_us, ios_lk1 > ios_lk0 ? ios_lk1 - ios_lk0 : 0 );
         IOS_FSA( ios_fs_open_lk_n, 1 );
-        if (status && status != STATUS_NO_SUCH_FILE) IOS_FSA( ios_fs_open_lk_fail, 1 );
+        if (status && status != STATUS_NO_SUCH_FILE)
+        {
+            IOS_FSA( ios_fs_open_lk_fail, 1 );
+            /* ml915: and how long that failure took, so [fs-stats] can print
+             * fail_avg_us -- the one number the dircache has to move. */
+            IOS_FSA( ios_fs_open_lk_fail_us, ios_lk1 > ios_lk0 ? ios_lk1 - ios_lk0 : 0 );
+        }
 #endif
     }
 
@@ -6079,6 +6763,13 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
             ios_sv1 = ios_fs_now_us();
             IOS_FSA( ios_fs_open_srv_us, ios_sv1 > ios_sv0 ? ios_sv1 - ios_sv0 : 0 );
             IOS_FSA( ios_fs_open_srv_n, 1 );
+            /* ml915: `created` means the walk proved the leaf absent and the
+             * server has now made it exist, so the parent directory just
+             * gained a name.  Its mtime moved too, but a mtime cannot be
+             * relied on to advance within one clock tick and a create
+             * followed immediately by an open of the same name is a normal
+             * thing for an installer or a save system to do. */
+            if (!status && created) ios_dc_invalidate_path( unix_name );
         }
 #else
         status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
@@ -6337,7 +7028,12 @@ NTSTATUS WINAPI NtDeleteFile( OBJECT_ATTRIBUTES *attr )
         if (!(status = open_unix_file( &handle, unix_name, GENERIC_READ | GENERIC_WRITE | DELETE, &new_attr,
                                        0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
                                        FILE_DELETE_ON_CLOSE, NULL, 0 )))
+        {
             NtClose( handle );
+#ifdef WINE_IOS
+            ios_dc_invalidate_path( unix_name );   /* ml915: a name left that directory */
+#endif
+        }
     }
     free( unix_name );
     free( nt_name.Buffer );
@@ -6956,6 +7652,12 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 }
                 SERVER_END_REQ;
 
+#ifdef WINE_IOS
+                /* ml915: the destination directory gained a name.  The source
+                 * one lost one, but only the server knows which path that
+                 * was; its mtime covers it. */
+                if (!status) ios_dc_invalidate_path( unix_name );
+#endif
             }
             free( unix_name );
             free( nt_name.Buffer );
@@ -7001,6 +7703,9 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 }
                 SERVER_END_REQ;
 
+#ifdef WINE_IOS
+                if (!status) ios_dc_invalidate_path( unix_name );   /* ml915 */
+#endif
             }
             free( unix_name );
             free( nt_name.Buffer );
