@@ -122,12 +122,50 @@ DEFINE_GUID( ios_joystick_guid, 0x9e573edc, 0x7734, 0x11d2, 0x8d, 0x4a, 0x23, 0x
 
 /* A marker with the axis contract in it, so a built dinput.dll can be checked
  * for THIS revision rather than for "a dinput.dll that has joystick_ios in it
- * at all". `llvm-objdump -s -j .rdata dinput.dll | grep ml761-combined-z`, or
- * plain `strings`. The first round of this file shipped and then had to be
+ * at all". `llvm-objdump -s -j .rdata dinput.dll | grep ml762-trace-killswitch`,
+ * or plain `strings`. The first round of this file shipped and then had to be
  * corrected; the difference between the two is invisible in the export table
- * and visible here. */
+ * and visible here.
+ *
+ * ml762: the axis contract itself is unchanged from ml761 (audited against
+ * Windows' XUSB DirectInput mapping and found compliant — see the comments on
+ * ios_logical_stick_inverted and ios_logical_triggers below). What ml762 adds
+ * is a MADEIRA_DINPUT_PAD=0 kill switch (ios_dinput_pad_disabled) and a
+ * once-a-second diagnostic trace (ios_joystick_trace) of the scaled state, the
+ * raw XInput sample it came from, the app's DIPROP_RANGE/DEADZONE/SATURATION
+ * per object and the app's SetDataFormat offsets, so the next device report
+ * can name the object rather than guess at it. */
 static const char ios_joystick_build_tag[] =
-    "MADEIRA-DINPUT-IOS ml761-combined-z axes=X,Y,Rx,Ry,Z(LT-RT) logical=-32768..32767 pov=0..7/idle8";
+    "MADEIRA-DINPUT-IOS ml762-trace-killswitch axes=X,Y,Rx,Ry,Z(LT-RT) logical=-32768..32767 "
+    "pov=0..7/idle8 pad-env=MADEIRA_DINPUT_PAD trace=state+raw+range+format@1Hz";
+
+/* MADEIRA_DINPUT_PAD=0 turns this whole device off: ios_joystick_enum_device
+ * enumerates nothing, so EnumDevices and CreateDevice(ios_joystick_guid) (which
+ * goes through enum_device too, see ios_joystick_create_device) both fail the
+ * same way they would on a stock Wine with no winebus.sys device. Default ON:
+ * unset, empty, or anything not starting with '0' leaves the device enabled.
+ * Same getenv-once-into-a-cached-atomic-int shape as file.c's ios_dc_disabled
+ * and sync.c's madeira_fastsync_enabled, so it costs nothing on the hot path
+ * after the first call; the ERR() is guarded by the compare-exchange so only
+ * the thread that actually flips the cache logs it, which is what makes "log
+ * once" true under concurrent enumeration. ERR rather than TRACE because
+ * "why is my controller gone" should not require WINEDEBUG=+dinput to see. */
+static int ios_dinput_pad_off = -1;
+
+static BOOL ios_dinput_pad_disabled( void )
+{
+    int off = __atomic_load_n( &ios_dinput_pad_off, __ATOMIC_RELAXED ), expect = -1;
+    const char *e;
+
+    if (off >= 0) return off;
+
+    e = getenv( "MADEIRA_DINPUT_PAD" );
+    off = (e && e[0] == '0') ? 1 : 0;
+    if (__atomic_compare_exchange_n( &ios_dinput_pad_off, &expect, off, 0,
+                                     __ATOMIC_RELAXED, __ATOMIC_RELAXED ) && off)
+        ERR( "[dinput] iOS joystick disabled by MADEIRA_DINPUT_PAD=0\n" );
+    return off;
+}
 
 /* The four XInput user slots, as in XUSER_MAX_COUNT. Only slot 0 is exposed:
  * see ios_joystick_enum_device. */
@@ -158,6 +196,7 @@ struct ios_joystick
 {
     struct dinput_device base;
     DWORD user_index;
+    DWORD last_trace_ms;   /* GetCurrentTime() at the last ios_joystick_trace, 0 = never */
 };
 
 static inline struct ios_joystick *impl_from_IDirectInputDevice8W( IDirectInputDevice8W *iface )
@@ -413,6 +452,12 @@ HRESULT ios_joystick_enum_device( DWORD type, DWORD flags, DIDEVICEINSTANCEW *in
      * is there to choose. */
     if (index != 0) return DIERR_DEVICENOTREG;
 
+    /* MADEIRA_DINPUT_PAD=0: see ios_dinput_pad_disabled. Checked before the
+     * pad-connected probe below so the kill switch works even with no
+     * controller paired (a game that only checks "did EnumDevices find
+     * anything" should see the same nothing either way). */
+    if (ios_dinput_pad_disabled()) return DIERR_DEVICENOTREG;
+
     /* CONNECTED ONLY, RE-CHECKED EVERY TIME. host_pad_state is TRUE only when
      * the host slot reports a pad, so a session with no controller enumerates
      * no joystick at all and a game sees what it would see on a PC with
@@ -546,6 +591,88 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
     return DIENUM_CONTINUE;
 }
 
+/* Object names for the trace below, index-aligned with enum ios_object_index
+ * (buttons are excluded here: they get one combined bitmask, not one line each). */
+static const char *const ios_trace_axis_name[IOS_VALUE_COUNT] = { "X", "Y", "Z", "RX", "RY", "POV" };
+
+/* Everything a device report about "which object is the game reading for its
+ * camera, and what does it read at rest" needs, in one place, at most once a
+ * second. Called only from ios_joystick_sample, which is called only from
+ * ios_joystick_poll (device.c's dinput_device_Poll refuses to call vtbl->poll
+ * unless status == STATUS_ACQUIRED) and from ios_joystick_acquire itself
+ * (device.c latches status to STATUS_ACQUIRED before calling vtbl->acquire) —
+ * so "while a device is acquired" is automatic, not something this function
+ * has to check on its own.
+ *
+ * Four kinds of line, each a stable grep target:
+ *
+ *   [dinput] state      the value GetDeviceState/GetDeviceData hand the app:
+ *                        exactly what ios_joystick_sample just wrote into
+ *                        device_state, i.e. AFTER DIPROP_RANGE/DEADZONE/
+ *                        SATURATION scaling (ios_scale_axis_value/ios_scale_value).
+ *   [dinput] raw         the XINPUT_GAMEPAD fields that produced it, so a
+ *                        wrong-object bug can be told apart from a wrong-sign
+ *                        or wrong-scaling one.
+ *   [dinput] app set     the app's current range/deadzone/saturation for each
+ *                        axis/POV object, one line per object. SetProperty
+ *                        itself is handled entirely by device.c's generic
+ *                        code with no per-device vtbl hook to log from (see
+ *                        the header comment on get_property in the vtbl
+ *                        below), so this reads the effective values back out
+ *                        of object_properties instead of intercepting the
+ *                        call — same information, one second staler at most.
+ *   [dinput] app format   the app's DIDATAFORMAT. dinput_device_init_user_format
+ *                        (device.c) matches device_format[i] into
+ *                        user_format[i] at the SAME index i, and device_format
+ *                        was built from ios_objects in ios_object_index order,
+ *                        so user_format.rgodf[IOS_OBJ_X] etc. is exactly the
+ *                        offset the app's SetDataFormat put that object at —
+ *                        DIDFT_OPTIONAL still set means the app's format never
+ *                        matched it at all. */
+static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD *pad,
+                                const LONG scaled[IOS_VALUE_COUNT], const BYTE buttons[10] )
+{
+    const DIDATAFORMAT *user_format = &impl->base.user_format;
+    DWORD now = GetCurrentTime();
+    DWORD btn = 0;
+    UINT i;
+
+    if (impl->last_trace_ms && (DWORD)(now - impl->last_trace_ms) < 1000) return;
+    impl->last_trace_ms = now;
+
+    for (i = 0; i < ARRAY_SIZE(ios_button_mask); ++i) if (buttons[i]) btn |= 1u << i;
+
+    ERR( "[dinput] state x=%ld y=%ld z=%ld rx=%ld ry=%ld pov=%ld btn=0x%03lx\n",
+           scaled[IOS_OBJ_X], scaled[IOS_OBJ_Y], scaled[IOS_OBJ_Z],
+           scaled[IOS_OBJ_RX], scaled[IOS_OBJ_RY], scaled[IOS_OBJ_POV], btn );
+    ERR( "[dinput] raw lx=%d ly=%d rx=%d ry=%d lt=%u rt=%u buttons=0x%04x\n",
+           pad->sThumbLX, pad->sThumbLY, pad->sThumbRX, pad->sThumbRY,
+           pad->bLeftTrigger, pad->bRightTrigger, pad->wButtons );
+
+    for (i = 0; i < IOS_VALUE_COUNT; ++i)
+    {
+        const struct object_properties *p = impl->base.object_properties + i;
+        ERR( "[dinput] app set range obj=%s min=%ld max=%ld deadzone=%lu saturation=%lu\n",
+               ios_trace_axis_name[i], p->range_min, p->range_max, p->deadzone, p->saturation );
+    }
+
+    if (!user_format->rgodf)
+        ERR( "[dinput] app format: SetDataFormat not called yet\n" );
+    else
+    {
+        ERR( "[dinput] app format dwDataSize=%lu dwNumObjs=%lu\n",
+               user_format->dwDataSize, user_format->dwNumObjs );
+        for (i = 0; i < IOS_VALUE_COUNT; ++i)
+        {
+            const DIOBJECTDATAFORMAT *obj = user_format->rgodf + i;
+            if (obj->dwType & DIDFT_OPTIONAL)
+                ERR( "[dinput] app format obj=%s unset\n", ios_trace_axis_name[i] );
+            else
+                ERR( "[dinput] app format obj=%s ofs=%lu\n", ios_trace_axis_name[i], obj->dwOfs );
+        }
+    }
+}
+
 /* Sample the pad into device_state, and queue one event per object that moved.
  *
  * This is the whole "buffered from polling at Poll()/GetDeviceState() time"
@@ -559,7 +686,7 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
 static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
 {
     IDirectInputDevice8W *iface = &impl->base.IDirectInputDevice8W_iface;
-    LONG values[IOS_VALUE_COUNT], value, old_value;
+    LONG values[IOS_VALUE_COUNT], scaled[IOS_VALUE_COUNT], value, old_value;
     XINPUT_STATE state;
     BYTE buttons[10];
     DWORD time, seq;
@@ -591,6 +718,7 @@ static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
 
         old_value = *(LONG *)(impl->base.device_state + ios_objects[i].dwOfs);
         *(LONG *)(impl->base.device_state + ios_objects[i].dwOfs) = value;
+        scaled[i] = value;
         if (queue && old_value != value) queue_event( iface, i, value, time, seq );
     }
 
@@ -604,6 +732,13 @@ static void ios_joystick_sample( struct ios_joystick *impl, BOOL queue )
     }
 
     LeaveCriticalSection( &impl->base.crit );
+
+    /* Outside the lock: this only reads object_properties/user_format for a
+     * TRACE, and holding the device lock across it would serialise every
+     * Poll()/GetDeviceState() in the app against a debug print once a second
+     * for no benefit. See ios_joystick_trace for why "while acquired" needs no
+     * extra check here. */
+    ios_joystick_trace( impl, &state.Gamepad, scaled, buttons );
 }
 
 static HRESULT ios_joystick_poll( IDirectInputDevice8W *iface )
