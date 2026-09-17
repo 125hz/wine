@@ -37,18 +37,21 @@
  * sees no controller at all while XInput-era titles in the same prefix work.
  *
  * WHAT THIS IS. The smallest thing that closes that gap: ONE joystick device
- * synthesised from the same gamepad query, with the object set an XInput pad
- * has when winebus.sys exposes it as HID —
+ * synthesised from the same gamepad query, with the Xbox 360 controller's
+ * DirectInput object set —
  *
  *   X, Y          left stick
- *   Z, Rz         left and right trigger
  *   Rx, Ry        right stick
- *   POV 0         d-pad, as a 8-way hat
+ *   Z             COMBINED triggers, left - right, centred when both released
+ *   POV 0         d-pad, as an 8-way hat
  *   buttons 0..9  A B X Y LB RB Back Start LThumb RThumb
  *
- * — the layout Wine's own bus driver reports for an XInput controller, so a
- * game's built-in "Xbox controller" button map lands on the same objects it
- * would land on under Wine on a desktop.
+ * — which is what Windows' XUSB DirectInput device reports, so a game's
+ * built-in "Xbox controller" map lands where it expects. See
+ * ios_logical_triggers for why Z is combined and there is no Rz; the short
+ * version is that it is the only arrangement in which every axis rests at the
+ * CENTRE of the app's range, and an axis that rests anywhere else drives a
+ * camera in a circle forever.
  *
  * WHY THERE IS NO #ifdef. NtUserGetGamepadState is NtUserCallTwoParam with a
  * code appended to the end of the enum in wine/include/ntuser.h. A win32u that
@@ -117,6 +120,15 @@ DEFINE_GUID( ios_joystick_guid, 0x9e573edc, 0x7734, 0x11d2, 0x8d, 0x4a, 0x23, 0x
 #define IOS_JOYSTICK_VID 0x1209
 #define IOS_JOYSTICK_PID 0x4d47
 
+/* A marker with the axis contract in it, so a built dinput.dll can be checked
+ * for THIS revision rather than for "a dinput.dll that has joystick_ios in it
+ * at all". `llvm-objdump -s -j .rdata dinput.dll | grep ml761-combined-z`, or
+ * plain `strings`. The first round of this file shipped and then had to be
+ * corrected; the difference between the two is invisible in the export table
+ * and visible here. */
+static const char ios_joystick_build_tag[] =
+    "MADEIRA-DINPUT-IOS ml761-combined-z axes=X,Y,Rx,Ry,Z(LT-RT) logical=-32768..32767 pov=0..7/idle8";
+
 /* The four XInput user slots, as in XUSER_MAX_COUNT. Only slot 0 is exposed:
  * see ios_joystick_enum_device. */
 #define IOS_JOYSTICK_USER 0
@@ -134,7 +146,6 @@ enum ios_object_index
     IOS_OBJ_Z,
     IOS_OBJ_RX,
     IOS_OBJ_RY,
-    IOS_OBJ_RZ,
     IOS_OBJ_POV,
     IOS_OBJ_BUTTON_0,
     IOS_OBJ_COUNT = IOS_OBJ_BUTTON_0 + 10,
@@ -196,7 +207,6 @@ static const struct ios_object ios_objects[IOS_OBJ_COUNT] =
     IOS_AXIS( IOS_OBJ_Z,  2, &GUID_ZAxis,  HID_USAGE_GENERIC_Z,  L"Z Axis" ),
     IOS_AXIS( IOS_OBJ_RX, 3, &GUID_RxAxis, HID_USAGE_GENERIC_RX, L"X Rotation" ),
     IOS_AXIS( IOS_OBJ_RY, 4, &GUID_RyAxis, HID_USAGE_GENERIC_RY, L"Y Rotation" ),
-    IOS_AXIS( IOS_OBJ_RZ, 5, &GUID_RzAxis, HID_USAGE_GENERIC_RZ, L"Z Rotation" ),
 #undef IOS_AXIS
     { &GUID_POV, IOS_VALUE_OFS( IOS_OBJ_POV ), DIDFT_POV | DIDFT_MAKEINSTANCE( 0 ),
       0, HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_HATSWITCH, L"Hat Switch" },
@@ -248,9 +258,12 @@ static const WORD ios_button_mask[10] =
  * exporting them would put a HID-shaped signature (struct hid_value_caps) into
  * a header shared with a device that has no HID under it.
  *
- * The logical range is fixed at 0..65535 for every axis, which is what lets
- * one conversion serve both a SHORT stick and a BYTE trigger. */
-#define IOS_LOGICAL_MAX 65535
+ * Neither of them is handed a pre-scaled value: they take the object's RAW
+ * logical value and the logical range ios_init_object_properties declared for
+ * it, and produce the app's physical range. That split is what makes
+ * DIPROP_RANGE work at all — the app can change range_min/range_max at any
+ * time and the next sample picks it up, because nothing downstream of these
+ * two functions knows about ranges. */
 
 static LONG ios_scale_value( LONG value, const struct object_properties *properties )
 {
@@ -290,23 +303,57 @@ static LONG ios_scale_axis_value( LONG value, const struct object_properties *pr
     return phy_min + MulDiv( value - log_min, phy_max - phy_min, log_max - log_min );
 }
 
-/* XInput -> logical. Sticks are SHORT, triggers are BYTE; both become the same
- * unsigned 0..65535 the properties above describe. The Y axes are negated:
- * XInput counts up as positive, DirectInput counts down as positive. */
+/* XInput -> logical. NOTHING here is pre-scaled into the app's range: each
+ * function returns the object's RAW logical value, in the logical range that
+ * ios_init_object_properties declares for that object, and the scaling above
+ * is the only place a physical range, a dead zone or a saturation is applied.
+ *
+ * ml761: this is where the first version was wrong, and the way it was wrong
+ * is worth writing down because it is not visible from the axis that broke.
+ * Every axis was converted to an UNSIGNED 0..65535 logical value and declared
+ * as such — fine for a stick, where XInput 0 lands on the declared centre
+ * 32767, and silently fatal for a trigger, where XInput 0 (RELEASED) landed on
+ * logical 0. scale_axis_value saturates that to phy_min, so a released trigger
+ * read as a FULLY DEFLECTED axis — 0 with dinput's default 0..65535 range,
+ * -1000 with an app range of -1000..1000. A 2008 DINPUT8 title that maps "the
+ * third axis" to camera yaw, as titles of that era do, therefore spun the
+ * camera at full rate forever and the right stick could not out-vote it. The
+ * XInput slot was all zeros throughout, which is exactly the state that
+ * triggers the bug, and is why the log looked innocent.
+ *
+ * Sticks are SHORT and stay SHORT. The Y axes are negated because XInput
+ * counts up as positive and DirectInput counts down as positive; the negation
+ * is clamped because -(-32768) does not fit. */
 static LONG ios_logical_stick( SHORT value )
 {
-    return (LONG)value + 32768;
+    return value;
 }
 
 static LONG ios_logical_stick_inverted( SHORT value )
 {
-    /* -32768 must stay in range after negation, hence the clamp. */
-    return IOS_LOGICAL_MAX - ((LONG)value + 32768);
+    if (value == -32768) return 32767;
+    return -(LONG)value;
 }
 
-static LONG ios_logical_trigger( BYTE value )
+/* Z IS THE COMBINED TRIGGER AXIS, not the left trigger.
+ *
+ * This is the Xbox 360 controller's DirectInput contract, and following it is
+ * the only way a trigger axis can rest at the CENTRE of the app's range
+ * instead of at one end of it. Windows' XUSB DirectInput device reports one Z
+ * axis carrying (left - right), centred when both are released; a game written
+ * against DirectInput in that era reads Z expecting exactly that. Two separate
+ * trigger axes are the MODERN (XInput / raw-HID) view, and a program that
+ * wants it has XInput, which this port has had all along.
+ *
+ * So there is no Rz object at all. An Rz declared as a separate right trigger
+ * would rest at a range extreme for the same reason Z did, and would reproduce
+ * the same spin in any title that happened to map it.
+ *
+ * 0..255 each, so the difference is -255..255; x128 spreads it over the same
+ * -32640..32640 a stick uses, which keeps one logical range for every axis. */
+static LONG ios_logical_triggers( BYTE left, BYTE right )
 {
-    return value * 257; /* 0..255 -> 0..65535, exactly */
+    return ((LONG)left - (LONG)right) * 128;
 }
 
 /* The d-pad as a hat: 0..7 clockwise from north, and 8 — outside the logical
@@ -340,10 +387,9 @@ static void ios_logical_state( const XINPUT_GAMEPAD *pad, LONG values[IOS_VALUE_
 
     values[IOS_OBJ_X]   = ios_logical_stick( pad->sThumbLX );
     values[IOS_OBJ_Y]   = ios_logical_stick_inverted( pad->sThumbLY );
-    values[IOS_OBJ_Z]   = ios_logical_trigger( pad->bLeftTrigger );
+    values[IOS_OBJ_Z]   = ios_logical_triggers( pad->bLeftTrigger, pad->bRightTrigger );
     values[IOS_OBJ_RX]  = ios_logical_stick( pad->sThumbRX );
     values[IOS_OBJ_RY]  = ios_logical_stick_inverted( pad->sThumbRY );
-    values[IOS_OBJ_RZ]  = ios_logical_trigger( pad->bRightTrigger );
     values[IOS_OBJ_POV] = ios_logical_pov( pad->wButtons );
 
     for (i = 0; i < ARRAY_SIZE(ios_button_mask); ++i)
@@ -366,7 +412,18 @@ HRESULT ios_joystick_enum_device( DWORD type, DWORD flags, DIDEVICEINSTANCEW *in
      * is a modal dialog nobody can dismiss without the controller the dialog
      * is there to choose. */
     if (index != 0) return DIERR_DEVICENOTREG;
+
+    /* CONNECTED ONLY, RE-CHECKED EVERY TIME. host_pad_state is TRUE only when
+     * the host slot reports a pad, so a session with no controller enumerates
+     * no joystick at all and a game sees what it would see on a PC with
+     * nothing plugged in. There is deliberately no caching: this runs on every
+     * EnumDevices (and on every CreateDevice, which goes through here), so a
+     * controller paired halfway through a session is picked up by the next
+     * enumeration and one that goes away stops being offered. Four syscalls
+     * into a memory read is cheaper than the staleness a cache would buy —
+     * the same reasoning as xinput1_3/main.c host_pad_any. */
     if (!host_pad_state( IOS_JOYSTICK_USER, &state )) return DIERR_DEVICENOTREG;
+    TRACE( "%s\n", ios_joystick_build_tag );
 
     size = instance->dwSize;
     memset( instance, 0, size );
@@ -449,13 +506,35 @@ static BOOL ios_init_object_properties( struct dinput_device *device, UINT index
 
     if (instance->dwType & DIDFT_AXIS)
     {
+        /* SIGNED, and this is the whole ml761 fix. Every axis this device has
+         * is centred at rest — the two sticks by construction, Z because it
+         * carries (left trigger - right trigger) — so the logical range that
+         * describes them is the SIGNED one the values actually live in, and
+         * logical 0 is the centre of it.
+         *
+         * scale_axis_value derives the centre from the declared range:
+         *   log_ctr = round((log_min + log_max) / 2.0) = round(-0.5) = -1
+         * so a resting axis (logical 0) is one LSB above centre and maps to
+         * phy_ctr — 32767 for dinput's default 0..65535 range, 0 for an app
+         * range of -1000..1000, and the centre of whatever else the app sets
+         * through DIPROP_RANGE. That is the property the device must have and
+         * the first version did not: at rest, EVERY axis reads the centre of
+         * the app-configured range, whatever that range is.
+         *
+         * It is also exactly the arithmetic joystick_hid.c performs on a
+         * winebus-backed pad, on the same struct object_properties, which is
+         * why DIPROP_RANGE / DIPROP_DEADZONE / DIPROP_SATURATION behave the
+         * same on both. */
         properties->bit_size = 16;
-        properties->logical_min = 0;
-        properties->logical_max = IOS_LOGICAL_MAX;
+        properties->logical_min = -32768;
+        properties->logical_max = 32767;
         properties->range_max = 65535;
     }
     else /* the hat */
     {
+        /* 0..7 clockwise from north. An idle hat is reported as logical 8,
+         * OUTSIDE this range, which is what makes ios_scale_value return -1
+         * (0xffffffff), DirectInput's "no direction". */
         properties->bit_size = 8;
         properties->logical_min = 0;
         properties->logical_max = 7;
