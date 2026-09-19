@@ -118,6 +118,10 @@ static HRESULT FAudio_WMAMF_ProcessOutput(
 		FAudio_assert(!FAILED(hr) && "Failed to lock buffer bytes!");
 		if (impl->output_pos + copy_size > impl->output_size)
 		{
+			/* MADEIRA: zero the newly grown tail -- pRealloc does not, and
+			 * everything past output_pos is readable by the voice before the
+			 * decoder has filled it (see the allocation site below). */
+			size_t old_size = impl->output_size;
 			impl->output_size = max(
 				impl->output_pos + copy_size,
 				impl->output_size * 3 / 2
@@ -127,6 +131,8 @@ static HRESULT FAudio_WMAMF_ProcessOutput(
 				impl->output_size
 			);
 			FAudio_assert(impl->output_buf && "Failed to resize output buffer!");
+			if (impl->output_buf && impl->output_size > old_size)
+				FAudio_zero(impl->output_buf + old_size, impl->output_size - old_size);
 		}
 		FAudio_memcpy(impl->output_buf + impl->output_pos, copy_buf, copy_size);
 		impl->output_pos += copy_size;
@@ -156,18 +162,19 @@ static void FAudio_INTERNAL_DecodeWMAMF(
 
 	if (!impl->output_pos)
 	{
-		if (wfx->Format.wFormatTag == FAUDIO_FORMAT_EXTENSIBLE)
-		{
-			const FAudioBufferWMA *wma = &voice->src.bufferList->bufferWMA;
-			const UINT32 *output_sizes = wma->pDecodedPacketCumulativeBytes;
-
-			impl->input_size = wfx->Format.nBlockAlign;
-			impl->output_size = max(
-				impl->output_size,
-				output_sizes[wma->PacketCount - 1]
-			);
-		}
-		else
+		/* MADEIRA: this used to select the XMA2 branch for EVERY format that
+		 * is not WAVEFORMATEXTENSIBLE, and then read dwBytesPerBlock and
+		 * dwSamplesEncoded out of it. Those two fields only exist in a
+		 * FAudioXMA2WaveFormat; for an xWMA voice submitted as a plain
+		 * WAVEFORMATEX with wFormatTag WMAUDIO2 -- which XAudio2 allows, and
+		 * which FAudio_WMADEC_init itself handles through its `type` switch
+		 * rather than through wFormatTag -- they are a read PAST THE END of
+		 * the caller's format struct. The results are used as the decoder's
+		 * input chunk size and as the size of an uninitialised pRealloc'd
+		 * output buffer, so the damage is a wrongly sized push and a buffer
+		 * whose tail is heap garbage that the voice can go on to play.
+		 * Key the branch on the format actually BEING XMA2 instead. */
+		if (wfx->Format.wFormatTag == FAUDIO_FORMAT_XMAUDIO2)
 		{
 			const FAudioXMA2WaveFormat *xwf = (const FAudioXMA2WaveFormat *)wfx;
 
@@ -179,12 +186,34 @@ static void FAudio_INTERNAL_DecodeWMAMF(
 				(voice->src.format->wBitsPerSample / 8)
 			);
 		}
+		else
+		{
+			const FAudioBufferWMA *wma = &voice->src.bufferList->bufferWMA;
+			const UINT32 *output_sizes = wma->pDecodedPacketCumulativeBytes;
 
-		impl->output_buf = voice->audio->pRealloc(
-			impl->output_buf,
-			impl->output_size
-		);
-		FAudio_assert(impl->output_buf && "Failed to allocate output buffer!");
+			impl->input_size = wfx->Format.nBlockAlign;
+			impl->output_size = max(
+				impl->output_size,
+				output_sizes ? output_sizes[wma->PacketCount - 1] : 0
+			);
+		}
+
+		{
+			/* MADEIRA: pRealloc does not zero, and the voice indexes this
+			 * buffer by its OWN cursor (samples_pos below), which can reach
+			 * past what the decoder has actually written when a packet fails
+			 * to decode. Uninitialised heap played as float32 is arbitrarily
+			 * loud -- the device's audio census read peak=65535.999. Zero the
+			 * whole thing so the worst case is silence. */
+			size_t old_size = impl->output_buf ? impl->output_pos : 0;
+			impl->output_buf = voice->audio->pRealloc(
+				impl->output_buf,
+				impl->output_size
+			);
+			FAudio_assert(impl->output_buf && "Failed to allocate output buffer!");
+			if (impl->output_buf && impl->output_size > old_size)
+				FAudio_zero(impl->output_buf + old_size, impl->output_size - old_size);
+		}
 
 		LOG_INFO(voice->audio, "sending BOS to %p", impl->decoder);
 		hr = IMFTransform_ProcessMessage(
@@ -243,6 +272,13 @@ error:
 	FAudio_zero(decodeCache, samples * voice->src.format->nChannels * sizeof(float));
 	LOG_FUNC_EXIT(voice->audio)
 }
+
+/* MADEIRA build tag. libs/faudio is built -DNDEBUG, so FAudio_assert strings
+ * do not survive into the PE and cannot be used to tell whether a shipped
+ * xaudio2, xactengine, x3daudio or xapofx module carries these fixes. This is
+ * a plain global in .rdata of a translation unit that is always linked (the
+ * decoder's entry point lives here), so `strings <module>.dll` answers it. */
+const char FAudio_WMADEC_madeira_tag[] = "MADEIRA-WMADEC-2026-09-19-xwma-zerofill";
 
 uint32_t FAudio_WMADEC_init(FAudioSourceVoice *voice, uint32_t type)
 {
