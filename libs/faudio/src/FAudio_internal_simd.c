@@ -56,9 +56,41 @@
 
 	/* Mac OS X/Intel guarantees SSE2. */
 	#define NEED_SCALAR_CONVERTER_FALLBACKS 0
+#elif defined(__i386__) || defined(_M_IX86)
+	/* MADEIRA: 32-bit x86 reached this file's final `#else` and got the SCALAR
+	 * paths only, because nothing defines __SSE2__ for an i686 PE target
+	 * (clang does not enable SSE2 by default for i686-windows, unlike
+	 * x86_64-windows).  FAudio_INTERNAL_InitSIMDFunctions then had no SSE2
+	 * branch compiled in at all, so the runtime
+	 * IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE) check below
+	 * could never select one -- scalar double-precision mixing and resampling
+	 * for every XAudio2 title, which a profile put at 22-27% of all CPU under
+	 * translation.
+	 *
+	 * Every x86 CPU a Windows game of the XAudio2 era targets has SSE2, but
+	 * unlike x86_64 the ISA does not GUARANTEE it here, so this deliberately
+	 * differs from the x86_64 case in two ways: the scalar fallbacks are still
+	 * built, and the choice is still made at runtime by that feature check.
+	 * All this does is make the SSE2 half exist to be chosen.
+	 *
+	 * The SSE2 bodies are enabled per function with
+	 * __attribute__((target("sse2"))) rather than by compiling the whole file
+	 * -msse2: a file-wide flag would also let the compiler emit SSE2 into the
+	 * scalar fallbacks, which are the paths that have to keep running on a CPU
+	 * without it.  clang's <emmintrin.h> already marks every intrinsic with
+	 * the same target attribute, so it can be included without the flag. */
+	#define NEED_SCALAR_CONVERTER_FALLBACKS 1
+	#if defined(__clang__) || defined(__GNUC__)
+	#define MADEIRA_FAUDIO_SSE2_TARGET __attribute__((target("sse2")))
+	#define MADEIRA_FAUDIO_WANT_SSE2 1
+	#endif
 #else
 	/* Need plain C implementations to support all other hardware */
 	#define NEED_SCALAR_CONVERTER_FALLBACKS 1
+#endif
+
+#ifndef MADEIRA_FAUDIO_SSE2_TARGET
+#define MADEIRA_FAUDIO_SSE2_TARGET
 #endif
 
 /* Our NEON paths require AArch64, don't check __ARM_NEON__ here */
@@ -69,6 +101,12 @@
 
 
 #ifdef __SSE2__
+#include <emmintrin.h>
+#define HAVE_SSE2_INTRINSICS 1
+#elif defined(MADEIRA_FAUDIO_WANT_SSE2)
+/* MADEIRA (see the i386 note above): the intrinsics carry their own
+ * target("sse2") attribute, so the header is usable without -msse2 and each
+ * SSE2 function opts in individually. */
 #include <emmintrin.h>
 #define HAVE_SSE2_INTRINSICS 1
 #endif
@@ -122,7 +160,7 @@ void FAudio_INTERNAL_Convert_S32_To_F32_Scalar(
 #endif /* NEED_SCALAR_CONVERTER_FALLBACKS */
 
 #if HAVE_SSE2_INTRINSICS
-void FAudio_INTERNAL_Convert_U8_To_F32_SSE2(
+MADEIRA_FAUDIO_SSE2_TARGET void FAudio_INTERNAL_Convert_U8_To_F32_SSE2(
 	const uint8_t *restrict src,
 	float *restrict dst,
 	uint32_t len
@@ -178,7 +216,7 @@ void FAudio_INTERNAL_Convert_U8_To_F32_SSE2(
     }
 }
 
-void FAudio_INTERNAL_Convert_S16_To_F32_SSE2(
+MADEIRA_FAUDIO_SSE2_TARGET void FAudio_INTERNAL_Convert_S16_To_F32_SSE2(
 	const int16_t *restrict src,
 	float *restrict dst,
 	uint32_t len
@@ -221,7 +259,7 @@ void FAudio_INTERNAL_Convert_S16_To_F32_SSE2(
     }
 }
 
-void FAudio_INTERNAL_Convert_S32_To_F32_SSE2(
+MADEIRA_FAUDIO_SSE2_TARGET void FAudio_INTERNAL_Convert_S32_To_F32_SSE2(
 	const int32_t *restrict src,
 	float *restrict dst,
 	uint32_t len
@@ -501,7 +539,7 @@ void FAudio_INTERNAL_ResampleStereo_Scalar(
 /* The SSE2 versions of the resamplers come from @8thMage! */
 
 #if HAVE_SSE2_INTRINSICS
-void FAudio_INTERNAL_ResampleMono_SSE2(
+MADEIRA_FAUDIO_SSE2_TARGET void FAudio_INTERNAL_ResampleMono_SSE2(
 	float *restrict dCache,
 	float *restrict resampleCache,
 	uint64_t *resampleOffset,
@@ -672,7 +710,7 @@ void FAudio_INTERNAL_ResampleMono_SSE2(
 	}
 }
 
-void FAudio_INTERNAL_ResampleStereo_SSE2(
+MADEIRA_FAUDIO_SSE2_TARGET void FAudio_INTERNAL_ResampleStereo_SSE2(
 	float *restrict dCache,
 	float *restrict resampleCache,
 	uint64_t *resampleOffset,
@@ -1199,7 +1237,7 @@ void FAudio_INTERNAL_Amplify_Scalar(
 /* The SSE2 version of the amplifier comes from @8thMage! */
 
 #if HAVE_SSE2_INTRINSICS
-void FAudio_INTERNAL_Amplify_SSE2(
+MADEIRA_FAUDIO_SSE2_TARGET void FAudio_INTERNAL_Amplify_SSE2(
 	float* output,
 	uint32_t totalSamples,
 	float volume
@@ -1312,7 +1350,7 @@ static inline float FAudio_simd_hadd(__m128 v)
 	return _mm_cvtss_f32(sums);
 }
 
-void FAudio_INTERNAL_Mix_Generic_SSE2(
+MADEIRA_FAUDIO_SSE2_TARGET void FAudio_INTERNAL_Mix_Generic_SSE2(
 	uint32_t toMix,
 	uint32_t srcChans,
 	uint32_t dstChans,
