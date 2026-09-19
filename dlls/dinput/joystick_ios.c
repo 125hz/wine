@@ -122,7 +122,7 @@ DEFINE_GUID( ios_joystick_guid, 0x9e573edc, 0x7734, 0x11d2, 0x8d, 0x4a, 0x23, 0x
 
 /* A marker with the axis contract in it, so a built dinput.dll can be checked
  * for THIS revision rather than for "a dinput.dll that has joystick_ios in it
- * at all". `llvm-objdump -s -j .rdata dinput.dll | grep ml762-trace-killswitch`,
+ * at all". `llvm-objdump -s -j .rdata dinput.dll | grep ml763-default-off`,
  * or plain `strings`. The first round of this file shipped and then had to be
  * corrected; the difference between the two is invisible in the export table
  * and visible here.
@@ -136,7 +136,7 @@ DEFINE_GUID( ios_joystick_guid, 0x9e573edc, 0x7734, 0x11d2, 0x8d, 0x4a, 0x23, 0x
  * per object and the app's SetDataFormat offsets, so the next device report
  * can name the object rather than guess at it. */
 static const char ios_joystick_build_tag[] =
-    "MADEIRA-DINPUT-IOS ml762-trace-killswitch axes=X,Y,Rx,Ry,Z(LT-RT) logical=-32768..32767 "
+    "MADEIRA-DINPUT-IOS ml763-default-off axes=X,Y,Rx,Ry,Z(LT-RT) logical=-32768..32767 "
     "pov=0..7/idle8 pad-env=MADEIRA_DINPUT_PAD trace=state+raw+range+format@1Hz";
 
 /* MADEIRA_DINPUT_PAD=0 turns this whole device off: ios_joystick_enum_device
@@ -159,11 +159,16 @@ static BOOL ios_dinput_pad_disabled( void )
 
     if (off >= 0) return off;
 
+    /* Default OFF since 2026-09-19: the pad is already exposed through XInput,
+     * and without the Windows "this DirectInput device is an XInput device"
+     * marker (the IG_ PnP id games look up through WMI) a title that reads both
+     * APIs sees TWO controllers and steers twice. MADEIRA_DINPUT_PAD=1 turns the
+     * DirectInput view on for DirectInput-only titles. */
     e = getenv( "MADEIRA_DINPUT_PAD" );
-    off = (e && e[0] == '0') ? 1 : 0;
+    off = (e && e[0] == '1') ? 0 : 1;
     if (__atomic_compare_exchange_n( &ios_dinput_pad_off, &expect, off, 0,
                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED ) && off)
-        ERR( "[dinput] iOS joystick disabled by MADEIRA_DINPUT_PAD=0\n" );
+        ERR( "[dinput] iOS joystick hidden (default); MADEIRA_DINPUT_PAD=1 exposes it to DirectInput\n" );
     return off;
 }
 
@@ -633,12 +638,20 @@ static void ios_joystick_trace( struct ios_joystick *impl, const XINPUT_GAMEPAD 
                                 const LONG scaled[IOS_VALUE_COUNT], const BYTE buttons[10] )
 {
     const DIDATAFORMAT *user_format = &impl->base.user_format;
-    DWORD now = GetCurrentTime();
+    static LONG trace_on = -1, calls, blocks;
     DWORD btn = 0;
     UINT i;
 
-    if (impl->last_trace_ms && (DWORD)(now - impl->last_trace_ms) < 1000) return;
-    impl->last_trace_ms = now;
+    /* Opt-in (MADEIRA_DINPUT_TRACE=1) and limited by a PROCESS-wide call
+     * counter: the per-device millisecond limiter never engaged for a title
+     * that re-creates its device constantly, and 260,000 trace lines in one
+     * session cost more than the input path itself. One block per 512 samples,
+     * at most 200 blocks per process. */
+    if (trace_on < 0) { const char *t = getenv( "MADEIRA_DINPUT_TRACE" ); trace_on = (t && t[0] == '1'); }
+    if (!trace_on) return;
+    if ((InterlockedIncrement( &calls ) & 511) != 1) return;
+    if (InterlockedIncrement( &blocks ) > 200) return;
+    (void)impl->last_trace_ms;
 
     for (i = 0; i < ARRAY_SIZE(ios_button_mask); ++i) if (buttons[i]) btn |= 1u << i;
 
