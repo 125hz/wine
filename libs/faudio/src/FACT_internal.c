@@ -34,6 +34,13 @@
 #include "stb.h"
 #define FACT_INTERNAL_rng() ((float) stb_frand())
 
+/* MADEIRA: build tag -- `strings xactengine*.dll | grep MADEIRA-FACT` answers
+ * "did the library change ship" on the artifact. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((used))
+#endif
+static const char madeira_fact_build_tag[] = "MADEIRA-FACT-2026-09-20-stream-base-offset";
+
 /* XACT Versions */
 
 #define FACT_CONTENT_VERSION_3_4 45
@@ -3164,6 +3171,25 @@ uint32_t FACT_INTERNAL_ParseWaveBank(
 				wb->entries[i].PlayRegion.dwLength =
 					header.Segments[FACT_WAVEBANK_SEGIDX_ENTRYWAVEDATA].dwLength;
 			}
+		}
+	}
+
+	/* MADEIRA: a streaming wave bank need not start at byte 0 of its file --
+	 * FACTStreamingParameters.offset exists precisely so a bank can live inside
+	 * a larger container. Every header read above honours it (SEEKSET adds
+	 * `offset`), but the entry offsets were left bank-relative, and those are
+	 * what the streaming reads use as absolute file positions
+	 * (FACT_INTERNAL_OnBufferEnd -> FACT_INTERNAL_ReadFile). The result was
+	 * wave data read `offset` bytes too early: correct format, wrong bytes,
+	 * which for a packetised codec means every packet fails to decode.
+	 * In-memory banks are always parsed with offset 0, so this is a no-op
+	 * for them. Done after the length fix-ups above, which need the
+	 * segment-relative values. */
+	if (isStreaming && offset != 0)
+	{
+		for (i = 0; i < wbinfo.dwEntryCount; i += 1)
+		{
+			wb->entries[i].PlayRegion.dwOffset += offset;
 		}
 	}
 

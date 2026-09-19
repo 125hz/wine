@@ -56,6 +56,8 @@
 #include <time.h>
 #ifdef __APPLE__
 # include <mach/mach_time.h>
+# include <mach/mach.h>
+# include <mach/mach_vm.h>
 #endif
 #ifdef HAVE_KQUEUE
 # include <sys/event.h>
@@ -4826,16 +4828,25 @@ static void ios_shared_futex_wake( const void *addr, int all )
         NtAlertThreadByThreadId( (HANDLE)(ULONG_PTR)tids[i] );
 }
 
+/* ml1000: bounded copy-out of guest memory; defined with the crash story at
+ * ios_alert_waiter_dump below. msync() only answers "is it mapped", so it let a
+ * PROT_NONE page through and the load took a BUS on a thread with no TEB. */
+static int ios_safe_read( ULONG_PTR addr, void *buf, size_t len );
+
 void ios_wpm_reap_shared( unsigned long long mutex_addr, unsigned int depth, unsigned long long dead_teb )
 {
     volatile LONG *futex = (volatile LONG *)(ULONG_PTR)mutex_addr;
     LONG old, desired;
     unsigned int owners;
+    LONG probe;
     if (!mutex_addr || (mutex_addr & 3) || mutex_addr >= 0x8000000000ULL) return;
-    {
-        char *page = (char *)((ULONG_PTR)mutex_addr & ~0x3fffULL);
-        if (msync( page, 0x4000, MS_ASYNC )) return;
-    }
+    /* ml1000: the reap itself has to be a real atomic RMW on the guest word, so
+     * it cannot go through mach_vm_read_overwrite -- but the common failure is
+     * a lock whose page is already gone, and this catches that without a fault.
+     * The residual window (reprotected between probe and CAS) is inherent to
+     * writing another process's lock and is bounded by the orphan detector's
+     * three-strike verdict, which is what earns the write in the first place. */
+    if (!ios_safe_read( (ULONG_PTR)mutex_addr, &probe, sizeof(probe) )) return;
     do
     {
         old = *futex;
@@ -4867,11 +4878,10 @@ void ios_srw_reap_exclusive( unsigned long long lock_addr, unsigned long long de
     volatile LONG *word = (volatile LONG *)(ULONG_PTR)lock_addr;
     LONG old, desired;
     unsigned int excl;
+    LONG probe;
     if (!lock_addr || (lock_addr & 3) || lock_addr >= 0x8000000000ULL) return;
-    {
-        char *page = (char *)((ULONG_PTR)lock_addr & ~0x3fffULL);
-        if (msync( page, 0x4000, MS_ASYNC )) return;
-    }
+    /* ml1000: same probe-before-RMW as ios_wpm_reap_shared; see the note there. */
+    if (!ios_safe_read( (ULONG_PTR)lock_addr, &probe, sizeof(probe) )) return;
     do
     {
         old = *word;
@@ -4949,6 +4959,53 @@ int ios_alert_waiter_lookup( unsigned int tid, const void **addr, int *age_s, in
     return 0;
 }
 
+/* iOS-Madeira ml1000: msync() IS NOT A READABILITY TEST, AND THIS IS WHERE THAT
+ * KILLED A SESSION.
+ *
+ * ml441/ml442 guarded every probe below with
+ * `if (!msync( page, 0x4000, MS_ASYNC ))' on the theory that Darwin returns
+ * ENOMEM for an unmapped page, so a success meant the page could be read.  It
+ * does not mean that.  msync answers a question about the MAPPING; it says
+ * nothing about the PROTECTION, so a region that is mapped PROT_NONE -- which
+ * is exactly what a guest DLL being unloaded or reprotected looks like for the
+ * moment it takes -- passes the guard and then faults on the load.
+ *
+ * Device log w1.txt, line ~38948, after a long healthy session:
+ *
+ *   bus_handler BUS #1: pc=0x102fd0208 addr=0x7177558688 x18=0x0
+ *                       insn=0xb8404528 (ldr w8,[x9],#4)
+ *   sym pc=Madeira`ios_alert_waiter_dump+0x3d4
+ *   bt[0] Madeira`ios_pump_sample+0x4c
+ *   bt[1] Madeira`ios_pool_warmer_thread+0x6e4
+ *   [bus-rgn] region=0x71774f0000+0xd8000 prot=0 max=7
+ *   [bus-rgn] VERDICT <== ANONYMOUS, NEVER RESIDENT
+ *
+ * `prot=0' is the whole story: mapped, so msync said yes; unreadable, so the
+ * load took a BUS.  The post-indexed `ldr w8,[x9],#4' is this function's own
+ * w0/w1 pair -- the compiler folded `*(al)' and the `al + 4' address into one
+ * post-increment -- and the thread is the pool warmer, which has no TEB, so
+ * the fault could not be adopted and the process died.
+ *
+ * Every probe here now goes through mach_vm_read_overwrite into a local.  The
+ * kernel does the permission check for us and reports failure as a return
+ * value instead of a signal, which is the only form of "is this readable"
+ * that is not a race against the guest in the first place: even a correct
+ * protection test would be stale by the next instruction, and this one cannot
+ * be, because the test IS the read. */
+static int ios_safe_read( ULONG_PTR addr, void *buf, size_t len )
+{
+#ifdef __APPLE__
+    mach_vm_size_t got = 0;
+    if (!addr) return 0;
+    return mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr, len,
+                                   (mach_vm_address_t)buf, &got ) == KERN_SUCCESS && got == len;
+#else
+    if (!addr) return 0;
+    memcpy( buf, (const void *)addr, len );
+    return 1;
+#endif
+}
+
 void ios_alert_waiter_dump(void)
 {
     LARGE_INTEGER now;
@@ -4990,11 +5047,11 @@ void ios_alert_waiter_dump(void)
                 {
                     ULONG_PTR row = base + line * 0x40;
                     unsigned long long w[8] = { 0 };
-                    char *page = (char *)(row & ~0x3fffULL);
-                    if (msync( page, 0x4000, MS_ASYNC )) continue;
-                    if ((((row + 0x38) & ~0x3fffULL) != (ULONG_PTR)page) &&
-                        msync( (char *)((row + 0x38) & ~0x3fffULL), 0x4000, MS_ASYNC )) continue;
-                    memcpy( w, (void *)row, 0x40 );
+                    /* ml1000: one bounded copy-out replaces the msync pair AND
+                     * the memcpy.  A row that straddles into an unreadable page
+                     * simply does not print, which is what the old two-page
+                     * msync was reaching for and did not achieve. */
+                    if (!ios_safe_read( row, w, sizeof(w) )) continue;
                     dprintf( 2, "[hot-lock]  %p: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
                              (void *)row, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7] );
                 }
@@ -5011,19 +5068,27 @@ void ios_alert_waiter_dump(void)
         age = (now.QuadPart - (LONGLONG)ios_alert_waiters[i].since) / 10000000;
         if (age < 60) continue;
         shown++;
-        /* safe-probe the lock word: msync rejects unmapped pages (Darwin
-         * returns ENOMEM).  ml442: read the CONTAINING aligned word — SRW and
-         * FEX WritePriorityMutex read-waits pass lock+2 (2-aligned), which the
-         * old 4-aligned-only guard refused (ml441's deaddead trio). */
+        /* Probe the lock word.  ml442: read the CONTAINING aligned word — SRW
+         * and FEX WritePriorityMutex read-waits pass lock+2 (2-aligned), which
+         * the old 4-aligned-only guard refused (ml441's deaddead trio).
+         * ml1000: and read it OUT of the guest rather than through a pointer —
+         * this pair of loads is what took the BUS in w1.txt.  w0/w1 keep their
+         * 0xdeaddead poison when the read fails, which is the existing "could
+         * not be read" spelling in this log line, so nothing downstream had to
+         * learn a new one. */
         if (!((ULONG_PTR)a & 1) && (ULONG_PTR)a > 0x10000 && (ULONG_PTR)a < 0x8000000000ULL)
         {
             ULONG_PTR al = (ULONG_PTR)a & ~3ULL;
-            char *page = (char *)(al & ~0x3fffULL);
-            if (!msync( page, 0x4000, MS_ASYNC ))
+            unsigned int pair[2];
+            if (ios_safe_read( al, pair, sizeof(pair) ))
             {
-                w0 = *(volatile unsigned int *)al;
-                if (((al + 4) & ~0x3fffULL) == (ULONG_PTR)page)
-                    w1 = *(volatile unsigned int *)(al + 4);
+                w0 = pair[0];
+                w1 = pair[1];
+            }
+            else if (ios_safe_read( al, &w0, sizeof(w0) ))
+            {
+                /* the second word is on a page we cannot read; the first is
+                 * the one the verdict is made from */
             }
         }
         dprintf( 2, "[waiters]  tid=%04x addr=%p age=%ds %s w0=%08x w1=%08x\n",
@@ -5055,11 +5120,10 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
         for (j = 0; j < IOS_ALERT_WAITER_MAX; j++)
             if (ios_alert_waiters[j].addr == a) nsame++;
         if (nsame < 3) continue;
-        {
-            char *page = (char *)((ULONG_PTR)lock & ~0x3fffULL);
-            if (msync( page, 0x4000, MS_ASYNC )) continue;
-            word = *(volatile unsigned int *)(ULONG_PTR)lock;
-        }
+        /* ml1000: same msync-is-not-a-readability-test fix as
+         * ios_alert_waiter_dump.  A lock word we cannot read cannot be judged,
+         * so skip the candidate exactly as the old unmapped case did. */
+        if (!ios_safe_read( (ULONG_PTR)lock, &word, sizeof(word) )) continue;
         if (!(word & 1))
         {
             /* released legitimately — clear any stale suspicion */
