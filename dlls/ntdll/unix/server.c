@@ -1737,6 +1737,12 @@ void server_init_process_done(void)
     FILE_FS_DEVICE_INFORMATION info;
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
 
+    /* ml982 fastsync: drop any handle -> cell cache entry left behind by a
+     * dead pseudo-process whose id we have just been reissued.  (The iOS build
+     * compiles build/ntdll-unix/server_ios.c in place of this file; the call is
+     * mirrored there.  Keep the two in step.) */
+    madeira_fast_flush_pid();
+
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );
     close( initial_cwd );

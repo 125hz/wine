@@ -229,6 +229,7 @@ extern struct object *create_internal_sync( int manual, int signaled );
 extern void madeira_event_sync_unclaim( struct object *sync );
 extern void madeira_event_sync_wake_queue( struct object *sync );
 extern int madeira_event_cell_index( struct object *obj, int *manual );
+extern int madeira_event_disable_cell( struct object *obj );
 extern int madeira_fastsync_cells_live(void);
 #endif
 extern void signal_sync( struct object *sync );

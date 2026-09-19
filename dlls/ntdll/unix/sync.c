@@ -294,7 +294,54 @@ static BOOL is_pseudo_handle( HANDLE handle );   /* defined with the inproc cach
 
 static struct madeira_fast_entry madeira_fast_cache[MADEIRA_FAST_CACHE_SIZE];
 static pthread_mutex_t madeira_fast_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int madeira_fast_on = -1;
+
+/* ml982: the four modes, parsed once (see the table at the head of
+ * ios_fastsync.h).  `madeira_fast_mode' selects the ladder and never changes
+ * again; `madeira_fast_on' is the CLIENT WAKE PATH and is the only thing the
+ * auto rule flips at runtime, always 0 -> 1 and never back. */
+enum
+{
+    MADEIRA_FS_MODE_OFF   = 0,   /* no cells at all: the pre-ml952 port       */
+    MADEIRA_FS_MODE_CELLS = 1,   /* server cells + the read-only poll peek    */
+    MADEIRA_FS_MODE_AUTO  = 2,   /* ... and arm the wake path on real traffic */
+    MADEIRA_FS_MODE_ON    = 3    /* ... armed from the first call             */
+};
+
+static int madeira_fast_mode  = -1;   /* MADEIRA_FS_MODE_*, -1 = not parsed   */
+static int madeira_fast_on    = -1;   /* client wake path active              */
+static int madeira_fast_peek  = 1;    /* MADEIRA_FS_POLLPEEK, default ON      */
+static int madeira_fast_ready = 0;    /* the parse has happened               */
+
+/* How many event/select operations in one 10 s [srv-stats] window arm the wake
+ * path in "auto" mode.  The measurement this whole mechanism exists for showed
+ * 338 k requests per 10 s; a launcher or a helper process does not come close,
+ * which is the point -- the three programs that died on the ml952 device
+ * snapshot were all quiet ones. */
+#define MADEIRA_FS_AUTO_REQS_DEFAULT  20000u
+static unsigned int madeira_fast_auto_reqs = MADEIRA_FS_AUTO_REQS_DEFAULT;
+
+/* ml982: one in every MADEIRA_FS_PEEK_EVERY zero-timeout waits is sent to the
+ * server even when the cell could have answered it.  Two reasons, and they are
+ * the whole safety argument for the peek:
+ *
+ *  - a zero-timeout wait is the one server call a thread in a polling loop may
+ *    be making AT ALL, and the server is what delivers a pending system APC
+ *    (STATUS_KERNEL_APC).  Answering every poll locally would let a thread
+ *    that does nothing else starve one indefinitely; answering 15 of 16 bounds
+ *    the delay at 16 poll iterations.
+ *  - it makes the peek SELF-CORRECTING.  If a cache entry ever resolved to the
+ *    wrong cell the peek would answer "not signaled" for an object that is
+ *    signaled -- a spin, not a lost wakeup, and one that the next server poll
+ *    ends.  A wrong answer can therefore never outlive 16 iterations of the
+ *    caller's own loop.
+ *
+ * Must be a power of two. */
+#define MADEIRA_FS_PEEK_EVERY     16u
+
+/* ... and one in this many peeked polls yields, which is what server_wait's
+ * own poll-streak rule (IOS_SRV_YIELD_EVERY, server_ios.c) used to do for
+ * these calls before the peek took them off the server. */
+#define MADEIRA_FS_PEEK_YIELD     64u
 
 /* How long a fast wait may park before it gives the wait back to the server.
  * This is the one number that trades handoff latency against how late a system
@@ -312,21 +359,40 @@ enum madeira_fast_result
     MADEIRA_FAST_SERVER   /* cell updated, but the server call is still due */
 };
 
-static int madeira_fastsync_enabled(void)
+/* ml982: parse MADEIRA_FASTSYNC / MADEIRA_FS_POLLPEEK / MADEIRA_FASTSYNC_CAP_US
+ * / MADEIRA_FS_AUTO_REQS once.  Running it twice on a race is harmless (the
+ * inputs are immutable and the outputs are identical), so there is no lock
+ * here; `madeira_fast_ready' only stops the getenv work happening on the hot
+ * path, it is not a mutual-exclusion flag.
+ *
+ * The DEFAULT IS THE MIDDLE RUNG: cells on, the client WAKE path off.  ml952
+ * shipped the wake path on by default and three unrelated programs died the
+ * same way on the first device snapshot; ml962 inverted the opt-in; ml972
+ * fixed four more defects and was never run on a device.  So the wake path
+ * stays opt-in, and what ships on is the half that cannot lose a wakeup
+ * because it never takes one: a read-only answer to a zero-timeout wait whose
+ * cell word reads RESET.  That half alone is a third of the measured traffic.
+ */
+static void madeira_fast_parse_env(void)
 {
-    int on = __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED ), expect = -1;
-    const char *e;
+    const char *e = getenv( "MADEIRA_FASTSYNC" );
+    int mode = MADEIRA_FS_MODE_CELLS, peek;
 
-    if (on >= 0) return on;
+    if (e)
+    {
+        if (!strcmp( e, "0" ) || !strcmp( e, "off" ) || !strcmp( e, "no" ))
+            mode = MADEIRA_FS_MODE_OFF;
+        else if (!strcmp( e, "1" ) || !strcmp( e, "on" ))
+            mode = MADEIRA_FS_MODE_ON;
+        else if (!strcmp( e, "auto" ))
+            mode = MADEIRA_FS_MODE_AUTO;
+    }
 
-    /* ml962: DEFAULT OFF.  ml952 shipped enabled-by-default and three
-     * unrelated programs died the same way on the first device snapshot, so
-     * the opt-in was inverted: unset or "0" is off and off is the pre-ml952
-     * code path byte for byte (no cell is allocated by the server, so nothing
-     * on either side ever touches the table).  MADEIRA_FASTSYNC=1 turns it on,
-     * which is what Documents/madeira-env.txt is for. */
-    e = getenv( "MADEIRA_FASTSYNC" );
-    on = (e && (!strcmp( e, "1" ) || !strcmp( e, "on" ))) ? 1 : 0;
+    /* the peek needs a cell to read, so "off" turns it off whatever it says */
+    e = getenv( "MADEIRA_FS_POLLPEEK" );
+    peek = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) || !strcmp( e, "no" ))) ? 0 : 1;
+    if (mode == MADEIRA_FS_MODE_OFF) peek = 0;
+
     if ((e = getenv( "MADEIRA_FASTSYNC_CAP_US" )))
     {
         unsigned long us = strtoul( e, NULL, 10 );
@@ -334,19 +400,76 @@ static int madeira_fastsync_enabled(void)
         if (us > 50000) us = 50000;
         madeira_fast_cap_ns = (unsigned long long)us * 1000;
     }
-    if (!__atomic_compare_exchange_n( &madeira_fast_on, &expect, on, 0,
-                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
-        return __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED );
+    if ((e = getenv( "MADEIRA_FS_AUTO_REQS" )))
+    {
+        unsigned long n = strtoul( e, NULL, 10 );
+        if (n < 1000) n = 1000;
+        madeira_fast_auto_reqs = (unsigned int)n;
+    }
 
-    if (on)
-        ERR( "[fastsync] ON rev=ml972 cells=%u cache=%u spin=%u cap=%uus - in-process event "
-             "set/reset/wait with no wineserver round trip; unset MADEIRA_FASTSYNC to disable, "
-             "MADEIRA_FASTSYNC_CAP_US=N to retune the park cap\n",
-             (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)MADEIRA_FAST_CACHE_SIZE,
-             (unsigned int)MADEIRA_FAST_SPIN, (unsigned int)(madeira_fast_cap_ns / 1000) );
-    else
-        ERR( "[fastsync] OFF (MADEIRA_FASTSYNC=1 enables) rev=ml972\n" );
-    return on;
+    __atomic_store_n( &madeira_fast_peek, peek, __ATOMIC_RELAXED );
+    __atomic_store_n( &madeira_fast_on, mode == MADEIRA_FS_MODE_ON ? 1 : 0, __ATOMIC_RELAXED );
+    __atomic_store_n( &madeira_fast_mode, mode, __ATOMIC_RELAXED );
+    if (__atomic_exchange_n( &madeira_fast_ready, 1, __ATOMIC_RELEASE )) return;   /* announce once */
+
+    ERR( "[fastsync] rev=ml982 mode=%s peek=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
+         " - MADEIRA_FASTSYNC=0|auto|1 selects; MADEIRA_FS_POLLPEEK=0 disables the"
+         " read-only zero-timeout answer\n",
+         mode == MADEIRA_FS_MODE_OFF   ? "off (pre-ml952)" :
+         mode == MADEIRA_FS_MODE_CELLS ? "cells (wake path OFF)" :
+         mode == MADEIRA_FS_MODE_AUTO  ? "auto (wake path armed on traffic)" : "on",
+         peek ? "on" : "off",
+         (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)MADEIRA_FAST_CACHE_SIZE,
+         (unsigned int)MADEIRA_FAST_SPIN, (unsigned int)(madeira_fast_cap_ns / 1000),
+         madeira_fast_auto_reqs );
+}
+
+static inline void madeira_fast_init(void)
+{
+    if (!__atomic_load_n( &madeira_fast_ready, __ATOMIC_ACQUIRE )) madeira_fast_parse_env();
+}
+
+/* "may this call take a token, park, or publish a wake" -- the client half. */
+static inline int madeira_fastsync_enabled(void)
+{
+    madeira_fast_init();
+    return __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED );
+}
+
+/* "does the server keep event state in a cell we may READ" -- true for every
+ * mode above "off", including the default. */
+static inline int madeira_fast_cells_enabled(void)
+{
+    madeira_fast_init();
+    return __atomic_load_n( &madeira_fast_mode, __ATOMIC_RELAXED ) > MADEIRA_FS_MODE_OFF;
+}
+
+/* ml982: the "auto" rule.  Called once per [srv-stats] window from
+ * build/ntdll-unix/server_ios.c, which is the only thing in this image that
+ * already knows the task's request rate, so the rule costs nothing of its own.
+ *
+ * Scope: this image is ONE Mach task and `madeira_fast_on' is one word in it,
+ * so the arm is task-wide rather than per-pseudo-process -- the counters it
+ * reads are task-wide too.  In practice the task IS the title: the quiet
+ * helper processes that this rule is meant to spare are separate Madeira
+ * launches, not threads of this one.
+ *
+ * One way only.  There is no disarm: a fast waiter parked on a cell would have
+ * to be told, and "turn it off underneath a parked thread" is exactly the kind
+ * of state change this mechanism is bad at.  A DESYNC demotes the one object
+ * instead (see madeira_fast_watchdog_check). */
+void madeira_fastsync_auto_arm( unsigned int ops, unsigned long long window_ns )
+{
+    if (__atomic_load_n( &madeira_fast_mode, __ATOMIC_RELAXED ) != MADEIRA_FS_MODE_AUTO) return;
+    if (__atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED )) return;
+    if (ops < madeira_fast_auto_reqs) return;
+    if (__atomic_exchange_n( &madeira_fast_on, 1, __ATOMIC_RELAXED )) return;
+
+    ERR( "[fastsync] AUTO-ENABLED after %u event/select ops in %llums (%llu/s, threshold %u)"
+         " - the in-process wake path is now live; MADEIRA_FASTSYNC=0 forces it off\n",
+         ops, window_ns / 1000000ull,
+         window_ns ? (unsigned long long)ops * 1000000000ull / window_ns : 0ull,
+         madeira_fast_auto_reqs );
 }
 
 static inline unsigned int madeira_fast_pid(void)
@@ -454,31 +577,79 @@ static void madeira_fast_publish( struct madeira_fast_entry *e, unsigned int han
  * ml962: the "is this slot even mine" test now happens INSIDE the section, so
  * it cannot race a publish into the same slot and decide not to evict an entry
  * that was installed a nanosecond later. */
+/* The eviction itself; the caller owns madeira_fast_mutex. */
+static void madeira_fast_evict_locked( struct madeira_fast_entry *e )
+{
+    unsigned int s = __atomic_load_n( &e->seq, __ATOMIC_RELAXED );
+
+    __atomic_store_n( &e->seq, s + 1, __ATOMIC_RELAXED );
+    __atomic_thread_fence( __ATOMIC_RELEASE );
+    __atomic_store_n( &e->handle, 0u, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->pid,    0u, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->cell,   -1, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->gen,    0u, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->access, 0u, __ATOMIC_RELAXED );
+    __atomic_store_n( &e->manual, 0u, __ATOMIC_RELAXED );
+    __atomic_thread_fence( __ATOMIC_RELEASE );
+    __atomic_store_n( &e->seq, s + 2, __ATOMIC_RELAXED );
+    ios_srv_nt_count( IOS_FS_EVICT );
+}
+
 void madeira_fast_close( HANDLE handle )
 {
     unsigned int h = wine_server_obj_handle( handle );
     struct madeira_fast_entry *e;
     sigset_t sigset;
-    unsigned int s;
 
-    if (!h || __atomic_load_n( &madeira_fast_on, __ATOMIC_RELAXED ) <= 0) return;
+    /* ml982: the guard is the MODE, not the wake path: the read-only poll peek
+     * populates this cache in the default mode too, and an entry it leaves
+     * behind has to be evicted on close for exactly the same reason. */
+    if (!h || __atomic_load_n( &madeira_fast_mode, __ATOMIC_RELAXED ) <= MADEIRA_FS_MODE_OFF) return;
     e = &madeira_fast_cache[(h >> 2) & (MADEIRA_FAST_CACHE_SIZE - 1)];
 
     server_enter_uninterrupted_section( &madeira_fast_mutex, &sigset );
     if (__atomic_load_n( &e->handle, __ATOMIC_RELAXED ) == h)
+        madeira_fast_evict_locked( e );
+    server_leave_uninterrupted_section( &madeira_fast_mutex, &sigset );
+}
+
+/* ml982 DEFECT: A POSITIVE ENTRY CAN OUTLIVE THE PROCESS IT BELONGS TO.
+ *
+ * The cache key is (handle value, owning pid) because this one address space
+ * holds every pseudo-process, and a positive entry is invalidated by
+ * madeira_fast_close() -- which is NtClose and the DUPLICATE_CLOSE_SOURCE
+ * path, i.e. by THIS process closing the handle.  Nothing invalidates the
+ * entries of a process that simply DIES: its whole handle table is torn down
+ * server-side, with no NtClose on this side to observe.
+ *
+ * On its own that is only a leak of dead entries.  What makes it a
+ * correctness problem is that the server reuses a dead process's id
+ * (alloc_ptid keeps a free list), so a LATER pseudo-process can be handed the
+ * same id, allocate the same low handle values, and hit a slot whose (handle,
+ * pid) both match and whose cell is still live because the EVENT is still
+ * alive in some other process.  That is a set or a wait landing on a
+ * completely unrelated object -- the same failure mode as the ml962 torn
+ * publish, reachable without any race at all.
+ *
+ * One scan of 2048 slots, once, on the process's own init thread, closes it:
+ * at that moment this process owns no handles, so any entry carrying our pid
+ * is by definition a ghost.  Cost is a few microseconds per process launch.
+ */
+void madeira_fast_flush_pid(void)
+{
+    unsigned int pid = madeira_fast_pid();
+    sigset_t sigset;
+    int i;
+
+    if (!pid) return;
+    server_enter_uninterrupted_section( &madeira_fast_mutex, &sigset );
+    for (i = 0; i < MADEIRA_FAST_CACHE_SIZE; i++)
     {
-        s = __atomic_load_n( &e->seq, __ATOMIC_RELAXED );
-        __atomic_store_n( &e->seq, s + 1, __ATOMIC_RELAXED );
-        __atomic_thread_fence( __ATOMIC_RELEASE );
-        __atomic_store_n( &e->handle, 0u, __ATOMIC_RELAXED );
-        __atomic_store_n( &e->pid,    0u, __ATOMIC_RELAXED );
-        __atomic_store_n( &e->cell,   -1, __ATOMIC_RELAXED );
-        __atomic_store_n( &e->gen,    0u, __ATOMIC_RELAXED );
-        __atomic_store_n( &e->access, 0u, __ATOMIC_RELAXED );
-        __atomic_store_n( &e->manual, 0u, __ATOMIC_RELAXED );
-        __atomic_thread_fence( __ATOMIC_RELEASE );
-        __atomic_store_n( &e->seq, s + 2, __ATOMIC_RELAXED );
-        ios_srv_nt_count( IOS_FS_EVICT );
+        struct madeira_fast_entry *e = &madeira_fast_cache[i];
+
+        if (__atomic_load_n( &e->handle, __ATOMIC_RELAXED ) &&
+            __atomic_load_n( &e->pid, __ATOMIC_RELAXED ) == pid)
+            madeira_fast_evict_locked( e );
     }
     server_leave_uninterrupted_section( &madeira_fast_mutex, &sigset );
 }
@@ -707,9 +878,64 @@ static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, L
     return MADEIRA_FAST_DONE;
 }
 
+/* ml982: THE READ-ONLY ZERO-TIMEOUT ANSWER ("poll peek").
+ *
+ * WHY THIS IS A DIFFERENT AND MUCH SMALLER CLAIM THAN THE WAKE PATH.
+ * The measurement that motivates all of this has 116607 zero-timeout
+ * single-object waits per 10 s, of which 115920 time out.  Every one of them
+ * is a full wineserver round trip to be told "no".  Answering the NO from the
+ * cell costs nothing and risks nothing, because:
+ *
+ *  - it never CONSUMES anything.  An auto-reset event cannot be acquired by a
+ *    peek: the only answer this function is allowed to give is "not signaled",
+ *    and "not signaled" transfers no token, releases nobody and writes no
+ *    memory.  The entire lost-wakeup / double-release problem space -- which
+ *    is what the wake path is hard for -- is structurally absent.
+ *  - the word it reads IS the server's own state.  For a cell-backed event
+ *    the server's event_sync_signaled() reads this same address:
+ *    MADEIRA_CELL_RESET is exactly the value for which it answers "not
+ *    signaled" (manual: st != RESET; auto: a CAS out of SET).  So RESET here
+ *    and STATUS_TIMEOUT there are the same fact, not two opinions.
+ *  - every other value -- SET, CLAIMED, DISABLED -- and every doubt about
+ *    whether this cell is still ours goes to the server untouched.
+ *  - one poll in MADEIRA_FS_PEEK_EVERY goes to the server anyway, which bounds
+ *    system-APC latency and makes a wrong cache entry self-correcting.
+ *
+ * This is why it is the half that ships ON by default while the wake path does
+ * not.
+ *
+ * The gate is per THREAD and is stepped exactly once per peeked poll. */
+static inline int madeira_peek_budget(void)
+{
+    static __thread unsigned int streak;
+    unsigned int s = ++streak;
+
+    /* The yield test comes FIRST and is independent of the server test: both
+     * periods are powers of two, so testing the server one first would make
+     * every yield point fall on a poll that went to the server anyway and the
+     * yield would never happen. */
+    if (!(s & (MADEIRA_FS_PEEK_YIELD - 1))) NtYieldExecution();
+    return (s & (MADEIRA_FS_PEEK_EVERY - 1)) != 0;    /* 0 = send this one to the server */
+}
+
+/* "is this cell provably NOT signaled right now?"  The generation is re-read
+ * AFTER the state word on purpose: gen moves on every free and every alloc, so
+ * an unchanged gen either side of the load proves no recycle happened across
+ * it and therefore that the RESET we saw belonged to OUR event. */
+static inline int madeira_peek_cell( struct madeira_sync_cell *cell, unsigned int gen )
+{
+    if (!__atomic_load_n( &madeira_fast_peek, __ATOMIC_RELAXED )) return 0;
+    if (!madeira_peek_budget()) return 0;
+    if (__atomic_load_n( &cell->state, __ATOMIC_SEQ_CST ) != MADEIRA_CELL_RESET) return 0;
+    if (!madeira_cell_alive( cell, gen )) return 0;
+    ios_srv_nt_count( IOS_FS_POLLPEEK );
+    return 1;
+}
+
 /* A single-handle, non-alertable, non-wait-all wait.
  *
- * Returns STATUS_SUCCESS when the wait was satisfied with no server call, or
+ * Returns STATUS_SUCCESS when the wait was satisfied with no server call,
+ * STATUS_TIMEOUT when a zero-timeout poll was answered from the cell, or
  * STATUS_NOT_IMPLEMENTED for "fall through to server_wait", in which case
  * *fallback is the timeout the caller must use from here (a relative timeout
  * is reduced by the time this function spent, so the total wait is unchanged;
@@ -723,7 +949,17 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
     int i, st, rounds;
 
     *fallback = timeout;
-    if (!madeira_fastsync_enabled()) return STATUS_NOT_IMPLEMENTED;
+    if (!madeira_fastsync_enabled())
+    {
+        /* Wake path off (the default).  The read-only peek still applies, and
+         * it is the only thing this function may do in that mode. */
+        if (timeout && !timeout->QuadPart && madeira_fast_cells_enabled() &&
+            __atomic_load_n( &madeira_fast_peek, __ATOMIC_RELAXED ) &&
+            (cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )) &&
+            madeira_peek_cell( cell, gen ))
+            return STATUS_TIMEOUT;
+        return STATUS_NOT_IMPLEMENTED;
+    }
     if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )))
         return STATUS_NOT_IMPLEMENTED;
 
@@ -733,11 +969,14 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
         return STATUS_SUCCESS;
     }
 
-    /* A zero timeout is a state query.  It has just been answered "no", and
-     * the server is what has to turn that into STATUS_TIMEOUT (and deliver any
-     * pending kernel APC on the way), so do not fake it here. */
+    /* A zero timeout is a state query.  madeira_fast_try() has just failed to
+     * take a token, which for an auto-reset event means either "not signaled"
+     * or "somebody else took it first" -- both of which are STATUS_TIMEOUT for
+     * this caller, but only the cell can say which, and only the RESET answer
+     * may be given here (see madeira_peek_cell). */
     if (timeout && !timeout->QuadPart)
     {
+        if (madeira_peek_cell( cell, gen )) return STATUS_TIMEOUT;
         ios_srv_nt_count( IOS_NT_FAST_MISS );
         return STATUS_NOT_IMPLEMENTED;
     }
@@ -861,6 +1100,143 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
     }
     ios_srv_nt_count( IOS_NT_FAST_MISS );
     return STATUS_NOT_IMPLEMENTED;
+}
+
+/***********************************************************************
+ *   ml982: THE WATCHDOG -- a hang becomes a logged hiccup
+ *
+ * WHERE A HANG CAN ACTUALLY LIVE.  The fast path parks for at most
+ * madeira_fast_cap_ns (2 ms, 50 ms at the top of the knob's range) and then
+ * hands the wait to the server, so "parked on a cell for two seconds" is not a
+ * state this code can reach.  A thread that is stuck is stuck in server_wait,
+ * and once it is there only the server can wake it.  So the watchdog cannot
+ * live in the park loop: it has to live in the fall-through, and the way to
+ * give an INFINITE wait a heartbeat is to stop making it infinite.
+ *
+ * WHAT IT LOOKS FOR.  Both sides read the same word, so they cannot disagree
+ * about RESET vs SET by opinion -- only by accident.  The one observable
+ * accident is: the server has just evaluated this object and said NOT
+ * SIGNALED, while the cell says SET.  That is a token nobody can collect: the
+ * wake that should have followed the set was lost, or the set landed on a cell
+ * that is no longer the one the server is reading.  Either way this thread
+ * would wait forever.
+ *
+ * WHY THE SECOND OPINION.  A plain "the timed wait expired and the cell says
+ * SET" is a false positive whenever the set simply landed in the gap between
+ * the two.  So the check re-asks the server with a ZERO-timeout select, which
+ * is both the confirmation and the cure when there is nothing wrong: if the
+ * object really is signaled the server satisfies the wait there and then and
+ * the caller gets its STATUS_SUCCESS.  Only "server says no AND the cell still
+ * says SET" is reported.
+ *
+ * WHAT IT DOES ABOUT IT.  One log line per process, a counter for the rest,
+ * and MADEIRA_EVENT_OP_DISABLE on that one object -- the PulseEvent exit,
+ * which folds the cell state back into the server's own bit, wakes every
+ * parked client and makes every future operation on that event take the server
+ * path.  A false positive therefore costs one permanently slower event and
+ * nothing else, which is the right price for never hanging.
+ *
+ * COST ON THE HOT PATH: none.  This runs only for an INFINITE single-object
+ * wait that the wake path could not satisfy, only when the wake path is
+ * active, and then once per interval per parked thread -- and the interval
+ * backs off ×4 to a minute, so a worker idle for an hour costs about 60
+ * requests, against the 338000 per 10 s this mechanism exists to remove.
+ ***********************************************************************/
+
+#define MADEIRA_FS_WATCH_MS_FIRST   2000u
+#define MADEIRA_FS_WATCH_MS_MAX    60000u
+
+static int madeira_desync_logged;
+
+/* Take one object out of the fast path for good.  Best effort: a failure here
+ * (a handle that has meanwhile been closed, say) leaves the object exactly as
+ * it was, which is the state we were already coping with. */
+static void madeira_fast_demote( HANDLE handle )
+{
+    SERVER_START_REQ( event_op )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        req->op     = MADEIRA_EVENT_OP_DISABLE;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    madeira_fast_close( handle );   /* forget the cell; the next learn says -1 */
+}
+
+/* Returns a status to hand back to the caller, or STATUS_NOT_IMPLEMENTED for
+ * "no verdict, keep waiting". */
+static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int flags,
+                                                 const union select_op *op, data_size_t size )
+{
+    struct madeira_sync_cell *cell;
+    unsigned int manual = 0, gen = 0, ret;
+    LARGE_INTEGER zero;
+    int st, st2;
+
+    ios_srv_nt_count( IOS_FS_WATCHDOG );
+    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )))
+        return STATUS_NOT_IMPLEMENTED;             /* not a cell event any more */
+
+    st = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+    if (!madeira_cell_alive( cell, gen )) return STATUS_NOT_IMPLEMENTED;
+    /* RESET is the coherent answer and DISABLED means the server is already
+     * authoritative; CLAIMED is a token in flight on the server thread, which
+     * resolves in nanoseconds and is nobody's hang. */
+    if (st != MADEIRA_CELL_SET) return STATUS_NOT_IMPLEMENTED;
+
+    /* Second opinion, and the cure if there is nothing wrong. */
+    zero.QuadPart = 0;
+    ret = server_wait( op, size, flags, &zero );
+    if (ret != STATUS_TIMEOUT) return ret;         /* satisfied, or a real status */
+
+    st2 = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+    if (!madeira_cell_alive( cell, gen ) || st2 != MADEIRA_CELL_SET)
+        return STATUS_NOT_IMPLEMENTED;             /* somebody consumed it: fine */
+
+    ios_srv_nt_count( IOS_FS_DESYNC );
+    if (!__atomic_exchange_n( &madeira_desync_logged, 1, __ATOMIC_RELAXED ))
+        ERR( "[fastsync] DESYNC handle=%p cell=%d gen=%u state=%d/%d waiters=%d srv_waiters=%d "
+             "manual=%u - the server reports this object NOT signaled while the shared cell "
+             "says SET; demoting it to the server path permanently.  Further occurrences are "
+             "counted as desync= in [srv-stats].\n",
+             handle, (int)(cell - madeira_sync_cells),
+             __atomic_load_n( &cell->gen, __ATOMIC_RELAXED ), st, st2,
+             __atomic_load_n( &cell->waiters, __ATOMIC_RELAXED ),
+             __atomic_load_n( &cell->srv_waiters, __ATOMIC_RELAXED ), manual );
+
+    madeira_fast_demote( handle );
+    return STATUS_NOT_IMPLEMENTED;                 /* re-wait, now on the server */
+}
+
+/* The INFINITE single-object wait, with a heartbeat.  Used only when the wake
+ * path is live; otherwise the caller issues the plain infinite server_wait it
+ * always did. */
+static unsigned int madeira_fast_watched_wait( const union select_op *op, data_size_t size,
+                                               unsigned int flags, HANDLE handle )
+{
+    unsigned int ms = MADEIRA_FS_WATCH_MS_FIRST, ret, manual = 0, gen = 0;
+
+    /* Only a cell-backed event can desync, and only an event is worth waking a
+     * parked thread for.  A wait on a thread, a process, a mutex, a semaphore,
+     * a timer or a file keeps the plain infinite wait it always had -- this is
+     * answered from the negative cache, so it is a couple of loads. */
+    if (!madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen ))
+        return server_wait( op, size, flags, NULL );
+
+    for (;;)
+    {
+        LARGE_INTEGER t;
+
+        t.QuadPart = -(LONGLONG)ms * 10000;
+        if ((ret = server_wait( op, size, flags, &t )) != STATUS_TIMEOUT) return ret;
+        ret = madeira_fast_watchdog_check( handle, flags, op, size );
+        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+        if (ms < MADEIRA_FS_WATCH_MS_MAX)
+        {
+            ms *= 4;
+            if (ms > MADEIRA_FS_WATCH_MS_MAX) ms = MADEIRA_FS_WATCH_MS_MAX;
+        }
+    }
 }
 
 #endif /* WINE_IOS */
@@ -3207,6 +3583,15 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
     if (alertable) flags |= SELECT_ALERTABLE;
     select_op.wait.op = type == WaitAll ? SELECT_WAIT_ALL : SELECT_WAIT;
     for (i = 0; i < count; i++) select_op.wait.handles[i] = wine_server_obj_handle( handles[i] );
+#ifdef WINE_IOS
+    if (count == 1 && type != WaitAll && !timeout && !alertable && madeira_fastsync_enabled())
+    {
+        ret = madeira_fast_watched_wait( &select_op, offsetof( union select_op, wait.handles[1] ),
+                                         flags, handles[0] );
+        TRACE( "-> %#x\n", ret );
+        return ret;
+    }
+#endif
     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[count] ), flags, timeout );
     TRACE( "-> %#x\n", ret );
     return ret;
@@ -3259,6 +3644,17 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     if (alertable) flags |= SELECT_ALERTABLE;
     select_op.wait.op = SELECT_WAIT;
     select_op.wait.handles[0] = wine_server_obj_handle( handle );
+#ifdef WINE_IOS
+    /* ml982: an INFINITE single-object wait is the one shape that can hang
+     * forever if the fast path ever loses a set, so give it a heartbeat. */
+    if (!timeout && !alertable && madeira_fastsync_enabled())
+    {
+        ret = madeira_fast_watched_wait( &select_op, offsetof( union select_op, wait.handles[1] ),
+                                         flags, handle );
+        TRACE( "-> %#x\n", ret );
+        return ret;
+    }
+#endif
     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[1] ), flags, timeout );
     TRACE( "-> %#x\n", ret );
     return ret;

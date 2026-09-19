@@ -400,8 +400,13 @@ extern void close_inproc_sync( HANDLE handle );
  * Must be called wherever close_inproc_sync() is, i.e. everywhere a handle
  * stops meaning what it used to mean. */
 extern void madeira_fast_close( HANDLE handle );
+/* ml982: drop every cache entry belonging to the calling process id.  Called
+ * once, from server_init_process_done(), because a pseudo-process that dies
+ * leaves its positive entries behind and the server reissues process ids. */
+extern void madeira_fast_flush_pid(void);
 #else
 #define madeira_fast_close(handle) ((void)0)
+#define madeira_fast_flush_pid() ((void)0)
 #endif
 
 extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,

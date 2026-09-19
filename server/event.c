@@ -60,14 +60,28 @@ static int madeira_fastsync_enabled(void)
 {
     if (madeira_fastsync_on < 0)
     {
-        /* ml962: DEFAULT OFF, and it must agree with the client's copy of this
-         * test in ntdll/unix/sync.c.  With it off madeira_cell_alloc() hands
-         * back -1 for every event, so event->cell is always -1, every hook in
-         * this file falls through to the plain `signaled' bit and
-         * madeira_event_cell_index() always answers -1 -- i.e. the server is
-         * the pre-ml952 server. */
+        /* ml982: the SERVER half is on for every mode except an explicit
+         * "off", and the client half (the wake semantics) is gated separately
+         * by the identical parse in ntdll/unix/sync.c -- see the four-mode
+         * table at the head of ios_fastsync.h.
+         *
+         * Allocating a cell with no client participation is a pure relocation
+         * of one bit: event_sync_signaled() reads the cell where it used to
+         * read `signaled', event_sync_satisfied() clears the cell where it
+         * used to clear `signaled', event_sync_signal() writes the cell where
+         * it used to write `signaled', and with nothing else touching the word
+         * every CAS in here succeeds first time.  What it buys is that the
+         * word EXISTS at an address a guest thread can read, which is all the
+         * read-only zero-timeout peek (MADEIRA_FS_POLLPEEK) needs -- and that
+         * peek is a third of this port's server traffic.
+         *
+         * With "0"/"off"/"no" madeira_cell_alloc() hands back -1 for every
+         * event, so event->cell is always -1, every hook in this file falls
+         * through to the plain `signaled' bit and madeira_event_cell_index()
+         * always answers -1: the pre-ml952 server, byte for byte. */
         const char *e = getenv( "MADEIRA_FASTSYNC" );
-        madeira_fastsync_on = (e && (!strcmp( e, "1" ) || !strcmp( e, "on" ))) ? 1 : 0;
+        madeira_fastsync_on = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) ||
+                                     !strcmp( e, "no" ))) ? 0 : 1;
     }
     return madeira_fastsync_on;
 }
@@ -865,6 +879,22 @@ int madeira_event_cell_index( struct object *obj, int *manual )
     *manual = sync->manual;
     return sync->cell;
 }
+
+/* ml982: the self-heal half of the client-side watchdog, reached through
+ * MADEIRA_EVENT_OP_DISABLE (see ios_fastsync.h).  Takes ONE event out of the
+ * fast path for good, by exactly the route PulseEvent already uses.  Returns 0
+ * for an object that has no cell, which is not an error -- the client may have
+ * raced a pulse or a re-learn and asking twice must be harmless. */
+int madeira_event_disable_cell( struct object *obj )
+{
+    struct event *event;
+
+    if (obj->ops != &event_ops) return 0;
+    event = (struct event *)obj;
+    if (!event->sync || event->sync->ops != &event_sync_ops) return 0;
+    event_sync_disable_cell( (struct event_sync *)event->sync );
+    return 1;
+}
 #endif
 
 struct keyed_event *create_keyed_event( struct object *root, const struct unicode_str *name,
@@ -962,6 +992,26 @@ DECL_HANDLER(event_op)
 {
     struct event_sync *sync;
     struct event *event;
+
+#ifdef WINE_IOS
+    /* ml982: the one opcode a WAITER may send.  It is answered before the
+     * EVENT_MODIFY_STATE check below because the thread that notices a
+     * fast-path incoherence is by construction a thread that was WAITING on
+     * the object, and SYNCHRONIZE is the only right it is required to hold.
+     * See MADEIRA_EVENT_OP_DISABLE in ios_fastsync.h for why this is not a
+     * state modification. */
+    if (req->op == MADEIRA_EVENT_OP_DISABLE)
+    {
+        if (!(event = get_event_obj( current->process, req->handle, SYNCHRONIZE ))) return;
+        if (event->sync && event->sync->ops == &event_sync_ops)
+        {
+            madeira_event_disable_cell( &event->obj );
+            reply->state = ((struct event_sync *)event->sync)->signaled;
+        }
+        release_object( event );
+        return;
+    }
+#endif
 
     if (!(event = get_event_obj( current->process, req->handle, EVENT_MODIFY_STATE ))) return;
     assert( event->sync->ops == &event_sync_ops ); /* never called with inproc syncs */
