@@ -523,6 +523,13 @@ INT WINAPI MessageBoxIndirectW( LPMSGBOXPARAMSW msgbox )
     UINT i;
     struct ThreadWindows threadWindows;
 
+    /* MADEIRA: a program that refuses to start usually says why in a message
+     * box, and on a phone that box can be off-screen, behind the game surface
+     * or dismissed by the next tap.  Put what it says in the exported log. */
+    ERR( "[msgbox] style=%#x caption=%s text=%s\n", (unsigned int)msgbox->dwStyle,
+         IS_INTRESOURCE(msgbox->lpszCaption) ? "(resource)" : debugstr_w(msgbox->lpszCaption),
+         IS_INTRESOURCE(msgbox->lpszText) ? "(resource)" : debugstr_w(msgbox->lpszText) );
+
     if (!(hRes = FindResourceExW(user32_module, (LPWSTR)RT_DIALOG, L"MSGBOX", msgbox->dwLanguageId)))
     {
         if (!msgbox->dwLanguageId ||
