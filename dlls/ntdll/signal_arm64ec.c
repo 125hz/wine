@@ -1348,12 +1348,115 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
     return status;
 }
 
+/* iOS-Madeira ml630 (#79): RESUMING INTO EMULATED x64 CODE.
+ *
+ * A managed runtime handles a null dereference by catching the access violation in a
+ * vectored handler, rewriting CONTEXT.Rip/Rsp to a throw helper and returning
+ * EXCEPTION_CONTINUE_EXECUTION. ntdll's dispatch_exception then calls NtContinue with that
+ * context. The target Rip is EMULATED x64 code, so the resume cannot be a native branch --
+ * the emulator has to be re-entered at the new Rip. On a stock arm64ec host the kernel does
+ * that by redirecting a non-EC resume to KiUserEmulationDispatcher; here the equivalent
+ * bounce lives in ntdll-unix (signal_set_full_context), and it is conditional: it refuses
+ * outright when it does not like the Sp it is handed, and NtContinue then RETURNS.
+ *
+ * A returning NtContinue is the amplifier. dispatch_exception ignores the return value and
+ * falls through to call_seh_handlers and finally NtRaiseException( rec, context, FALSE ) --
+ * which re-dispatches the SAME record with no host fault at all. A single dropped continue
+ * therefore becomes an unbounded software redelivery loop: one observed session took 17 real
+ * host faults but dispatched the identical exception 2,085 times before [redeliv] killed the
+ * task, with the guest Rip pinned at the original faulting address and the handler's
+ * replacement Rip discarded on all 60 iterations that instrumentation could still see.
+ *
+ * Two things here. The classification log is unconditional (sampled) because every probe in
+ * this path was a one-shot cap that had been spent long before the storm started, which is
+ * why 2,025 of those 2,085 iterations were invisible. The re-entry itself is OPT-IN
+ * (MADEIRA_EC_CONTINUE_SIM=1): it is the documented mechanism, and it is exactly what
+ * dispatch_emulation() below does with an already-x64 context, but it changes the resume path
+ * for every guest SEH continue and has not been confirmed on device.
+ */
+static int ec_continue_sim_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        UNICODE_STRING nm, val;
+        WCHAR buf[8];
+        RtlInitUnicodeString( &nm, L"MADEIRA_EC_CONTINUE_SIM" );
+        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+        on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length && buf[0] == '1');
+    }
+    return on;
+}
+
+/* Sampled so a redelivery storm is represented at its TAIL as well as its head: every one of
+ * the first 32, then every power of two. A 2,000-iteration storm costs ~40 lines and the last
+ * one is always printed. */
+static int ec_sample( LONG n )
+{
+    return n <= 32 || !(n & (n - 1));
+}
+
+/* Returns TRUE only if it has entered simulation, in which case it does NOT return. */
+static BOOL ec_continue_into_simulation( CONTEXT *context, BOOLEAN alertable )
+{
+    ARM64EC_NT_CONTEXT *ec = (ARM64EC_NT_CONTEXT *)context;
+    CHPE_V2_CPU_AREA_INFO *cpu;
+    BOOLEAN is_ec;
+    static LONG cont_n;
+    LONG n = InterlockedIncrement( &cont_n );
+
+    if ((context->ContextFlags & CONTEXT_CONTROL) != CONTEXT_CONTROL) return FALSE;
+
+    is_ec = RtlIsEcCode( ec->Pc );
+    cpu = get_arm64ec_cpu_area();
+
+    if (ec_sample( n ))
+        ERR( "[ec-continue] ml630 #%d Rip=%p Rsp=%p is_ec=%d alertable=%d insim=%u sim_knob=%d "
+             "-> %s\n", (int)n, (void *)(ULONG_PTR)ec->Pc, (void *)(ULONG_PTR)ec->Sp,
+             (int)is_ec, (int)alertable, cpu ? cpu->InSimulation : 0, ec_continue_sim_enabled(),
+             (is_ec || alertable || !ec_continue_sim_enabled() || !pBeginSimulation || !cpu)
+                 ? "native resume (ntdll-unix decides whether to bounce)"
+                 : "ENTER SIMULATION here" );
+
+    /* Genuine EC code resumes natively. So does an alertable continue, which must run its APC
+     * check in the syscall first, and anything before the emulator is up. */
+    if (is_ec || alertable || !ec_continue_sim_enabled()) return FALSE;
+    if (!pBeginSimulation || !cpu || !cpu->ContextAmd64) return FALSE;
+
+    *cpu->ContextAmd64 = *ec;
+    cpu->InSimulation = 1;
+    pBeginSimulation();   /* does not return */
+    return TRUE;
+}
+
 NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
+
+    if (ec_continue_into_simulation( context, alertable )) return STATUS_SUCCESS; /* unreached */
 
     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
-    return syscall_NtContinue( &arm_ctx, alertable );
+    status = syscall_NtContinue( &arm_ctx, alertable );
+
+    /* ml630: NtContinue does not return on success. If it did, the guest's
+     * EXCEPTION_CONTINUE_EXECUTION has been dropped and dispatch_exception is about to
+     * re-raise the same record - say so, every time, because this is the start of the storm
+     * and the caller is in ntdll's generic exception.c where we cannot instrument it. */
+    {
+        static LONG fail_n;
+        LONG n = InterlockedIncrement( &fail_n );
+        if (ec_sample( n ))
+            ERR( "[ec-continue] ml630 RETURNED #%d status=%08x Rip=%p Rsp=%p is_ec=%d -- the "
+                 "continue was DROPPED; the caller will now re-raise the same record "
+                 "(set MADEIRA_EC_CONTINUE_SIM=1 to re-enter simulation directly instead)\n",
+                 (int)n, (unsigned int)status,
+                 (void *)(ULONG_PTR)((ARM64EC_NT_CONTEXT *)context)->Pc,
+                 (void *)(ULONG_PTR)((ARM64EC_NT_CONTEXT *)context)->Sp,
+                 (int)RtlIsEcCode( ((ARM64EC_NT_CONTEXT *)context)->Pc ) );
+    }
+    return status;
 }
 
 NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
@@ -3640,7 +3743,18 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
      * through to the dispatchers. RtCS may not return (NtContinueNative). */
     {
         static LONG rtcs_n;
+        /* iOS-Madeira ml630 (#79): THIS GUARD'S BODY WAS ONE STATEMENT.
+         *
+         * The `if (rtcs_n < 40 ...)` below used to have no braces, so its body was just the
+         * `if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)` block - and the `[rtcs] pre`
+         * ERR at the end ran on EVERY exception, uncapped. A single x86-64 session printed
+         * 4,170 of them (two per redelivery) and they were the only uncapped probe left once
+         * [rtcs] post / [ki-path] / [veh] had spent their caps, which made a 2,085-iteration
+         * redelivery storm look like it had changed shape at iteration 60 when all that had
+         * changed was which probes were still printing. Same family as the ml631 dangling
+         * `else` fixed a few lines down. Brace it. */
         if (rtcs_n < 40 && InterlockedIncrement( &rtcs_n ) <= 40)
+        {
             /* ml266 (#47): WHY did the guest fault? Name the guest RIP's memory.
              *
              * FEX's side is correct -- it reconstructs the context and rethrows onto the
@@ -4005,6 +4119,7 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                  (unsigned int)rec->ExceptionCode, rec->ExceptionAddress,
                  (void *)(ULONG_PTR)arm_ctx->Pc, (void *)(ULONG_PTR)context->AMD64_Context.Rip,
                  pResetToConsistentState, get_arm64ec_cpu_area()->InSimulation );
+        }
     }
     if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
     {
@@ -4030,8 +4145,12 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                               sizeof(KiUserExceptionDispatcher_orig) ) != 0;
         if (rec->ExceptionCode == STATUS_ACCESS_VIOLATION)
         {
+            /* ml630 (#79): was a hard cap of 60. A redelivery storm runs thousands of
+             * iterations, so a one-shot cap goes blind exactly when the interesting part
+             * starts - and the resulting gap read as a behavioural change at iteration 60.
+             * Sample instead: all of the first 32, then powers of two. */
             static LONG kipath_n;
-            if (kipath_n < 60 && InterlockedIncrement( &kipath_n ) <= 60)
+            if (ec_sample( InterlockedIncrement( &kipath_n ) ))
                 ERR( "[ki-path] code=%08x ctx=%p Rsp=%p Rip=%p -> %s (patched=%d wow64=%p)\n",
                      (unsigned int)rec->ExceptionCode, context,
                      (void *)(ULONG_PTR)context->AMD64_Context.Rsp,

@@ -1180,6 +1180,7 @@ static void object_sync_unclaim( struct object *obj )
 {
     struct object *sync = get_obj_sync( obj );
     madeira_event_sync_unclaim( sync );
+    madeira_semaphore_sync_unclaim( sync );   /* ml1010; both are ops-checked */
     release_object( sync );
 }
 #endif

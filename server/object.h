@@ -231,6 +231,15 @@ extern void madeira_event_sync_wake_queue( struct object *sync );
 extern int madeira_event_cell_index( struct object *obj, int *manual );
 extern int madeira_event_disable_cell( struct object *obj );
 extern int madeira_fastsync_cells_live(void);
+/* ml1010: the same mechanism for semaphores.  The cell table and its allocator
+ * live in server/event.c; the semaphore half of the protocol lives in
+ * server/semaphore.c. */
+extern int madeira_fastsync_sem_enabled(void);
+extern int madeira_sem_cell_alloc( unsigned int initial, unsigned int max );
+extern void madeira_sem_cell_free( int idx );
+extern void madeira_semaphore_sync_unclaim( struct object *sync );
+extern int madeira_semaphore_cell_index( struct object *obj );
+extern int madeira_semaphore_disable_cell( struct object *obj );
 #endif
 extern void signal_sync( struct object *sync );
 extern void reset_sync( struct object *sync );

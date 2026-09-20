@@ -55,6 +55,25 @@ static int madeira_cell_free_head = -1;
 static int madeira_cell_high;              /* bump allocator watermark */
 static int madeira_cell_live;              /* live cells, reported in the banner */
 static int madeira_fastsync_on = -1;
+static int madeira_fastsync_sem_on = -1;   /* ml1010 MADEIRA_FASTSYNC_SEM       */
+
+static int madeira_fastsync_enabled(void);
+
+/* ml1010: the SEMAPHORE half of the cell table, which is off with one env var
+ * of its own so that a bad semaphore round can be turned off without giving up
+ * the event path that has already shipped and run with desync=0.  Off also
+ * means "allocate no cell at all", so a semaphore is then the pre-ml1010
+ * server object, byte for byte. */
+int madeira_fastsync_sem_enabled(void)
+{
+    if (madeira_fastsync_sem_on < 0)
+    {
+        const char *e = getenv( "MADEIRA_FASTSYNC_SEM" );
+        madeira_fastsync_sem_on = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) ||
+                                         !strcmp( e, "no" ))) ? 0 : 1;
+    }
+    return madeira_fastsync_sem_on && madeira_fastsync_enabled();
+}
 
 static int madeira_fastsync_enabled(void)
 {
@@ -115,8 +134,12 @@ static int madeira_cell_xchg_state( struct madeira_sync_cell *cell, int want )
 }
 
 /* Returns a cell index, or -1 when the fast path is off or the table is full;
- * -1 simply means the event keeps the pre-fastsync, all-server behaviour. */
-static int madeira_cell_alloc( int manual, int signaled )
+ * -1 simply means the object keeps the pre-fastsync, all-server behaviour.
+ *
+ * ml1010: `kind', `smax' and the initial `state' are parameters now, because
+ * semaphore.c allocates through here too.  For an event `state' is
+ * MADEIRA_CELL_SET/_RESET; for a semaphore it is the initial count. */
+static int madeira_cell_alloc_kind( unsigned int kind, int manual, unsigned int smax, int state )
 {
     struct madeira_sync_cell *cell;
     int idx;
@@ -133,18 +156,46 @@ static int madeira_cell_alloc( int manual, int signaled )
 
     cell = &madeira_sync_cells[idx];
     cell->manual      = !!manual;
+    cell->kind        = kind;
+    cell->smax        = smax;
     cell->srv_waiters = 0;
     cell->waiters     = 0;
     /* publish the generation and the state TOGETHER, and LAST: a client can
      * only learn this index through a get_inproc_sync_fd reply, which the
      * server sends strictly after this, and a client that still holds the
-     * PREVIOUS generation can never CAS against the word this store makes. */
-    __atomic_store_n( &cell->sg,
-                      MADEIRA_SG( madeira_cell_next_gen( cell ),
-                                  signaled ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET ),
+     * PREVIOUS generation can never CAS against the word this store makes.
+     * `kind' and `smax' above are immutable for this generation and are
+     * ordered before it by this store, so a client that has matched the
+     * generation has by construction read the right ones. */
+    __atomic_store_n( &cell->sg, MADEIRA_SG( madeira_cell_next_gen( cell ), state ),
                       __ATOMIC_SEQ_CST );
     madeira_cell_live++;
     return idx;
+}
+
+static int madeira_cell_alloc( int manual, int signaled )
+{
+    return madeira_cell_alloc_kind( MADEIRA_CELL_KIND_EVENT, manual, 0,
+                                    signaled ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET );
+}
+
+/* ml1010: semaphore.c's entry points into the allocator above.  The free list
+ * is server-thread-only state that lives here, so it is not duplicated. */
+int madeira_sem_cell_alloc( unsigned int initial, unsigned int max )
+{
+    if (!madeira_fastsync_sem_enabled()) return -1;
+    /* create_semaphore rejects max == 0 and initial > max, and NtCreateSemaphore
+     * rejects max > LONG_MAX before that, so the count always fits the signed
+     * state half.  Check it here anyway rather than trust the caller. */
+    if (!max || max > 0x7fffffffu || initial > max) return -1;
+    return madeira_cell_alloc_kind( MADEIRA_CELL_KIND_SEM, 0, max, (int)initial );
+}
+
+static void madeira_cell_free( int idx );
+
+void madeira_sem_cell_free( int idx )
+{
+    if (idx >= 0) madeira_cell_free( idx );
 }
 
 static void madeira_cell_free( int idx )
@@ -1049,6 +1100,21 @@ DECL_HANDLER(event_op)
             reply->state = ((struct event_sync *)event->sync)->signaled;
         }
         release_object( event );
+        return;
+    }
+    /* ml1010: the same self-heal for a SEMAPHORE.  It has to be answered here,
+     * ahead of get_event_obj(), because the handle is a semaphore handle.  Like
+     * the event opcode above it is accepted on SYNCHRONIZE: the thread that
+     * notices an incoherence is a waiter, and disabling a cell changes no
+     * observable semaphore state (the count is folded back into the server's
+     * own field and stays there). */
+    if (req->op == MADEIRA_SEM_OP_DISABLE)
+    {
+        struct object *obj = get_handle_obj( current->process, req->handle, SYNCHRONIZE, NULL );
+
+        if (!obj) return;
+        madeira_semaphore_disable_cell( obj );
+        release_object( obj );
         return;
     }
 #endif

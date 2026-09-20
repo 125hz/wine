@@ -326,6 +326,16 @@ DECL_HANDLER(get_inproc_sync_fd)
             release_object( obj );
             return;
         }
+        /* ml1010: ... and the same answer for a cell-backed SEMAPHORE.  The
+         * reply needs no new bit: the client reads `kind' (and `max') out of
+         * the cell itself, both of which are immutable for the generation it
+         * validates before touching anything. */
+        if ((idx = madeira_semaphore_cell_index( obj )) >= 0)
+        {
+            reply->type = MADEIRA_FAST_REPLY_FLAG | idx;
+            release_object( obj );
+            return;
+        }
     }
 #endif
 

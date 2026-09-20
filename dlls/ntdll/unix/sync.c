@@ -310,6 +310,7 @@ enum
 static int madeira_fast_mode  = -1;   /* MADEIRA_FS_MODE_*, -1 = not parsed   */
 static int madeira_fast_on    = -1;   /* client wake path active              */
 static int madeira_fast_peek  = 1;    /* MADEIRA_FS_POLLPEEK, default ON      */
+static int madeira_fast_sem   = 1;    /* ml1010 MADEIRA_FASTSYNC_SEM, ON      */
 static int madeira_fast_ready = 0;    /* the parse has happened               */
 
 /* How many event/select operations in one 10 s [srv-stats] window arm the wake
@@ -391,7 +392,7 @@ enum madeira_fast_result
 static void madeira_fast_parse_env(void)
 {
     const char *e = getenv( "MADEIRA_FASTSYNC" );
-    int mode = MADEIRA_FS_MODE_AUTO, peek;
+    int mode = MADEIRA_FS_MODE_AUTO, peek, sem;
 
     if (e)
     {
@@ -410,6 +411,15 @@ static void madeira_fast_parse_env(void)
     peek = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) || !strcmp( e, "no" ))) ? 0 : 1;
     if (mode == MADEIRA_FS_MODE_OFF) peek = 0;
 
+    /* ml1010: the SEMAPHORE path has a knob of its own so it can be turned off
+     * without giving up the event path, which has already shipped and run on a
+     * device with desync=0.  The server parses the identical name and then
+     * allocates no cell for a semaphore at all, so "off" is the pre-ml1010
+     * behaviour on both sides rather than a client-only opt-out. */
+    e = getenv( "MADEIRA_FASTSYNC_SEM" );
+    sem = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) || !strcmp( e, "no" ))) ? 0 : 1;
+    if (mode == MADEIRA_FS_MODE_OFF) sem = 0;
+
     if ((e = getenv( "MADEIRA_FASTSYNC_CAP_US" )))
     {
         unsigned long us = strtoul( e, NULL, 10 );
@@ -425,17 +435,19 @@ static void madeira_fast_parse_env(void)
     }
 
     __atomic_store_n( &madeira_fast_peek, peek, __ATOMIC_RELAXED );
+    __atomic_store_n( &madeira_fast_sem, sem, __ATOMIC_RELAXED );
     __atomic_store_n( &madeira_fast_on, mode == MADEIRA_FS_MODE_ON ? 1 : 0, __ATOMIC_RELAXED );
     __atomic_store_n( &madeira_fast_mode, mode, __ATOMIC_RELAXED );
     if (__atomic_exchange_n( &madeira_fast_ready, 1, __ATOMIC_RELEASE )) return;   /* announce once */
 
-    ERR( "[fastsync] rev=ml990 mode=%s peek=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
+    ERR( "[fastsync] rev=ml1010 mode=%s peek=%s sem=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
          " gen-packed - MADEIRA_FASTSYNC=0|cells|auto|1 selects (auto is the default);"
-         " MADEIRA_FS_POLLPEEK=0 disables the read-only zero-timeout answer\n",
+         " MADEIRA_FS_POLLPEEK=0 disables the read-only zero-timeout answer;"
+         " MADEIRA_FASTSYNC_SEM=0 disables the semaphore path only\n",
          mode == MADEIRA_FS_MODE_OFF   ? "off (pre-ml952)" :
          mode == MADEIRA_FS_MODE_CELLS ? "cells (wake path OFF)" :
          mode == MADEIRA_FS_MODE_AUTO  ? "auto (wake path armed on traffic)" : "on",
-         peek ? "on" : "off",
+         peek ? "on" : "off", sem ? "on" : "off",
          (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)MADEIRA_FAST_CACHE_SIZE,
          (unsigned int)MADEIRA_FAST_SPIN, (unsigned int)(madeira_fast_cap_ns / 1000),
          madeira_fast_auto_reqs );
@@ -459,6 +471,14 @@ static inline int madeira_fast_cells_enabled(void)
 {
     madeira_fast_init();
     return __atomic_load_n( &madeira_fast_mode, __ATOMIC_RELAXED ) > MADEIRA_FS_MODE_OFF;
+}
+
+/* ml1010: "may this call touch a SEMAPHORE cell at all".  Every semaphore site
+ * tests this in addition to the mode test that applies to events. */
+static inline int madeira_fast_sem_enabled(void)
+{
+    madeira_fast_init();
+    return __atomic_load_n( &madeira_fast_sem, __ATOMIC_RELAXED );
 }
 
 /* ml982: the "auto" rule.  Called once per [srv-stats] window from
@@ -681,7 +701,8 @@ void madeira_fast_flush_pid(void)
  * freed and handed to an entirely different event while the caller is parked
  * on it, and the state word alone cannot tell the two apart. */
 static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK access,
-                                                      unsigned int *manual, unsigned int *gen_out )
+                                                      unsigned int *manual, unsigned int *gen_out,
+                                                      unsigned int *kind_out )
 {
     unsigned int h = wine_server_obj_handle( handle );
     unsigned int pid = madeira_fast_pid();
@@ -727,8 +748,18 @@ static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK
              * but check anyway rather than mutate a stranger's event */
             if (MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_ACQUIRE ) ) == gen)
             {
+                /* ml1010: `kind' comes out of the CELL, not the cache, because
+                 * it is immutable for this generation and the load above is
+                 * exactly the proof that the generation is still ours.  A
+                 * semaphore cell reached with the semaphore path turned off
+                 * must look like "no cell" so that every caller keeps the
+                 * server path it had before ml1010. */
+                unsigned int kind = madeira_cell_kind( cell );
+
+                if (kind == MADEIRA_CELL_KIND_SEM && !madeira_fast_sem_enabled()) return NULL;
                 *manual = man;
                 *gen_out = gen;
+                *kind_out = kind;
                 return cell;
             }
             ios_srv_nt_count( IOS_FS_STALE_GEN );
@@ -797,12 +828,18 @@ static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK
     }
     ios_srv_nt_count( IOS_FS_LEARN_EVENT );
     cell = &madeira_sync_cells[idx];
-    /* the handle we hold pins the event, which pins the cell, so this
+    /* the handle we hold pins the object, which pins the cell, so this
      * generation cannot go stale between here and the store below */
     gen  = MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_ACQUIRE ) );
     madeira_fast_publish( e, h, pid, idx, gen, acc, man );
 
     if ((acc & access) != access) return NULL;
+    {
+        unsigned int kind = madeira_cell_kind( cell );
+
+        if (kind == MADEIRA_CELL_KIND_SEM && !madeira_fast_sem_enabled()) return NULL;
+        *kind_out = kind;
+    }
     *manual = man;
     *gen_out = gen;
     return cell;
@@ -838,11 +875,34 @@ static inline int madeira_cell_alive( const struct madeira_sync_cell *cell, unsi
  * establishes "at this instant the cell was mine AND it was SET", which the
  * ml982 pair of a separate alive-check plus a separate state load could not. */
 static inline int madeira_fast_try( struct madeira_sync_cell *cell, unsigned int manual,
-                                    unsigned int gen )
+                                    unsigned int gen, unsigned int kind )
 {
     uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
 
     if (MADEIRA_SG_GEN( sg ) != gen) return 0;
+    /* ml1010: a SEMAPHORE's state half is its COUNT, so "is there a token" is
+     * `count > 0' and taking one is a decrement -- but everything else is the
+     * event argument unchanged, because the generation rides in the same CAS.
+     * The retry loop exists because a concurrent release (another client, or
+     * the server) changes the word without invalidating our claim to a token:
+     * losing the CAS to a +n must not be reported as "not signaled".
+     *
+     * A count is never "already ours to keep" the way a manual-reset event's
+     * state is, so a semaphore always CASes. */
+    if (kind == MADEIRA_CELL_KIND_SEM)
+    {
+        for (;;)
+        {
+            int cur = MADEIRA_SG_STATE( sg );
+
+            if (cur <= 0) return 0;              /* empty, or DISABLED (-1) */
+            if (__atomic_compare_exchange_n( &cell->sg, &sg,
+                                             MADEIRA_SG( gen, cur - 1 ), 0,
+                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+                return 1;
+            if (MADEIRA_SG_GEN( sg ) != gen) return 0;   /* recycled under us */
+        }
+    }
     if (MADEIRA_SG_STATE( sg ) != MADEIRA_CELL_SET) return 0;
     if (manual) return 1;
     return __atomic_compare_exchange_n( &cell->sg, &sg,
@@ -850,17 +910,92 @@ static inline int madeira_fast_try( struct madeira_sync_cell *cell, unsigned int
                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
 }
 
+/* ml1010: NtReleaseSemaphore's whole arithmetic, done on the cell.
+ *
+ * Returns MADEIRA_FAST_MISS to hand the call to the server, MADEIRA_FAST_DONE
+ * when the release is complete, or MADEIRA_FAST_SERVER when the cell is
+ * already updated but the server still has to re-run its own wait queue.
+ * *status carries STATUS_SEMAPHORE_LIMIT_EXCEEDED for an overflow, which is
+ * answered here because the answer is "change nothing" and the cell holds
+ * everything needed to decide it.
+ *
+ * The overflow rule is upstream release_semaphore()'s, read off the same two
+ * numbers: count + n must not pass max.  `max' comes out of the cell (it is
+ * written before the generation that publishes the cell and never changes), so
+ * no extra server state is consulted.  On the error path *previous is NOT
+ * written, which is what the server path does too -- NtReleaseSemaphore only
+ * copies reply->prev_count when wine_server_call() succeeded. */
+static enum madeira_fast_result madeira_fast_sem_release( HANDLE handle, ULONG count,
+                                                          ULONG *previous, unsigned int *status )
+{
+    struct madeira_sync_cell *cell;
+    unsigned int manual = 0, gen = 0, kind = 0, max;
+    uint64_t sg;
+    int cur;
+
+    *status = STATUS_SUCCESS;
+    if (!madeira_fastsync_enabled() || !madeira_fast_sem_enabled()) return MADEIRA_FAST_MISS;
+    if (!(cell = madeira_fast_lookup( handle, SEMAPHORE_MODIFY_STATE, &manual, &gen, &kind )))
+        return MADEIRA_FAST_MISS;
+    if (kind != MADEIRA_CELL_KIND_SEM) return MADEIRA_FAST_MISS;
+
+    max = __atomic_load_n( &cell->smax, __ATOMIC_RELAXED );
+    if (!max || max > 0x7fffffffu) return MADEIRA_FAST_MISS;   /* cannot happen; do not trust it */
+
+    for (;;)
+    {
+        sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+        if (MADEIRA_SG_GEN( sg ) != gen) return MADEIRA_FAST_MISS;
+        cur = MADEIRA_SG_STATE( sg );
+        if (cur < 0) return MADEIRA_FAST_MISS;                 /* DISABLED */
+        if (count > max || (unsigned int)cur + count > max)
+        {
+            *status = STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+            return MADEIRA_FAST_DONE;                          /* no state change */
+        }
+        if (__atomic_compare_exchange_n( &cell->sg, &sg,
+                                         MADEIRA_SG( gen, cur + (int)count ), 0,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+            break;
+    }
+    if (previous) *previous = (ULONG)cur;
+    ios_srv_nt_count( IOS_FS_SEM_REL );
+
+    /* Dekker, client half #2: the CAS above and this load are both seq_cst, and
+     * a parking waiter does `waiters++; load count' with the same ordering, so
+     * the two cannot miss each other.  Wake one for a single token and all for
+     * a burst; a waiter woken with nothing left for it simply re-parks. */
+    if (count && __atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
+    {
+        madeira_fast_wake( madeira_cell_futex( cell ), count > 1 );
+        ios_srv_nt_count( IOS_NT_FAST_WAKE );
+    }
+
+    /* Dekker, client half #1: if the server has anybody queued on this object
+     * it is the only thing that can wake them, so a request still has to go --
+     * and it is `release_semaphore' with a count of ZERO, which changes nothing
+     * and runs wake_up( obj, 0 ).  Releasing again here would mint a second set
+     * of tokens out of one ReleaseSemaphore, which is the ml952 double-release
+     * bug in its semaphore form. */
+    if (count && __atomic_load_n( &cell->srv_waiters, __ATOMIC_SEQ_CST ))
+        return MADEIRA_FAST_SERVER;
+    return MADEIRA_FAST_DONE;
+}
+
 /* NtSetEvent / NtResetEvent. */
 static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, LONG *prev_state )
 {
     struct madeira_sync_cell *cell;
-    unsigned int manual = 0, gen = 0;
+    unsigned int manual = 0, gen = 0, kind = 0;
     int want = set ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET;
     int prev;
 
     if (!madeira_fastsync_enabled()) return MADEIRA_FAST_MISS;
-    if (!(cell = madeira_fast_lookup( handle, EVENT_MODIFY_STATE, &manual, &gen )))
+    if (!(cell = madeira_fast_lookup( handle, EVENT_MODIFY_STATE, &manual, &gen, &kind )))
         return MADEIRA_FAST_MISS;
+    /* ml1010: NtSetEvent on a semaphore handle is a type error the server has
+     * to raise, and a cell of the wrong kind must never be written here. */
+    if (kind != MADEIRA_CELL_KIND_EVENT) return MADEIRA_FAST_MISS;
 
     for (;;)
     {
@@ -975,6 +1110,9 @@ static inline int madeira_peek_cell( struct madeira_sync_cell *cell, unsigned in
     if (!madeira_peek_budget()) return 0;
     sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
     if (MADEIRA_SG_GEN( sg ) != gen) return 0;
+    /* MADEIRA_CELL_RESET is 0, which for a SEMAPHORE cell is exactly "the
+     * count is empty" -- the same value and the same meaning, so this test
+     * needs no kind of its own.  Every other value goes to the server. */
     if (MADEIRA_SG_STATE( sg ) != MADEIRA_CELL_RESET) return 0;
     ios_srv_nt_count( IOS_FS_POLLPEEK );
     return 1;
@@ -992,7 +1130,7 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
                                    const LARGE_INTEGER **fallback, LARGE_INTEGER *store )
 {
     struct madeira_sync_cell *cell;
-    unsigned int manual = 0, gen = 0;
+    unsigned int manual = 0, gen = 0, kind = 0;
     unsigned long long t0, spent = 0, budget_ns;
     int i, st, rounds;
 
@@ -1003,17 +1141,18 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
          * it is the only thing this function may do in that mode. */
         if (timeout && !timeout->QuadPart && madeira_fast_cells_enabled() &&
             __atomic_load_n( &madeira_fast_peek, __ATOMIC_RELAXED ) &&
-            (cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )) &&
+            (cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen, &kind )) &&
             madeira_peek_cell( cell, gen ))
             return STATUS_TIMEOUT;
         return STATUS_NOT_IMPLEMENTED;
     }
-    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )))
+    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen, &kind )))
         return STATUS_NOT_IMPLEMENTED;
 
-    if (madeira_fast_try( cell, manual, gen ))
+    if (madeira_fast_try( cell, manual, gen, kind ))
     {
         ios_srv_nt_count( IOS_NT_FAST_HIT );
+        if (kind == MADEIRA_CELL_KIND_SEM) ios_srv_nt_count( IOS_FS_SEM_WAIT );
         return STATUS_SUCCESS;
     }
 
@@ -1032,9 +1171,10 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
     for (i = 0; i < MADEIRA_FAST_SPIN; i++)
     {
         __asm__ __volatile__( "isb" ::: "memory" );
-        if (madeira_fast_try( cell, manual, gen ))
+        if (madeira_fast_try( cell, manual, gen, kind ))
         {
             ios_srv_nt_count( IOS_NT_FAST_HIT );
+            if (kind == MADEIRA_CELL_KIND_SEM) ios_srv_nt_count( IOS_FS_SEM_WAIT );
             return STATUS_SUCCESS;
         }
     }
@@ -1115,11 +1255,21 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
         __atomic_sub_fetch( &cell->waiters, 1, __ATOMIC_SEQ_CST );
 
         /* DISABLED (pulsed/freed) or CLAIMED (a server-side waiter is being
-         * handed this token right now) both mean "queue with the server". */
-        if (st != MADEIRA_CELL_RESET && st != MADEIRA_CELL_SET) break;
-        if (madeira_fast_try( cell, manual, gen ))
+         * handed this token right now) both mean "queue with the server".
+         *
+         * ml1010: for a SEMAPHORE cell there is no CLAIMED -- 2 is a count of
+         * two -- so the only value that means "go to the server" is the
+         * negative one, and every non-negative count is a legal state to keep
+         * trying from. */
+        if (kind == MADEIRA_CELL_KIND_SEM)
+        {
+            if (st < 0) break;
+        }
+        else if (st != MADEIRA_CELL_RESET && st != MADEIRA_CELL_SET) break;
+        if (madeira_fast_try( cell, manual, gen, kind ))
         {
             ios_srv_nt_count( IOS_NT_FAST_HIT );
+            if (kind == MADEIRA_CELL_KIND_SEM) ios_srv_nt_count( IOS_FS_SEM_WAIT );
             return STATUS_SUCCESS;
         }
     }
@@ -1210,12 +1360,15 @@ static int madeira_desync_logged;
 /* Take one object out of the fast path for good.  Best effort: a failure here
  * (a handle that has meanwhile been closed, say) leaves the object exactly as
  * it was, which is the state we were already coping with. */
-static void madeira_fast_demote( HANDLE handle )
+static void madeira_fast_demote( HANDLE handle, unsigned int kind )
 {
     SERVER_START_REQ( event_op )
     {
         req->handle = wine_server_obj_handle( handle );
-        req->op     = MADEIRA_EVENT_OP_DISABLE;
+        /* ml1010: the semaphore opcode is answered ahead of event_op's own
+         * object-type check, because the handle is a semaphore handle. */
+        req->op     = (kind == MADEIRA_CELL_KIND_SEM) ? MADEIRA_SEM_OP_DISABLE
+                                                      : MADEIRA_EVENT_OP_DISABLE;
         wine_server_call( req );
     }
     SERVER_END_REQ;
@@ -1228,13 +1381,13 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
                                                  const union select_op *op, data_size_t size )
 {
     struct madeira_sync_cell *cell;
-    unsigned int manual = 0, gen = 0, ret;
+    unsigned int manual = 0, gen = 0, kind = 0, ret;
     LARGE_INTEGER zero;
     int st, st2;
 
     ios_srv_nt_count( IOS_FS_WATCHDOG );
-    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )))
-        return STATUS_NOT_IMPLEMENTED;             /* not a cell event any more */
+    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen, &kind )))
+        return STATUS_NOT_IMPLEMENTED;             /* not a cell object any more */
 
     {
         uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
@@ -1243,8 +1396,12 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
     }
     /* RESET is the coherent answer and DISABLED means the server is already
      * authoritative; CLAIMED is a token in flight on the server thread, which
-     * resolves in nanoseconds and is nobody's hang. */
-    if (st != MADEIRA_CELL_SET) return STATUS_NOT_IMPLEMENTED;
+     * resolves in nanoseconds and is nobody's hang.
+     *
+     * ml1010: for a SEMAPHORE the same question is "the cell says there is a
+     * token (count > 0) while this thread is still waiting", i.e. st > 0. */
+    if (kind == MADEIRA_CELL_KIND_SEM) { if (st <= 0) return STATUS_NOT_IMPLEMENTED; }
+    else if (st != MADEIRA_CELL_SET) return STATUS_NOT_IMPLEMENTED;
 
     /* Second opinion, and the cure if there is nothing wrong. */
     zero.QuadPart = 0;
@@ -1254,22 +1411,27 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
     {
         uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
         st2 = MADEIRA_SG_STATE( sg );
-        if (MADEIRA_SG_GEN( sg ) != gen || st2 != MADEIRA_CELL_SET)
-            return STATUS_NOT_IMPLEMENTED;         /* somebody consumed it: fine */
+        if (MADEIRA_SG_GEN( sg ) != gen) return STATUS_NOT_IMPLEMENTED;
+        if (kind == MADEIRA_CELL_KIND_SEM)
+        {
+            if (st2 <= 0) return STATUS_NOT_IMPLEMENTED;   /* somebody consumed it: fine */
+        }
+        else if (st2 != MADEIRA_CELL_SET) return STATUS_NOT_IMPLEMENTED;
     }
 
     ios_srv_nt_count( IOS_FS_DESYNC );
     if (!__atomic_exchange_n( &madeira_desync_logged, 1, __ATOMIC_RELAXED ))
-        ERR( "[fastsync] DESYNC handle=%p cell=%d gen=%u state=%d/%d waiters=%d srv_waiters=%d "
-             "manual=%u - the server reports this object NOT signaled while the shared cell "
-             "says SET; demoting it to the server path permanently.  Further occurrences are "
-             "counted as desync= in [srv-stats].\n",
-             handle, (int)(cell - madeira_sync_cells),
+        ERR( "[fastsync] DESYNC handle=%p kind=%s cell=%d gen=%u state=%d/%d waiters=%d "
+             "srv_waiters=%d manual=%u - the server reports this object NOT signaled while "
+             "the shared cell says signaled; demoting it to the server path permanently.  "
+             "Further occurrences are counted as desync= in [srv-stats].\n",
+             handle, kind == MADEIRA_CELL_KIND_SEM ? "sem" : "event",
+             (int)(cell - madeira_sync_cells),
              MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_RELAXED ) ), st, st2,
              __atomic_load_n( &cell->waiters, __ATOMIC_RELAXED ),
              __atomic_load_n( &cell->srv_waiters, __ATOMIC_RELAXED ), manual );
 
-    madeira_fast_demote( handle );
+    madeira_fast_demote( handle, kind );
     return STATUS_NOT_IMPLEMENTED;                 /* re-wait, now on the server */
 }
 
@@ -1279,13 +1441,14 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
 static unsigned int madeira_fast_watched_wait( const union select_op *op, data_size_t size,
                                                unsigned int flags, HANDLE handle )
 {
-    unsigned int ms = MADEIRA_FS_WATCH_MS_FIRST, ret, manual = 0, gen = 0;
+    unsigned int ms = MADEIRA_FS_WATCH_MS_FIRST, ret, manual = 0, gen = 0, kind = 0;
 
-    /* Only a cell-backed event can desync, and only an event is worth waking a
-     * parked thread for.  A wait on a thread, a process, a mutex, a semaphore,
-     * a timer or a file keeps the plain infinite wait it always had -- this is
-     * answered from the negative cache, so it is a couple of loads. */
-    if (!madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen ))
+    /* Only a cell-backed object can desync, and only one is worth waking a
+     * parked thread for.  A wait on a thread, a process, a mutex, a timer or a
+     * file keeps the plain infinite wait it always had -- this is answered from
+     * the negative cache, so it is a couple of loads.  ml1010 adds semaphores
+     * to the set that gets the heartbeat. */
+    if (!madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen, &kind ))
         return server_wait( op, size, flags, NULL );
 
     for (;;)
@@ -2218,6 +2381,35 @@ NTSTATUS WINAPI NtQuerySemaphore( HANDLE handle, SEMAPHORE_INFORMATION_CLASS cla
 
     if (len != sizeof(SEMAPHORE_BASIC_INFORMATION)) return STATUS_INFO_LENGTH_MISMATCH;
 
+#ifdef WINE_IOS
+    /* ml1010: answer from the cell.  This is a pure READ of the word that IS
+     * the server's own count -- semaphore_sync_signaled() and the server's
+     * release_semaphore() read and write this same address -- so it is the
+     * same fact the server would have reported, not a second opinion.  It
+     * consumes nothing, so none of the lost-wakeup reasoning applies and it
+     * needs no peek budget; it is gated only on the semaphore path being on. */
+    if (madeira_fast_cells_enabled() && madeira_fast_sem_enabled())
+    {
+        struct madeira_sync_cell *cell;
+        unsigned int manual = 0, gen = 0, kind = 0;
+
+        if ((cell = madeira_fast_lookup( handle, SEMAPHORE_QUERY_STATE, &manual, &gen, &kind )) &&
+            kind == MADEIRA_CELL_KIND_SEM)
+        {
+            uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+
+            if (MADEIRA_SG_GEN( sg ) == gen && MADEIRA_SG_STATE( sg ) >= 0)
+            {
+                out->CurrentCount = MADEIRA_SG_STATE( sg );
+                out->MaximumCount = __atomic_load_n( &cell->smax, __ATOMIC_RELAXED );
+                if (ret_len) *ret_len = sizeof(SEMAPHORE_BASIC_INFORMATION);
+                ios_srv_nt_count( IOS_NT_FAST_HIT );
+                return STATUS_SUCCESS;
+            }
+        }
+    }
+#endif
+
     if ((ret = inproc_query_semaphore( handle, out )) != STATUS_NOT_IMPLEMENTED)
     {
         if (!ret && ret_len) *ret_len = sizeof(SEMAPHORE_BASIC_INFORMATION);
@@ -2245,10 +2437,39 @@ NTSTATUS WINAPI NtQuerySemaphore( HANDLE handle, SEMAPHORE_INFORMATION_CLASS cla
 NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous )
 {
     unsigned int ret;
+#ifdef WINE_IOS
+    int wake_only = 0;
+#endif
 
     TRACE( "handle %p, count %u, prev_count %p\n", handle, count, previous );
 
     ios_srv_nt_count( IOS_NT_RELEASE_SEM );
+
+#ifdef WINE_IOS
+    {
+        unsigned int fast_status = STATUS_SUCCESS;
+
+        switch (madeira_fast_sem_release( handle, count, previous, &fast_status ))
+        {
+        case MADEIRA_FAST_DONE:
+            ios_srv_nt_count( IOS_NT_FAST_HIT );
+            return fast_status;
+        case MADEIRA_FAST_SERVER:
+            /* The cell (and *previous) are already right, so this request must
+             * NOT release again -- a fast waiter may have taken a token in the
+             * meantime and a second server-side release on top of that hands
+             * out tokens nobody produced.  A count of ZERO is upstream's own
+             * "change nothing, then wake_up( obj, 0 )", which is exactly the
+             * re-evaluation the server's queue needs.  See ios_fastsync.h. */
+            ios_srv_nt_count( IOS_NT_FAST_MISS );
+            previous  = NULL;
+            wake_only = 1;
+            break;
+        default:
+            break;
+        }
+    }
+#endif
 
     if ((ret = inproc_release_semaphore( handle, count, previous )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -2256,7 +2477,11 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous 
     SERVER_START_REQ( release_semaphore )
     {
         req->handle = wine_server_obj_handle( handle );
+#ifdef WINE_IOS
+        req->count  = wake_only ? 0 : count;
+#else
         req->count  = count;
+#endif
         if (!(ret = wine_server_call( req )))
         {
             if (previous) *previous = reply->prev_count;
