@@ -365,18 +365,33 @@ enum madeira_fast_result
  * here; `madeira_fast_ready' only stops the getenv work happening on the hot
  * path, it is not a mutual-exclusion flag.
  *
- * The DEFAULT IS THE MIDDLE RUNG: cells on, the client WAKE path off.  ml952
- * shipped the wake path on by default and three unrelated programs died the
- * same way on the first device snapshot; ml962 inverted the opt-in; ml972
- * fixed four more defects and was never run on a device.  So the wake path
- * stays opt-in, and what ships on is the half that cannot lose a wakeup
- * because it never takes one: a read-only answer to a zero-timeout wait whose
- * cell word reads RESET.  That half alone is a third of the measured traffic.
+ * ml990: THE DEFAULT IS NOW "auto" -- cells on, and the client WAKE path armed
+ * the first time this task's own [srv-stats] window shows more than
+ * MADEIRA_FS_AUTO_REQS event+select operations in 10 s.  The history that kept
+ * it at the middle rung: ml952 shipped the wake path on unconditionally and
+ * three unrelated programs died the same way on the first device snapshot;
+ * ml962 inverted the opt-in; ml972 fixed four defects and was never run on a
+ * device; ml982 audited it, shipped the read-only peek on, and named two
+ * reasons not to arm the wake path by default.  Both are now answered:
+ *
+ *  - the lost-wakeup vector (a state CAS that was not atomic with the
+ *    generation check) is gone -- the generation is INSIDE the word the CAS
+ *    compares, see ios_fastsync.h;
+ *  - it has now run on a device.  Log y104 armed it through a 32-bit
+ *    job-system title ("[fastsync] AUTO-ENABLED after 181468 event/select ops
+ *    in 10000ms") and reported desync=0, stale_gen=0 and relearn=0 in every
+ *    window, with total server traffic falling from 15296/s to ~5200/s.
+ *
+ * The arm is deliberately still conditional rather than unconditional: a quiet
+ * process (a launcher, an installer, a helper) never reaches the threshold and
+ * therefore never exercises the wake semantics at all, which keeps the class of
+ * program that died on the ml952 snapshot on the path it survives.
+ * MADEIRA_FASTSYNC=0 forces everything off, cells included.
  */
 static void madeira_fast_parse_env(void)
 {
     const char *e = getenv( "MADEIRA_FASTSYNC" );
-    int mode = MADEIRA_FS_MODE_CELLS, peek;
+    int mode = MADEIRA_FS_MODE_AUTO, peek;
 
     if (e)
     {
@@ -386,6 +401,8 @@ static void madeira_fast_parse_env(void)
             mode = MADEIRA_FS_MODE_ON;
         else if (!strcmp( e, "auto" ))
             mode = MADEIRA_FS_MODE_AUTO;
+        else if (!strcmp( e, "cells" ))
+            mode = MADEIRA_FS_MODE_CELLS;   /* ml990: the old default, still reachable */
     }
 
     /* the peek needs a cell to read, so "off" turns it off whatever it says */
@@ -412,9 +429,9 @@ static void madeira_fast_parse_env(void)
     __atomic_store_n( &madeira_fast_mode, mode, __ATOMIC_RELAXED );
     if (__atomic_exchange_n( &madeira_fast_ready, 1, __ATOMIC_RELEASE )) return;   /* announce once */
 
-    ERR( "[fastsync] rev=ml982 mode=%s peek=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
-         " - MADEIRA_FASTSYNC=0|auto|1 selects; MADEIRA_FS_POLLPEEK=0 disables the"
-         " read-only zero-timeout answer\n",
+    ERR( "[fastsync] rev=ml990 mode=%s peek=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
+         " gen-packed - MADEIRA_FASTSYNC=0|cells|auto|1 selects (auto is the default);"
+         " MADEIRA_FS_POLLPEEK=0 disables the read-only zero-timeout answer\n",
          mode == MADEIRA_FS_MODE_OFF   ? "off (pre-ml952)" :
          mode == MADEIRA_FS_MODE_CELLS ? "cells (wake path OFF)" :
          mode == MADEIRA_FS_MODE_AUTO  ? "auto (wake path armed on traffic)" : "on",
@@ -708,7 +725,7 @@ static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK
             /* the cell may have been freed and handed to another event since
              * we cached it; that can only happen after this handle was closed,
              * but check anyway rather than mutate a stranger's event */
-            if (__atomic_load_n( &cell->gen, __ATOMIC_ACQUIRE ) == gen)
+            if (MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_ACQUIRE ) ) == gen)
             {
                 *manual = man;
                 *gen_out = gen;
@@ -782,7 +799,7 @@ static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK
     cell = &madeira_sync_cells[idx];
     /* the handle we hold pins the event, which pins the cell, so this
      * generation cannot go stale between here and the store below */
-    gen  = __atomic_load_n( &cell->gen, __ATOMIC_ACQUIRE );
+    gen  = MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_ACQUIRE ) );
     madeira_fast_publish( e, h, pid, idx, gen, acc, man );
 
     if ((acc & access) != access) return NULL;
@@ -798,22 +815,38 @@ static struct madeira_sync_cell *madeira_fast_lookup( HANDLE handle, ACCESS_MASK
  * (possibly) already been handed to another event.  Every operation that can
  * observe the cell AFTER an unbounded pause -- i.e. after a park -- has to ask
  * again, because the state word of the NEW occupant is a perfectly ordinary
- * RESET/SET and is indistinguishable from the old one's. */
+ * RESET/SET and is indistinguishable from the old one's.
+ *
+ * ml990: this is now only for the places that need the question ON ITS OWN --
+ * across a park, and in the watchdog.  Every place that reads or writes the
+ * STATE gets the generation out of the same 64-bit load or CAS instead, which
+ * is what closes the ml982 residual: there is no longer a gap between "is it
+ * mine" and "take it". */
 static inline int madeira_cell_alive( const struct madeira_sync_cell *cell, unsigned int gen )
 {
-    return __atomic_load_n( &cell->gen, __ATOMIC_ACQUIRE ) == gen;
+    return MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_ACQUIRE ) ) == gen;
 }
 
 /* Take the token if there is one.  A manual-reset event is never consumed; an
  * auto-reset one is consumed with a CAS, which is what makes "exactly one
- * waiter is released" true no matter how many threads and the server race. */
-static inline int madeira_fast_try( struct madeira_sync_cell *cell, unsigned int manual )
+ * waiter is released" true no matter how many threads and the server race.
+ *
+ * ml990: `gen' is now part of the comparison, in the SAME atomic operation as
+ * the state.  For an auto-reset event that means the CAS cannot succeed
+ * against a cell that changed owner since the load, so a token can never be
+ * taken out of a stranger's event; for a manual-reset one the single load
+ * establishes "at this instant the cell was mine AND it was SET", which the
+ * ml982 pair of a separate alive-check plus a separate state load could not. */
+static inline int madeira_fast_try( struct madeira_sync_cell *cell, unsigned int manual,
+                                    unsigned int gen )
 {
-    int st = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+    uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
 
-    if (st != MADEIRA_CELL_SET) return 0;
+    if (MADEIRA_SG_GEN( sg ) != gen) return 0;
+    if (MADEIRA_SG_STATE( sg ) != MADEIRA_CELL_SET) return 0;
     if (manual) return 1;
-    return __atomic_compare_exchange_n( &cell->state, &st, MADEIRA_CELL_RESET, 0,
+    return __atomic_compare_exchange_n( &cell->sg, &sg,
+                                        MADEIRA_SG( gen, MADEIRA_CELL_RESET ), 0,
                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
 }
 
@@ -831,13 +864,22 @@ static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, L
 
     for (;;)
     {
+        uint64_t sg;
+
         /* ml972: a freed cell passes through DISABLED, but the server can
          * re-allocate it to another event before we look, and then the word
          * reads as an ordinary RESET/SET.  The generation is the only thing
          * that separates "my event" from "the event that got my cell", so test
-         * it on every attempt rather than trusting DISABLED to still be there. */
-        if (!madeira_cell_alive( cell, gen )) return MADEIRA_FAST_MISS;
-        prev = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+         * it on every attempt rather than trusting DISABLED to still be there.
+         *
+         * ml990: the test is now the SAME LOAD as the state read, and its
+         * result is carried into the CAS below as the expected value -- so a
+         * recycle between the two can no longer let this store land on a
+         * stranger's event.  That was the last lost-wakeup vector, and it is
+         * why the wake path can now default on. */
+        sg   = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+        if (MADEIRA_SG_GEN( sg ) != gen) return MADEIRA_FAST_MISS;
+        prev = MADEIRA_SG_STATE( sg );
         if (prev == MADEIRA_CELL_DISABLED) return MADEIRA_FAST_MISS;  /* pulsed, or freed */
         /* ml962: MADEIRA_CELL_CLAIMED means the server has decided, inside
          * event_sync_signaled(), to hand this auto-reset token to one of its
@@ -850,7 +892,7 @@ static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, L
          * event_op below is applied strictly after the claim is resolved. */
         if (prev == MADEIRA_CELL_CLAIMED) return MADEIRA_FAST_MISS;
         if (prev == want) break;                                      /* no transition */
-        if (__atomic_compare_exchange_n( &cell->state, &prev, want, 0,
+        if (__atomic_compare_exchange_n( &cell->sg, &sg, MADEIRA_SG( gen, want ), 0,
                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST )) break;
     }
     if (prev_state) *prev_state = (prev != MADEIRA_CELL_RESET);
@@ -864,7 +906,7 @@ static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, L
      * ordering, so the two cannot miss each other. */
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
     {
-        madeira_fast_wake( &cell->state, manual );
+        madeira_fast_wake( madeira_cell_futex( cell ), manual );
         ios_srv_nt_count( IOS_NT_FAST_WAKE );
     }
 
@@ -918,16 +960,22 @@ static inline int madeira_peek_budget(void)
     return (s & (MADEIRA_FS_PEEK_EVERY - 1)) != 0;    /* 0 = send this one to the server */
 }
 
-/* "is this cell provably NOT signaled right now?"  The generation is re-read
- * AFTER the state word on purpose: gen moves on every free and every alloc, so
- * an unchanged gen either side of the load proves no recycle happened across
- * it and therefore that the RESET we saw belonged to OUR event. */
+/* "is this cell provably NOT signaled right now?"
+ *
+ * ml982 read the state word and then re-read `gen' after it, so that an
+ * unchanged generation either side of the load proved no recycle had happened
+ * across it.  ml990 gets both out of ONE load, which is the same proof without
+ * the sandwich: at the instant of that load the cell carried our generation
+ * and read RESET, so the RESET was our event's. */
 static inline int madeira_peek_cell( struct madeira_sync_cell *cell, unsigned int gen )
 {
+    uint64_t sg;
+
     if (!__atomic_load_n( &madeira_fast_peek, __ATOMIC_RELAXED )) return 0;
     if (!madeira_peek_budget()) return 0;
-    if (__atomic_load_n( &cell->state, __ATOMIC_SEQ_CST ) != MADEIRA_CELL_RESET) return 0;
-    if (!madeira_cell_alive( cell, gen )) return 0;
+    sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+    if (MADEIRA_SG_GEN( sg ) != gen) return 0;
+    if (MADEIRA_SG_STATE( sg ) != MADEIRA_CELL_RESET) return 0;
     ios_srv_nt_count( IOS_FS_POLLPEEK );
     return 1;
 }
@@ -963,7 +1011,7 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
     if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )))
         return STATUS_NOT_IMPLEMENTED;
 
-    if (madeira_fast_try( cell, manual ))
+    if (madeira_fast_try( cell, manual, gen ))
     {
         ios_srv_nt_count( IOS_NT_FAST_HIT );
         return STATUS_SUCCESS;
@@ -984,7 +1032,7 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
     for (i = 0; i < MADEIRA_FAST_SPIN; i++)
     {
         __asm__ __volatile__( "isb" ::: "memory" );
-        if (madeira_fast_try( cell, manual ))
+        if (madeira_fast_try( cell, manual, gen ))
         {
             ios_srv_nt_count( IOS_NT_FAST_HIT );
             return STATUS_SUCCESS;
@@ -1012,13 +1060,24 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
         if (spent >= budget_ns) break;
 
         __atomic_add_fetch( &cell->waiters, 1, __ATOMIC_SEQ_CST );
-        st = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+        {
+            /* ml990: one load answers both "is it still mine" and "what is the
+             * state", so a cell recycled between the two can no longer make
+             * this thread park on a stranger's futex word believing it is its
+             * own.  A generation mismatch here takes the same exit as a
+             * mismatch after the park: leave `waiters' alone (it now belongs
+             * to the new occupant's count) and hand the wait to the server. */
+            uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+
+            if (MADEIRA_SG_GEN( sg ) != gen) break;
+            st = MADEIRA_SG_STATE( sg );
+        }
         if (st == MADEIRA_CELL_RESET)
         {
             ios_srv_nt_count( IOS_NT_FAST_SLEEP );
             /* the value is re-tested inside the syscall, so a set landing
              * between the load above and here does not sleep */
-            madeira_fast_park( &cell->state, MADEIRA_CELL_RESET, budget_ns - spent );
+            madeira_fast_park( madeira_cell_futex( cell ), MADEIRA_CELL_RESET, budget_ns - spent );
         }
 
         /* ml972 DEFECT 2: THE PARK IS THE ONE UNBOUNDED PAUSE IN HERE, AND THE
@@ -1058,7 +1117,7 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
         /* DISABLED (pulsed/freed) or CLAIMED (a server-side waiter is being
          * handed this token right now) both mean "queue with the server". */
         if (st != MADEIRA_CELL_RESET && st != MADEIRA_CELL_SET) break;
-        if (madeira_fast_try( cell, manual ))
+        if (madeira_fast_try( cell, manual, gen ))
         {
             ios_srv_nt_count( IOS_NT_FAST_HIT );
             return STATUS_SUCCESS;
@@ -1177,8 +1236,11 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
     if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen )))
         return STATUS_NOT_IMPLEMENTED;             /* not a cell event any more */
 
-    st = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
-    if (!madeira_cell_alive( cell, gen )) return STATUS_NOT_IMPLEMENTED;
+    {
+        uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+        if (MADEIRA_SG_GEN( sg ) != gen) return STATUS_NOT_IMPLEMENTED;
+        st = MADEIRA_SG_STATE( sg );
+    }
     /* RESET is the coherent answer and DISABLED means the server is already
      * authoritative; CLAIMED is a token in flight on the server thread, which
      * resolves in nanoseconds and is nobody's hang. */
@@ -1189,9 +1251,12 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
     ret = server_wait( op, size, flags, &zero );
     if (ret != STATUS_TIMEOUT) return ret;         /* satisfied, or a real status */
 
-    st2 = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
-    if (!madeira_cell_alive( cell, gen ) || st2 != MADEIRA_CELL_SET)
-        return STATUS_NOT_IMPLEMENTED;             /* somebody consumed it: fine */
+    {
+        uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+        st2 = MADEIRA_SG_STATE( sg );
+        if (MADEIRA_SG_GEN( sg ) != gen || st2 != MADEIRA_CELL_SET)
+            return STATUS_NOT_IMPLEMENTED;         /* somebody consumed it: fine */
+    }
 
     ios_srv_nt_count( IOS_FS_DESYNC );
     if (!__atomic_exchange_n( &madeira_desync_logged, 1, __ATOMIC_RELAXED ))
@@ -1200,7 +1265,7 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
              "says SET; demoting it to the server path permanently.  Further occurrences are "
              "counted as desync= in [srv-stats].\n",
              handle, (int)(cell - madeira_sync_cells),
-             __atomic_load_n( &cell->gen, __ATOMIC_RELAXED ), st, st2,
+             MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_RELAXED ) ), st, st2,
              __atomic_load_n( &cell->waiters, __ATOMIC_RELAXED ),
              __atomic_load_n( &cell->srv_waiters, __ATOMIC_RELAXED ), manual );
 
