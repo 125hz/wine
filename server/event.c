@@ -84,9 +84,32 @@ static int madeira_fastsync_enabled(void)
     return madeira_fastsync_on;
 }
 
-static void madeira_cell_bump_gen( struct madeira_sync_cell *cell )
+/* ml990: the generation lives in the high half of `sg'.  Only this thread
+ * writes it, so a plain load is enough to find the current value; the bump is
+ * always published together with a new state in one 64-bit store, which is
+ * what makes a client's state CAS also a generation check. */
+static unsigned int madeira_cell_next_gen( const struct madeira_sync_cell *cell )
 {
-    if (!++cell->gen) cell->gen = 1;   /* 0 is reserved for "never allocated" */
+    unsigned int gen = MADEIRA_SG_GEN( __atomic_load_n( &cell->sg, __ATOMIC_RELAXED ) );
+
+    if (!++gen) gen = 1;               /* 0 is reserved for "never allocated" */
+    return gen;
+}
+
+/* Rebuild `sg' with a new state, keeping whatever generation is there now.
+ * Used by every server-side write that is not an alloc or a free.  The CAS
+ * loop is not there to protect the generation (this thread is its only writer)
+ * but to make the operation a proper 64-bit RMW rather than a mixed-size
+ * store racing the clients' 64-bit CASes. */
+static int madeira_cell_xchg_state( struct madeira_sync_cell *cell, int want )
+{
+    uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+
+    while (!__atomic_compare_exchange_n( &cell->sg, &sg,
+                                         MADEIRA_SG( MADEIRA_SG_GEN( sg ), want ), 1,
+                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
+        ;
+    return MADEIRA_SG_STATE( sg );
 }
 
 /* Returns a cell index, or -1 when the fast path is off or the table is full;
@@ -107,13 +130,16 @@ static int madeira_cell_alloc( int manual, int signaled )
     else return -1;
 
     cell = &madeira_sync_cells[idx];
-    madeira_cell_bump_gen( cell );
     cell->manual      = !!manual;
     cell->srv_waiters = 0;
     cell->waiters     = 0;
-    /* publish the state LAST: a client can only learn this index through a
-     * get_inproc_sync_fd reply, which the server sends strictly after this. */
-    __atomic_store_n( &cell->state, signaled ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET,
+    /* publish the generation and the state TOGETHER, and LAST: a client can
+     * only learn this index through a get_inproc_sync_fd reply, which the
+     * server sends strictly after this, and a client that still holds the
+     * PREVIOUS generation can never CAS against the word this store makes. */
+    __atomic_store_n( &cell->sg,
+                      MADEIRA_SG( madeira_cell_next_gen( cell ),
+                                  signaled ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET ),
                       __ATOMIC_SEQ_CST );
     madeira_cell_live++;
     return idx;
@@ -123,13 +149,20 @@ static void madeira_cell_free( int idx )
 {
     struct madeira_sync_cell *cell = &madeira_sync_cells[idx];
 
-    /* DISABLED first, so any client still holding a stale (index, gen) pair
-     * takes the server path rather than mutating a recycled cell, then the
-     * generation bump so that stale pair can never match again. */
-    __atomic_store_n( &cell->state, MADEIRA_CELL_DISABLED, __ATOMIC_SEQ_CST );
-    madeira_cell_bump_gen( cell );
+    /* ml990: ONE store retires the old generation and puts the cell in
+     * DISABLED.  Through ml982 these were two stores with the DISABLED first,
+     * which left a window in which a stale (index, gen) pair still matched;
+     * now a client holding the old generation cannot match the word at all,
+     * whichever of the two halves it looks at.
+     *
+     * DISABLED rather than simply "the next generation" because the low half
+     * is the futex word: a parked waiter is released by this store's value
+     * change as well as by the explicit wake below. */
+    __atomic_store_n( &cell->sg,
+                      MADEIRA_SG( madeira_cell_next_gen( cell ), MADEIRA_CELL_DISABLED ),
+                      __ATOMIC_SEQ_CST );
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
-        madeira_fast_wake( &cell->state, 1 );
+        madeira_fast_wake( madeira_cell_futex( cell ), 1 );
     madeira_cell_next[idx] = madeira_cell_free_head;
     madeira_cell_free_head = idx;
     madeira_cell_live--;
@@ -183,7 +216,8 @@ static int event_sync_state( struct event_sync *event )
 {
     if (event->cell >= 0)
     {
-        int st = __atomic_load_n( &madeira_sync_cells[event->cell].state, __ATOMIC_SEQ_CST );
+        int st = MADEIRA_SG_STATE( __atomic_load_n( &madeira_sync_cells[event->cell].sg,
+                                                    __ATOMIC_SEQ_CST ) );
         if (st != MADEIRA_CELL_DISABLED) return st != MADEIRA_CELL_RESET;
     }
     return event->signaled;
@@ -202,11 +236,11 @@ static void event_sync_disable_cell( struct event_sync *event )
 
     if (event->cell < 0) return;
     cell = &madeira_sync_cells[event->cell];
-    prev = __atomic_exchange_n( &cell->state, MADEIRA_CELL_DISABLED, __ATOMIC_SEQ_CST );
+    prev = madeira_cell_xchg_state( cell, MADEIRA_CELL_DISABLED );
     if (prev != MADEIRA_CELL_DISABLED) event->signaled = (prev != MADEIRA_CELL_RESET);
     /* every parked client must wake, re-read DISABLED and go to the server */
     if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
-        madeira_fast_wake( &cell->state, 1 );
+        madeira_fast_wake( madeira_cell_futex( cell ), 1 );
 }
 #endif
 
@@ -344,17 +378,24 @@ void madeira_event_sync_unclaim( struct object *obj )
 {
     struct event_sync *event = (struct event_sync *)obj;
     struct madeira_sync_cell *cell;
-    int st = MADEIRA_CELL_CLAIMED;
+    uint64_t sg;
 
     if (obj->ops != &event_sync_ops) return;
     if (event->cell < 0 || event->manual) return;
     cell = &madeira_sync_cells[event->cell];
-    if (__atomic_compare_exchange_n( &cell->state, &st, MADEIRA_CELL_SET, 0,
+    /* ml990: the CLAIM this releases was taken by event_sync_signaled() on the
+     * same generation a moment ago, so the expected word is fully determined
+     * by the current one; rebuilding it from a fresh load keeps the CAS a
+     * 64-bit RMW without ever guessing a generation. */
+    sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+    if (MADEIRA_SG_STATE( sg ) != MADEIRA_CELL_CLAIMED) return;
+    if (__atomic_compare_exchange_n( &cell->sg, &sg,
+                                     MADEIRA_SG( MADEIRA_SG_GEN( sg ), MADEIRA_CELL_SET ), 0,
                                      __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
     {
         /* the token is up for grabs again; a client may be parked on it */
         if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
-            madeira_fast_wake( &cell->state, 0 );
+            madeira_fast_wake( madeira_cell_futex( cell ), 0 );
     }
 }
 
@@ -394,7 +435,8 @@ static int event_sync_signaled( struct object *obj, struct wait_queue_entry *ent
         /* seq_cst: this load is the server half of the Dekker pair whose other
          * half is the client's `store state; load srv_waiters' in NtSetEvent.
          * srv_waiters was already incremented by event_sync_add_queue(). */
-        int st = __atomic_load_n( &cell->state, __ATOMIC_SEQ_CST );
+        uint64_t sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+        int st = MADEIRA_SG_STATE( sg );
 
         if (st == MADEIRA_CELL_DISABLED) return event->signaled;
         if (event->manual) return st != MADEIRA_CELL_RESET;
@@ -403,7 +445,8 @@ static int event_sync_signaled( struct object *obj, struct wait_queue_entry *ent
         /* CLAIM the auto-reset token so that no client CAS can steal it
          * between here and event_sync_satisfied().  If the CAS loses, a client
          * took it first and this waiter is simply not signaled. */
-        return __atomic_compare_exchange_n( &cell->state, &st, MADEIRA_CELL_CLAIMED, 0,
+        return __atomic_compare_exchange_n( &cell->sg, &sg,
+                                            MADEIRA_SG( MADEIRA_SG_GEN( sg ), MADEIRA_CELL_CLAIMED ), 0,
                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
     }
 #endif
@@ -419,13 +462,12 @@ static void event_sync_satisfied( struct object *obj, struct wait_queue_entry *e
     {
         struct madeira_sync_cell *cell = &madeira_sync_cells[event->cell];
 
-        if (__atomic_load_n( &cell->state, __ATOMIC_SEQ_CST ) != MADEIRA_CELL_DISABLED)
+        if (MADEIRA_SG_STATE( __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST ) ) != MADEIRA_CELL_DISABLED)
         {
             /* consume the claim taken in event_sync_signaled(); a SetEvent
-             * that landed on top of the claim is consumed by this same store,
+             * that landed on top of the claim is consumed by this same write,
              * which is what Windows does too -- one set, one release. */
-            if (!event->manual)
-                __atomic_store_n( &cell->state, MADEIRA_CELL_RESET, __ATOMIC_SEQ_CST );
+            if (!event->manual) madeira_cell_xchg_state( cell, MADEIRA_CELL_RESET );
             return;
         }
     }
@@ -444,20 +486,18 @@ static int event_sync_signal( struct object *obj, unsigned int access, int signa
     {
         struct madeira_sync_cell *cell = &madeira_sync_cells[event->cell];
 
-        if (__atomic_load_n( &cell->state, __ATOMIC_SEQ_CST ) != MADEIRA_CELL_DISABLED)
+        if (MADEIRA_SG_STATE( __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST ) ) != MADEIRA_CELL_DISABLED)
         {
             int prev;
 
             event->signaled = !!signal;   /* kept only for the DISABLED fallback */
-            prev = __atomic_exchange_n( &cell->state,
-                                        signal ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET,
-                                        __ATOMIC_SEQ_CST );
+            prev = madeira_cell_xchg_state( cell, signal ? MADEIRA_CELL_SET : MADEIRA_CELL_RESET );
             if (prev == MADEIRA_CELL_DISABLED)  /* raced a pulse: put it back */
-                __atomic_store_n( &cell->state, MADEIRA_CELL_DISABLED, __ATOMIC_SEQ_CST );
+                madeira_cell_xchg_state( cell, MADEIRA_CELL_DISABLED );
             else if (signal)
             {
                 if (__atomic_load_n( &cell->waiters, __ATOMIC_SEQ_CST ))
-                    madeira_fast_wake( &cell->state, event->manual );
+                    madeira_fast_wake( madeira_cell_futex( cell ), event->manual );
                 wake_up( &event->obj, !event->manual );
             }
             return 1;
@@ -653,8 +693,8 @@ int madeira_event_cell_index( struct object *obj, int *manual )
     if (!event->sync || event->sync->ops != &event_sync_ops) return -1;
     sync = (struct event_sync *)event->sync;
     if (sync->cell < 0) return -1;
-    if (__atomic_load_n( &madeira_sync_cells[sync->cell].state,
-                         __ATOMIC_SEQ_CST ) == MADEIRA_CELL_DISABLED) return -1;
+    if (MADEIRA_SG_STATE( __atomic_load_n( &madeira_sync_cells[sync->cell].sg,
+                                           __ATOMIC_SEQ_CST ) ) == MADEIRA_CELL_DISABLED) return -1;
     *manual = sync->manual;
     return sync->cell;
 }
