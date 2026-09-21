@@ -90,6 +90,37 @@ static inline ULONG get_ulong( UINT **args ) { return *(*args)++; }
 static inline HANDLE get_handle( UINT **args ) { return LongToHandle( *(*args)++ ); }
 static inline void *get_ptr( UINT **args ) { return guest_ptr32( *(*args)++ ); }
 
+/* iOS-Madeira ml1030: AN ATOM IS NOT A POINTER, AND ON THIS PORT THE DIFFERENCE
+ * IS FATAL.
+ *
+ * A few win32u entry points take an argument that is EITHER a string pointer OR
+ * a MAKEINTATOM value, told apart downstream by IS_INTRESOURCE(), i.e.
+ * ((ULONG_PTR)x >> 16) == 0.  Upstream's guest_ptr32() is the identity on a
+ * 32-bit value, so an atom survives get_ptr() unchanged and the test still
+ * works.  Here guest_ptr32() ADDS THE WINDOW BASE, so an atom such as 0xc01a
+ * arrives as 0x72000000c01a; IS_INTRESOURCE() is then false, the callee takes
+ * the string branch, and lstrlenW() walks the reserved-but-uncommitted low
+ * megabyte of the guest window until it faults.
+ *
+ * Observed as a silent 0xC0000005 in every themed installer: the crash is inside
+ * NtUserSetProp+0x4c / NtUserGetProp+0x50 on `ldrh w,[x],#2` — the inlined
+ * lstrlenW — reached from NtUserCreateWindowEx -> WM_NCCREATE, because a themed
+ * or rich-edit control stores its per-window state under an atom during
+ * creation.  It kills the process outright because the fault happens on a
+ * KeUserModeCallback stack that the SEH dispatcher then refuses
+ * ("Exception frame is not in stack limits").
+ *
+ * So: pass an INTRESOURCE through untranslated.  Nothing is lost — a real
+ * pointer below 64 KB cannot exist in a Windows process either, which is the
+ * assumption IS_INTRESOURCE itself is built on. */
+static inline void *get_str_or_atom( UINT **args )
+{
+    ULONG v = *(*args)++;
+
+    if (!v || (v >> 16)) return guest_ptr32( v );
+    return (void *)(ULONG_PTR)v;
+}
+
 static inline void **addr_32to64( void **addr, ULONG *addr32 )
 {
     if (!addr32) return NULL;

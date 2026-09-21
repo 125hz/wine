@@ -3817,6 +3817,60 @@ static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_uni
 
 
 /***********************************************************************
+ *           get_volume_serial_fallback      (iOS-Madeira ml1030)
+ *
+ * A STABLE volume serial for a host that has no mount manager.
+ *
+ * Stability is the whole requirement: a program records a serial when it
+ * installs and compares it when it launches, so the value has to survive a
+ * reboot, a relaunch and a reinstall of the emulator.  It is therefore derived
+ * from the FILESYSTEM's mount point — a property of the volume, not of this
+ * process — and mixed with the DOS drive letter so that two drive letters
+ * backed by the same filesystem still get different serials, which is the
+ * distinction Windows draws.  st_dev is the fallback where there is no
+ * f_mntonname; it is stable per boot, which is weaker but still far better than
+ * failing the call.
+ *
+ * 0 is never returned: a great many callers treat a zero serial as "no volume".
+ */
+static DWORD get_volume_serial_fallback( int fd, WCHAR letter )
+{
+    UINT h = 2166136261u;     /* FNV-1a */
+    BOOL hashed = FALSE;
+
+#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__OpenBSD__) || \
+    defined(__DragonFly__) || defined(__APPLE__)
+    {
+        struct statfs stfs;
+
+        if (!fstatfs( fd, &stfs ))
+        {
+            const char *p;
+
+            for (p = stfs.f_mntonname; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+            hashed = TRUE;
+        }
+    }
+#endif
+    if (!hashed)
+    {
+        struct stat st;
+
+        if (!fstat( fd, &st ))
+        {
+            unsigned long long dev = st.st_dev;
+            unsigned i;
+
+            for (i = 0; i < sizeof(dev); i++) { h ^= (unsigned char)(dev >> (i * 8)); h *= 16777619u; }
+        }
+    }
+    if (letter) { h ^= (unsigned char)letter; h *= 16777619u; }
+    if (!h || h == 0xffffffff) h = 0x57494e45;   /* 'WINE' — never hand out 0 or -1 */
+    return h;
+}
+
+
+/***********************************************************************
  *           get_dir_data_entry
  *
  * Return a directory entry from the cached data.
@@ -7328,9 +7382,13 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             struct mountmgr_unix_drive drive;
             FILE_ID_INFORMATION *info = ptr;
 
-            info->VolumeSerialNumber = 0;
+            /* iOS-Madeira ml1030: same fallback as FileFsVolumeInformation — with
+             * no mount manager this used to report serial 0 for every file, and
+             * 0 is the value callers read as "no volume". */
             if (!get_mountmgr_fs_info( handle, fd, &drive, sizeof(drive) ))
                 info->VolumeSerialNumber = drive.serial;
+            else
+                info->VolumeSerialNumber = get_volume_serial_fallback( fd, drive.letter );
             memset( &info->FileId, 0, sizeof(info->FileId) );
             *(ULONGLONG *)&info->FileId = st.st_ino;
         }
@@ -10042,7 +10100,55 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
 
         if (get_mountmgr_fs_info( handle, fd, drive, sizeof(data) ))
         {
-            status = STATUS_NOT_IMPLEMENTED;
+            /* iOS-Madeira ml1030: THE MOUNT MANAGER IS NOT A PRECONDITION FOR
+             * "WHICH VOLUME IS THIS".
+             *
+             * FileFsVolumeInformation is the only volume class that hard-fails
+             * when \Device\MountPointManager cannot be opened; FileFsAttribute,
+             * FileFsDevice and FileFsSize all fall back to statfs already.  On a
+             * host with no mount manager that single STATUS_NOT_IMPLEMENTED
+             * makes GetVolumeInformation() — and with it every install check,
+             * licence check and "what drive am I on" heuristic that asks for a
+             * serial or a label — return FALSE with ERROR_CALL_NOT_IMPLEMENTED
+             * for EVERY path on the system, because kernelbase issues this query
+             * whenever `label` or `serial` is non-NULL and returns FALSE on any
+             * failure (dlls/kernelbase/volume.c, GetVolumeInformationByHandleW).
+             *
+             * Windows always answers this class for a local volume, so
+             * "not implemented" is not a legal answer; a synthesized but stable
+             * one is strictly closer to the truth.  The label is genuinely empty
+             * here (there is nothing that could name it), and SupportsObjects
+             * agrees with the NTFS that FileFsAttributeInformation reports on the
+             * same fallback path.
+             *
+             * MADEIRA_VOLUME_FALLBACK=0 restores the refusal exactly. */
+            static int fallback_enabled = -1;
+
+            if (fallback_enabled < 0)
+            {
+                const char *s = getenv( "MADEIRA_VOLUME_FALLBACK" );
+                fallback_enabled = (s && (*s == '0' || *s == 'n' || *s == 'N')) ? 0 : 1;
+            }
+            if (!fallback_enabled)
+            {
+                status = STATUS_NOT_IMPLEMENTED;
+                break;
+            }
+
+            info->VolumeCreationTime.QuadPart = 0;
+            info->VolumeSerialNumber = get_volume_serial_fallback( fd, drive->letter );
+            info->VolumeLabelLength = 0;
+            info->SupportsObjects = TRUE;
+            io->Information = offsetof( FILE_FS_VOLUME_INFORMATION, VolumeLabel );
+            status = STATUS_SUCCESS;
+
+            {
+                static int reported;
+                if (!reported++)
+                    ERR( "no mount manager: answering FileFsVolumeInformation from statfs "
+                         "(serial %08lx, empty label); MADEIRA_VOLUME_FALLBACK=0 to refuse instead\n",
+                         (unsigned long)info->VolumeSerialNumber );
+            }
             break;
         }
 
