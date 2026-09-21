@@ -269,6 +269,7 @@ static inline int futex_wake_one( const LONG *addr )
 #ifdef WINE_IOS
 
 #include "ios_fastsync.h"
+#include "ios_late_wake.h"
 
 #define MADEIRA_FAST_CACHE_SIZE  2048          /* power of two, direct mapped   */
 #define MADEIRA_FAST_SPIN        96            /* isb ladder before parking     */
@@ -403,16 +404,87 @@ static unsigned long long madeira_fast_cap_ns = MADEIRA_FAST_CAP_NS;
 static unsigned long long madeira_fast_spin_ns = MADEIRA_FAST_SPIN_NS;
 static int madeira_fast_spin_credit = MADEIRA_SPIN_CREDIT_MAX;
 
-static inline unsigned long long madeira_fast_spin_budget_ns( const LARGE_INTEGER *timeout )
+/* ml1100: credit==0 WAS ABSORBING, AND THE HISTOGRAM SAYS IT SHOULD NOT HAVE BEEN.
+ *
+ * The ml1050 controller only scores a spin it actually RAN: a hit adds
+ * MADEIRA_SPIN_CREDIT_UP, a miss subtracts one, and a zero budget skips the whole
+ * phase.  So once credit reaches 0 nothing spins, nothing is scored, and credit can
+ * never rise again -- an absorbing state, not a decay.  A 32-minute device session
+ * shows exactly that: `handoff: spin hit=0 miss=0 credit=0' in every window from the
+ * first one on, with 36,996 parks in ten seconds underneath it.
+ *
+ * And it was wrong to be off.  That session's own park-to-satisfied histogram --
+ * `us: 0=618 1=692 2=621 4=3096 8=4376 16=5476 32=5341 64=4755 128=4154 256=3251
+ * 512=2319 1024=2051 2048=246' -- puts 20,220 of 36,996 parks (54.7%) at or below
+ * 32 us and 67.5% at or below 64 us.  The ceiling is 40 us.  So the workload sat in
+ * the payoff region the whole time (the controller's own break-even is one in three)
+ * while the controller was switched off, and the histogram is also why 40 us is the
+ * right ceiling rather than 10 or 200: at 8 us only a quarter of parks would be
+ * caught, and past 128 us the marginal park costs more spin than it saves.
+ *
+ * THE PROBE.  One park in MADEIRA_SPIN_PROBE_EVERY spins anyway, on a budget of the
+ * ceiling shifted down, and is scored by the ordinary hit/miss path.  A single hit
+ * lifts credit off 0 and the existing controller takes over; a run of misses leaves
+ * it at 0 because the decrement is clamped there.  Cost at the measured park rate is
+ * ~580 probes per ten seconds at 5 us each -- under 3 ms of spin spread across every
+ * thread in the process, against 37,000 parks.  MADEIRA_FASTSYNC_SPIN_PROBE=0 turns
+ * the probe off and restores the absorbing ml1050 behaviour exactly. */
+#define MADEIRA_SPIN_PROBE_EVERY  64u   /* power of two */
+#define MADEIRA_SPIN_PROBE_SHIFT  3u    /* probe budget = ceiling >> this */
+
+/* ml1100: AND THE RAMP BACK UP WAS BROKEN TOO, which a probe alone would not have
+ * fixed.  MADEIRA_SPIN_CREDIT_UP is +2 out of 64, so a credit that has reached 0
+ * buys a budget of 40 us * 2/64 = 1.25 us on its next attempt -- shorter than
+ * almost every handoff in the measured histogram (only 3.5% of parks complete
+ * inside 2 us), so it misses, decays straight back to 0, and the controller is
+ * stuck again one wait later.  A probe that PAYS is evidence about the workload,
+ * not about one wait, so it re-arms the controller to a credit that buys a real
+ * trial (a quarter of the ceiling = 10 us, which the histogram puts above a third
+ * of all parks) and lets the ordinary +2/-1 rule take it from there. */
+#define MADEIRA_SPIN_CREDIT_REARM (MADEIRA_SPIN_CREDIT_MAX / 4)
+
+static unsigned int madeira_fast_spin_probe_seq;   /* the 1-in-N sequencer */
+static unsigned int madeira_fast_spin_probes;      /* probes run, drained by the reporter */
+
+static int madeira_fast_spin_probe_on( void )
+{
+    static int cached = -1;
+
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_FASTSYNC_SPIN_PROBE" );
+        cached = !(e && e[0] == '0');
+    }
+    return cached;
+}
+
+static inline unsigned long long madeira_fast_spin_budget_ns( const LARGE_INTEGER *timeout,
+                                                              int *is_probe )
 {
     int credit;
     unsigned long long ns;
 
+    *is_probe = 0;
     if (!madeira_fast_spin_ns) return 0;
     credit = __atomic_load_n( &madeira_fast_spin_credit, __ATOMIC_RELAXED );
-    if (credit <= 0) return 0;
+    if (credit <= 0)
+    {
+        unsigned seq;
+
+        if (!madeira_fast_spin_probe_on()) return 0;
+        seq = __atomic_fetch_add( &madeira_fast_spin_probe_seq, 1, __ATOMIC_RELAXED );
+        if (seq & (MADEIRA_SPIN_PROBE_EVERY - 1)) return 0;
+        ns = madeira_fast_spin_ns >> MADEIRA_SPIN_PROBE_SHIFT;
+        if (!ns) return 0;
+        __atomic_fetch_add( &madeira_fast_spin_probes, 1, __ATOMIC_RELAXED );
+        *is_probe = 1;
+        /* Falls through to the caller-timeout clamp below, exactly as a
+         * credited budget does -- a probe must not outlive its own wait. */
+        goto clamp;
+    }
     if (credit > MADEIRA_SPIN_CREDIT_MAX) credit = MADEIRA_SPIN_CREDIT_MAX;
     ns = madeira_fast_spin_ns * (unsigned)credit / MADEIRA_SPIN_CREDIT_MAX;
+clamp:
     /* Never spin past the caller's own relative timeout -- the same rule the
      * park below applies to its 2 ms cap, for the same reason. */
     if (timeout && timeout->QuadPart < 0 &&
@@ -447,7 +519,7 @@ static unsigned int madeira_fast_spin_hits, madeira_fast_spin_misses;
  * translation unit); fills `out' with the window and zeroes the source. */
 void madeira_fast_park_hist_snapshot( unsigned int *out, unsigned n,
                                       unsigned int *spin_hit, unsigned int *spin_miss,
-                                      int *credit )
+                                      int *credit, unsigned int *spin_probe )
 {
     unsigned i;
     for (i = 0; i < n; i++)
@@ -456,6 +528,10 @@ void madeira_fast_park_hist_snapshot( unsigned int *out, unsigned n,
     *spin_hit  = __atomic_exchange_n( &madeira_fast_spin_hits, 0, __ATOMIC_RELAXED );
     *spin_miss = __atomic_exchange_n( &madeira_fast_spin_misses, 0, __ATOMIC_RELAXED );
     *credit    = __atomic_load_n( &madeira_fast_spin_credit, __ATOMIC_RELAXED );
+    /* ml1100: probes run this window. `hit=0 miss=0 probe=0' now means the spin is
+     * OFF by configuration; `probe=N miss=N' means the probe ran and the workload
+     * genuinely does not pay off; `probe=N' with hit>0 means it recovered. */
+    *spin_probe = __atomic_exchange_n( &madeira_fast_spin_probes, 0, __ATOMIC_RELAXED );
 }
 
 static inline void madeira_fast_spin_credit_add( int delta )
@@ -572,12 +648,15 @@ static void madeira_fast_parse_env(void)
          (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)MADEIRA_FAST_CACHE_SIZE,
          (unsigned int)MADEIRA_FAST_SPIN, (unsigned int)(madeira_fast_cap_ns / 1000),
          madeira_fast_auto_reqs );
-    ERR( "[fastsync] ml1050 adaptive spin: isb x%u then up to %lluus of timed spin, budget scaled "
+    ERR( "[fastsync] ml1100 adaptive spin: isb x%u then up to %lluus of timed spin, budget scaled "
          "by a payoff credit in [0,%u] (+%d on a spin that was paid, -1 on one that had to park); "
-         "MADEIRA_FASTSYNC_SPIN_US=0 restores the fixed %u-iteration ladder\n",
+         "credit 0 is no longer absorbing — 1 park in %u spins anyway on a %lluus probe and a probe "
+         "that pays re-arms the credit to %d; MADEIRA_FASTSYNC_SPIN_PROBE=0 restores the ml1050 "
+         "behaviour and MADEIRA_FASTSYNC_SPIN_US=0 the fixed %u-iteration ladder\n",
          (unsigned int)MADEIRA_FAST_SPIN, madeira_fast_spin_ns / 1000,
          (unsigned int)MADEIRA_SPIN_CREDIT_MAX, MADEIRA_SPIN_CREDIT_UP,
-         (unsigned int)MADEIRA_FAST_SPIN );
+         MADEIRA_SPIN_PROBE_EVERY, (madeira_fast_spin_ns >> MADEIRA_SPIN_PROBE_SHIFT) / 1000,
+         MADEIRA_SPIN_CREDIT_REARM, (unsigned int)MADEIRA_FAST_SPIN );
 }
 
 static inline void madeira_fast_init(void)
@@ -671,6 +750,60 @@ static inline unsigned long long madeira_now_ns(void)
         if (!tb.denom) mach_timebase_info( &tb );
         return mach_absolute_time() * tb.numer / tb.denom;
     }
+}
+
+/***********************************************************************
+ *   ml1110: THE LATE-WAKE CENSUS -- see build/ntdll-unix/shims/ios_late_wake.h
+ *
+ * The counters and the one branch on the release path.  Everything that reads
+ * them lives at the bottom of this block, next to the reporter's entry points.
+ ***********************************************************************/
+
+static int madeira_late_on = -1;          /* MADEIRA_LATEWAKE, default ON     */
+
+static unsigned int madeira_late_counts[7];   /* indexed by MADEIRA_LATE_*    */
+static unsigned int madeira_late_age[IOS_LATE_AGE_N];
+
+#define MADEIRA_LATE_TMO_FIN    0
+#define MADEIRA_LATE_SEM        1
+#define MADEIRA_LATE_EVENT      2
+#define MADEIRA_LATE_NOSTAMP    3
+#define MADEIRA_LATE_HB         4
+#define MADEIRA_LATE_HB_LATE    5
+#define MADEIRA_LATE_RESCUED    6
+
+/* The hot-object sketch.  Fixed slots, racy by design: two threads charging
+ * the same cell can both install it, which costs a duplicated row in a
+ * diagnostic and nothing else.  A slot is claimed by the first late expiry on
+ * a cell and is never evicted within a window, because the window is zeroed
+ * whole by the snapshot. */
+static unsigned int madeira_late_hot_cell[IOS_LATE_HOT_N];
+static unsigned int madeira_late_hot_kind[IOS_LATE_HOT_N];
+static unsigned int madeira_late_hot_n[IOS_LATE_HOT_N];
+
+static inline int madeira_late_enabled(void)
+{
+    int on = __atomic_load_n( &madeira_late_on, __ATOMIC_RELAXED );
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_LATEWAKE" );
+
+        on = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) || !strcmp( e, "no" ))) ? 0 : 1;
+        __atomic_store_n( &madeira_late_on, on, __ATOMIC_RELAXED );
+    }
+    return on;
+}
+
+/* The release path's whole contribution: one clock read (a commpage read on
+ * this OS, not a syscall) and one relaxed store, and only while the census is
+ * on.  Called from the two CLIENT fast paths that can raise a cell without
+ * the server knowing about it -- see ios_fastsync.h for why the server's own
+ * releases are not stamped. */
+static inline void madeira_late_stamp( struct madeira_sync_cell *cell )
+{
+    if (!madeira_late_enabled()) return;
+    madeira_cell_note_release( cell, madeira_now_ns() );
 }
 
 /* ml962: the seqlock WRITE side, corrected.
@@ -1087,6 +1220,10 @@ static enum madeira_fast_result madeira_fast_sem_release( HANDLE handle, ULONG c
     }
     if (previous) *previous = (ULONG)cur;
     ios_srv_nt_count( IOS_FS_SEM_REL );
+    /* ml1110: the count went up HERE, off-server.  Stamp it before either
+     * wake, so a waiter that times out a moment later measures the age of the
+     * token and not the age of the notification. */
+    if (count) madeira_late_stamp( cell );
 
     /* Dekker, client half #2: the CAS above and this load are both seq_cst, and
      * a parking waiter does `waiters++; load count' with the same ordering, so
@@ -1162,6 +1299,8 @@ static enum madeira_fast_result madeira_fast_event_op( HANDLE handle, int set, L
     /* A reset can never release anybody, so it is always complete here --
      * including for the server, whose event_sync_signaled() reads this word. */
     if (!set) return MADEIRA_FAST_DONE;
+
+    madeira_late_stamp( cell );   /* ml1110: raised off-server, see above */
 
     /* Dekker, client half #2: the state store above and this load are both
      * seq_cst, and a parking waiter does `waiters++; load state' with the same
@@ -1313,7 +1452,8 @@ static NTSTATUS madeira_fast_wait_inner( HANDLE handle, const LARGE_INTEGER *tim
      * is skipped entirely when the credit has decayed (budget 0), which costs
      * one relaxed load. */
     {
-        unsigned long long spin_ns = madeira_fast_spin_budget_ns( timeout );
+        int spin_probe = 0;
+        unsigned long long spin_ns = madeira_fast_spin_budget_ns( timeout, &spin_probe );
 
         if (spin_ns)
         {
@@ -1328,7 +1468,12 @@ static NTSTATUS madeira_fast_wait_inner( HANDLE handle, const LARGE_INTEGER *tim
                         ios_srv_nt_count( IOS_NT_FAST_HIT );
                         __atomic_fetch_add( &madeira_fast_spin_hits, 1, __ATOMIC_RELAXED );
                         if (kind == MADEIRA_CELL_KIND_SEM) ios_srv_nt_count( IOS_FS_SEM_WAIT );
-                        madeira_fast_spin_credit_add( MADEIRA_SPIN_CREDIT_UP );
+                        /* ml1100: a probe that paid re-arms; an ordinary spin that
+                         * paid nudges.  See MADEIRA_SPIN_CREDIT_REARM. */
+                        if (spin_probe)
+                            madeira_fast_spin_credit_add( MADEIRA_SPIN_CREDIT_REARM );
+                        else
+                            madeira_fast_spin_credit_add( MADEIRA_SPIN_CREDIT_UP );
                         return STATUS_SUCCESS;
                     }
                 }
@@ -1638,6 +1783,143 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
     return STATUS_NOT_IMPLEMENTED;                 /* re-wait, now on the server */
 }
 
+/***********************************************************************
+ *   ml1110: THE LATE-WAKE CENSUS, RECORDING SIDE
+ ***********************************************************************/
+
+static void madeira_late_charge_hot( unsigned int idx, unsigned int kind )
+{
+    unsigned int i;
+
+    for (i = 0; i < IOS_LATE_HOT_N; i++)
+    {
+        unsigned int have = __atomic_load_n( &madeira_late_hot_cell[i], __ATOMIC_RELAXED );
+
+        if (have == idx + 1u)
+        {
+            __atomic_fetch_add( &madeira_late_hot_n[i], 1, __ATOMIC_RELAXED );
+            return;
+        }
+        if (!have)
+        {
+            unsigned int zero = 0;
+
+            if (__atomic_compare_exchange_n( &madeira_late_hot_cell[i], &zero, idx + 1u, 0,
+                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+            {
+                __atomic_store_n( &madeira_late_hot_kind[i], kind, __ATOMIC_RELAXED );
+                __atomic_fetch_add( &madeira_late_hot_n[i], 1, __ATOMIC_RELAXED );
+                return;
+            }
+            i--;                                   /* somebody took it; re-read */
+        }
+    }
+    /* more than IOS_LATE_HOT_N distinct objects in one window: the totals above
+     * still count it, only the naming is dropped */
+}
+
+/* One timed wait has just come back STATUS_TIMEOUT.  `hb' distinguishes the
+ * ml982/ml1060 heartbeat's own expiry (the caller asked for INFINITE) from a
+ * finite timeout the GUEST asked for, because the two mean different things:
+ * a late heartbeat is a wake this port owed and did not deliver, while a late
+ * guest timeout is that plus a result the guest can legitimately observe. */
+static void madeira_late_note( HANDLE handle, int hb )
+{
+    struct madeira_sync_cell *cell;
+    unsigned int manual = 0, gen = 0, kind = 0, b, age_us;
+    unsigned int rel;
+    uint64_t sg;
+
+    if (!madeira_late_enabled()) return;
+    __atomic_fetch_add( &madeira_late_counts[hb ? MADEIRA_LATE_HB : MADEIRA_LATE_TMO_FIN],
+                        1, __ATOMIC_RELAXED );
+    /* MADEIRA_FASTSYNC=0 means there are no cells to read, and without this
+     * gate the lookup below would issue one get_inproc_sync_fd per handle to
+     * learn that -- an extra request on the one path whose whole point is to
+     * be the pre-fastsync port.  `tmo_fin' above is still counted, because it
+     * costs nothing and the rate is worth having in both configurations. */
+    if (!madeira_fast_cells_enabled()) return;
+    if (!(cell = madeira_fast_lookup( handle, SYNCHRONIZE, &manual, &gen, &kind ))) return;
+
+    sg = __atomic_load_n( &cell->sg, __ATOMIC_SEQ_CST );
+    if (MADEIRA_SG_GEN( sg ) != gen) return;        /* recycled: says nothing */
+    if (!madeira_cell_signalled( kind, manual, MADEIRA_SG_STATE( sg ) )) return;
+
+    /* From here on: the wait expired while the object could have released it. */
+    if (hb) __atomic_fetch_add( &madeira_late_counts[MADEIRA_LATE_HB_LATE], 1, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &madeira_late_counts[kind == MADEIRA_CELL_KIND_SEM
+                                             ? MADEIRA_LATE_SEM : MADEIRA_LATE_EVENT],
+                        1, __ATOMIC_RELAXED );
+    madeira_late_charge_hot( (unsigned int)(cell - madeira_sync_cells), kind );
+
+    rel = __atomic_load_n( &cell->rel_us, __ATOMIC_RELAXED );
+    if (!rel)
+    {
+        /* signalled, but no CLIENT release ever raised this cell -- so the
+         * server raised it, and a server-side release walks its own queue in
+         * the same call.  Counted apart rather than bucketed at age 0, which
+         * would make the distribution say the opposite of the truth. */
+        __atomic_fetch_add( &madeira_late_counts[MADEIRA_LATE_NOSTAMP], 1, __ATOMIC_RELAXED );
+        return;
+    }
+    age_us = (unsigned int)(madeira_now_ns() / 1000) - rel;   /* wrap-safe */
+    for (b = 0; b + 1 < IOS_LATE_AGE_N && age_us >= (1u << b); b++) ;
+    __atomic_fetch_add( &madeira_late_age[b], 1, __ATOMIC_RELAXED );
+}
+
+/* "a release whose wake was delivered only by a later timeout", counted at the
+ * one place that can see both halves: the heartbeat timed out, and the
+ * watchdog's zero-timeout re-ask then satisfied the wait on the spot. */
+static inline void madeira_late_rescued(void)
+{
+    if (madeira_late_enabled())
+        __atomic_fetch_add( &madeira_late_counts[MADEIRA_LATE_RESCUED], 1, __ATOMIC_RELAXED );
+}
+
+unsigned int madeira_late_wake_peek( unsigned int *rescued )
+{
+    *rescued = __atomic_load_n( &madeira_late_counts[MADEIRA_LATE_RESCUED], __ATOMIC_RELAXED );
+    return __atomic_load_n( &madeira_late_counts[MADEIRA_LATE_SEM], __ATOMIC_RELAXED )
+         + __atomic_load_n( &madeira_late_counts[MADEIRA_LATE_EVENT], __ATOMIC_RELAXED );
+}
+
+void madeira_late_wake_snapshot( struct ios_late_snapshot *out )
+{
+    unsigned int i, total = 0, acc = 0;
+
+    memset( out, 0, sizeof(*out) );
+    out->tmo_fin    = __atomic_exchange_n( &madeira_late_counts[MADEIRA_LATE_TMO_FIN], 0, __ATOMIC_RELAXED );
+    out->late_sem   = __atomic_exchange_n( &madeira_late_counts[MADEIRA_LATE_SEM], 0, __ATOMIC_RELAXED );
+    out->late_event = __atomic_exchange_n( &madeira_late_counts[MADEIRA_LATE_EVENT], 0, __ATOMIC_RELAXED );
+    out->nostamp    = __atomic_exchange_n( &madeira_late_counts[MADEIRA_LATE_NOSTAMP], 0, __ATOMIC_RELAXED );
+    out->hb         = __atomic_exchange_n( &madeira_late_counts[MADEIRA_LATE_HB], 0, __ATOMIC_RELAXED );
+    out->hb_late    = __atomic_exchange_n( &madeira_late_counts[MADEIRA_LATE_HB_LATE], 0, __ATOMIC_RELAXED );
+    out->rescued    = __atomic_exchange_n( &madeira_late_counts[MADEIRA_LATE_RESCUED], 0, __ATOMIC_RELAXED );
+
+    for (i = 0; i < IOS_LATE_AGE_N; i++)
+    {
+        out->age[i] = __atomic_exchange_n( &madeira_late_age[i], 0, __ATOMIC_RELAXED );
+        total += out->age[i];
+    }
+    /* Percentiles are read off the log2 histogram and reported as the bucket's
+     * LOWER bound, so they never overstate -- the same rule [sleep0] uses. */
+    for (i = 0; i < IOS_LATE_AGE_N && total; i++)
+    {
+        acc += out->age[i];
+        if (!out->age_p50 && acc * 2 >= total) out->age_p50 = i ? (1u << (i - 1)) : 0;
+        if (!out->age_p90 && acc * 10 >= total * 9) { out->age_p90 = i ? (1u << (i - 1)) : 0; break; }
+    }
+
+    for (i = 0; i < IOS_LATE_HOT_N; i++)
+    {
+        unsigned int c = __atomic_exchange_n( &madeira_late_hot_cell[i], 0, __ATOMIC_RELAXED );
+
+        out->hot[i].cell = c ? c - 1u : 0xffffffffu;
+        out->hot[i].kind = __atomic_exchange_n( &madeira_late_hot_kind[i], 0, __ATOMIC_RELAXED );
+        out->hot[i].late = __atomic_exchange_n( &madeira_late_hot_n[i], 0, __ATOMIC_RELAXED );
+    }
+}
+
 /* The INFINITE single-object wait, with a heartbeat.  Used only when the wake
  * path is live; otherwise the caller issues the plain infinite server_wait it
  * always did.
@@ -1683,8 +1965,19 @@ static unsigned int madeira_fast_watched_wait( const union select_op *op, data_s
 
         t.QuadPart = -(LONGLONG)ms * 10000;
         if ((ret = server_wait( op, size, flags, &t )) != STATUS_TIMEOUT) return ret;
+        /* ml1110: the heartbeat expired.  Ask the cell, before the watchdog's
+         * zero-timeout re-ask changes it, whether this wait was owed a wake. */
+        madeira_late_note( handle, 1 );
         ret = madeira_fast_watchdog_check( handle, flags, op, size );
-        if (ret != STATUS_NOT_IMPLEMENTED) return ret;
+        if (ret != STATUS_NOT_IMPLEMENTED)
+        {
+            /* ml1110: the re-ask SATISFIED it.  This wait was delivered by a
+             * timer, not by a wake, and that is the number this census exists
+             * to produce.  A real status other than SUCCESS (a user APC, an
+             * abandoned mutex) is not a rescue and is not counted as one. */
+            if (ret == STATUS_WAIT_0) madeira_late_rescued();
+            return ret;
+        }
         if (ms < MADEIRA_FS_WATCH_MS_MAX)
         {
             ms *= 4;
@@ -3969,6 +4262,11 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
     }
 #endif
     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[count] ), flags, timeout );
+#ifdef WINE_IOS
+    /* ml1110: a finite wait that expired -- was the object signalled anyway? */
+    if (ret == STATUS_TIMEOUT && count == 1 && type != WaitAll && timeout && timeout->QuadPart)
+        madeira_late_note( handles[0], 0 );
+#endif
     TRACE( "-> %#x\n", ret );
     return ret;
 }
@@ -4026,6 +4324,9 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     }
 #endif
     ret = server_wait( &select_op, offsetof( union select_op, wait.handles[1] ), flags, timeout );
+#ifdef WINE_IOS
+    if (ret == STATUS_TIMEOUT && timeout && timeout->QuadPart) madeira_late_note( handle, 0 );
+#endif
     TRACE( "-> %#x\n", ret );
     return ret;
 }

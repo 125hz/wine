@@ -463,7 +463,25 @@ VOID WINAPI GlobalMemoryStatus( LPMEMORYSTATUS lpBuffer )
 
     /* values are limited to 2Gb unless the app has the IMAGE_FILE_LARGE_ADDRESS_AWARE flag */
     /* page file sizes are not limited (Adobe Illustrator 8 depends on this) */
-    if (!(nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE))
+    /* iOS-Madeira ml1100: ASK THE CEILING, NOT THE HEADER BIT.
+     *
+     * On Windows these two are the same question — a non-large-address-aware
+     * process really does top out at 0x7FFEFFFF, so ullTotalVirtual is already
+     * ~2 GB there and this clamp is a no-op. It matters only where ntdll reports
+     * a LARGER user space than the header bit predicts, and then the honest
+     * answer is the space the process can actually address: ullTotalVirtual is
+     * computed straight from NtQuerySystemInformation(SystemBasicInformation)'s
+     * HighestUserAddress (kernelbase/memory.c), which is ntdll's own statement of
+     * the ceiling.
+     *
+     * This replaces a fix that used to write the flag into the program's MAPPED
+     * PE HEADER so this line would read it. Programs hash their own in-memory
+     * image, headers included, and a deliberate self-check crash is the
+     * documented consequence; real Windows never alters those bytes. Reading the
+     * ceiling costs nothing extra — GlobalMemoryStatusEx above already produced
+     * it — and needs no guest byte to change. */
+    if (!(nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) &&
+        memstatus.ullTotalVirtual <= (ULONGLONG)MAXLONG + 1)
     {
         if (lpBuffer->dwTotalPhys > MAXLONG) lpBuffer->dwTotalPhys = MAXLONG;
         if (lpBuffer->dwAvailPhys > MAXLONG) lpBuffer->dwAvailPhys = MAXLONG;
