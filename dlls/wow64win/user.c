@@ -2987,7 +2987,7 @@ NTSTATUS WINAPI wow64_NtUserGetProcessWindowStation( UINT *args )
 NTSTATUS WINAPI wow64_NtUserGetProp( UINT *args )
 {
     HWND hwnd = get_handle( &args );
-    const WCHAR *str = get_ptr( &args );
+    const WCHAR *str = get_str_or_atom( &args );   /* iOS-Madeira ml1030: atom, not pointer */
 
     return HandleToUlong( NtUserGetProp( hwnd, str ));
 }
@@ -4330,7 +4330,7 @@ NTSTATUS WINAPI wow64_NtUserRemoveMenu( UINT *args )
 NTSTATUS WINAPI wow64_NtUserRemoveProp( UINT *args )
 {
     HWND hwnd = get_handle( &args );
-    const WCHAR *str = get_ptr( &args );
+    const WCHAR *str = get_str_or_atom( &args );   /* iOS-Madeira ml1030: atom, not pointer */
 
     return HandleToUlong( NtUserRemoveProp( hwnd, str ));
 }
@@ -4739,7 +4739,7 @@ NTSTATUS WINAPI wow64_NtUserSetProgmanWindow( UINT *args )
 NTSTATUS WINAPI wow64_NtUserSetProp( UINT *args )
 {
     HWND hwnd = get_handle( &args );
-    const WCHAR *str = get_ptr( &args );
+    const WCHAR *str = get_str_or_atom( &args );   /* iOS-Madeira ml1030: atom, not pointer */
     HANDLE handle = get_handle( &args );
 
     return NtUserSetProp( hwnd, str, handle );

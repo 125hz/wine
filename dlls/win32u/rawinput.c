@@ -281,8 +281,79 @@ static void enumerate_devices( DWORD type, const WCHAR *class )
     NtClose( class_key );
 }
 
+/***********************************************************************
+ *           add_builtin_device      (iOS-Madeira ml1030)
+ *
+ * THE DEVICE THE SERVER ALREADY SENDS INPUT FROM MUST APPEAR IN THE LIST.
+ *
+ * Every WM_INPUT the server synthesises for injected keyboard and mouse input
+ * carries hDevice = WINE_MOUSE_HANDLE (1) or WINE_KEYBOARD_HANDLE (2) — see
+ * rawmouse_init()/rawkeyboard_init() in the server's queue.  Those two handles
+ * only become REPORTABLE devices here, and only by opening the device file that
+ * winebus.sys exposes for them.  On a host with no driver stack that open
+ * fails, add_device() returns NULL for every entry, and the list ends up empty:
+ *
+ *   - GetRawInputDeviceList() reports ZERO devices, so a title that asks "is
+ *     there a keyboard?" before wiring its input concludes there is not;
+ *   - GetRawInputDeviceInfo( hDevice, RIDI_DEVICENAME / RIDI_DEVICEINFO ) fails
+ *     for the very handle every WM_INPUT it receives is stamped with, so a
+ *     title that identifies the source device before trusting a message drops
+ *     all of them.
+ *
+ * Both failures are silent and both look exactly like "input is dispatched but
+ * the game ignores it", which is the symptom that sent us looking at focus,
+ * foreground and message routing instead.
+ *
+ * So when the enumeration produced no device of a given type, publish the
+ * built-in one.  It has no file handle and no preparsed data — it is not a HID
+ * collection and RIDI_PREPARSEDDATA correctly reports nothing for it — and the
+ * info blocks are the same statics add_device() would have used.  The name is
+ * shaped like the PS/2 devices Windows itself reports for a built-in keyboard
+ * and mouse, because that is what callers pattern-match on.
+ *
+ * SELF-DISARMING: it only runs when the type is missing, so on any host where
+ * the real device stack works this changes nothing at all. */
+static void add_builtin_device( DWORD type, HANDLE handle, const char *path )
+{
+    static const RID_DEVICE_INFO_KEYBOARD builtin_keyboard_info = {0, 0, 1, 12, 3, 101};
+    static const RID_DEVICE_INFO_MOUSE builtin_mouse_info = {1, 5, 0, FALSE};
+    struct device *device;
+    unsigned int i;
+
+    if (!(device = calloc( 1, sizeof(*device) ))) return;
+
+    /* the path is ASCII by construction; WCHAR is 16 bits on both sides of this
+     * file's build while a wide string literal is not, so widen it here rather
+     * than spelling the name out as an initialiser list */
+    for (i = 0; path[i] && i < ARRAY_SIZE(device->path) - 1; i++) device->path[i] = (WCHAR)path[i];
+    device->path[i] = 0;
+    device->file = NULL;
+    device->handle = handle;
+    device->data = NULL;
+    device->info.cbSize = sizeof(device->info);
+    device->info.dwType = type;
+    if (type == RIM_TYPEMOUSE) device->info.mouse = builtin_mouse_info;
+    else device->info.keyboard = builtin_keyboard_info;
+
+    TRACE( "Adding built-in device %p / %s.\n", handle, debugstr_a(path) );
+    list_add_tail( &devices, &device->entry );
+}
+
+static BOOL have_device_of_type( DWORD type )
+{
+    struct device *device;
+
+    LIST_FOR_EACH_ENTRY( device, &devices, struct device, entry )
+        if (device->info.dwType == type) return TRUE;
+    return FALSE;
+}
+
 static void rawinput_update_device_list( BOOL force )
 {
+    static const char builtin_mouse_path[] =
+        "\\\\?\\ACPI#PNP0F03#4&2d1e5e0b&0#{378de44c-56ef-11d1-bc8c-00a0c91405dd}";
+    static const char builtin_keyboard_path[] =
+        "\\\\?\\ACPI#PNP0303#4&2d1e5e0b&0#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}";
     unsigned int ticks = NtGetTickCount();
     static unsigned int last_check;
     struct device *device, *next;
@@ -295,7 +366,7 @@ static void rawinput_update_device_list( BOOL force )
     LIST_FOR_EACH_ENTRY_SAFE( device, next, &devices, struct device, entry )
     {
         list_remove( &device->entry );
-        NtClose( device->file );
+        if (device->file) NtClose( device->file );   /* ml1030: a built-in device has none */
         free( device->data );
         free( device );
     }
@@ -303,6 +374,12 @@ static void rawinput_update_device_list( BOOL force )
     enumerate_devices( RIM_TYPEMOUSE, guid_devinterface_mouseW );
     enumerate_devices( RIM_TYPEKEYBOARD, guid_devinterface_keyboardW );
     enumerate_devices( RIM_TYPEHID, guid_devinterface_hidW );
+
+    /* ml1030: see add_builtin_device. */
+    if (!have_device_of_type( RIM_TYPEMOUSE ))
+        add_builtin_device( RIM_TYPEMOUSE, WINE_MOUSE_HANDLE, builtin_mouse_path );
+    if (!have_device_of_type( RIM_TYPEKEYBOARD ))
+        add_builtin_device( RIM_TYPEKEYBOARD, WINE_KEYBOARD_HANDLE, builtin_keyboard_path );
 }
 
 static struct device *find_device_from_handle( HANDLE handle, BOOL refresh )
@@ -580,7 +657,7 @@ BOOL process_rawinput_message( MSG *msg, UINT hw_id, const struct hardware_msg_d
             if (msg->wParam == GIDC_REMOVAL)
             {
                 list_remove( &device->entry );
-                NtClose( device->file );
+                if (device->file) NtClose( device->file );   /* ml1030: built-in device has none */
                 free( device->data );
                 free( device );
             }
