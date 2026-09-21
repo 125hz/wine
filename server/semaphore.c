@@ -339,9 +339,25 @@ static int release_semaphore( struct semaphore_sync *sem, unsigned int count,
              * there -- semaphore_sync_signaled() CASes them out one at a time
              * and fails when a fast waiter got there first.  It also needs no
              * futex wake: it added no token, and the client that sent it has
-             * already woken the parked waiters itself. */
+             * already woken the parked waiters itself.
+             *
+             * ml1060: THE WAKE LIMIT IS 0 ("no limit"), NOT `count'.
+             * `wake_up( obj, n )' means "stop after n threads have been
+             * satisfied", and upstream may use `count' for it because upstream's
+             * count IS the number of tokens that just appeared.  Here it is not:
+             * a client can have raised the cell without telling the server (its
+             * Dekker load of srv_waiters legitimately read 0 because nobody was
+             * queued AT THAT INSTANT), threads can queue afterwards, and the next
+             * server-side release of 1 would then wake exactly one of them and
+             * leave the rest asleep on tokens that are sitting in the cell.  The
+             * count == 0 protocol arm was already unlimited for precisely this
+             * reason; making both arms unlimited removes the asymmetry rather
+             * than relying on a later release to come and collect the backlog.
+             * It cannot over-deliver: every wake runs check_wait(), which CASes
+             * a token out of the cell and refuses when there is none, so the
+             * number of threads released is bounded by the tokens that exist. */
             if (count) semaphore_cell_wake( sem, count );
-            wake_up( &sem->obj, count );
+            wake_up( &sem->obj, 0 );
             return 1;
         }
         /* DISABLED: fall through to the plain server-side arithmetic below,
