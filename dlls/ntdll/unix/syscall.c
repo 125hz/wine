@@ -264,6 +264,20 @@ void ntdll_add_syscall_debug_info( UINT idx, const char **names, const char **us
     usercall_names = user_names;
 }
 
+/* MADEIRA ml1120: name a syscall id for the [syscall-fault] line in
+ * build/ntdll-unix/signal_arm64_ios.c.  Bounded array indexing only, so it is
+ * safe to call from a signal handler; returns NULL when the id is out of range
+ * or no table has been registered (the caller then prints the raw number). */
+const char *ntdll_syscall_name( UINT id )
+{
+    UINT idx = (id >> 12) & 3, num = id & 0xfff;
+    const char **names = syscall_names[idx];
+
+    if (!names) return NULL;
+    if (num >= KeServiceDescriptorTable[idx].ServiceLimit) return NULL;
+    return names[num];
+}
+
 BOOLEAN KeAddSystemServiceTable( ULONG_PTR *funcs, ULONG_PTR *counters, ULONG limit,
                                  BYTE *arguments, ULONG index )
 {
