@@ -1497,6 +1497,22 @@ int wake_thread_queue_entry( struct wait_queue_entry *entry )
     return 1;
 }
 
+#ifdef WINE_IOS
+/* iOS-Madeira ml1110: "may an expiring timeout look at the objects first".
+ * MADEIRA_TIMEOUT_RECHECK=0 restores upstream's unconditional timeout. */
+static int madeira_timeout_recheck(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_TIMEOUT_RECHECK" );
+        on = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) || !strcmp( e, "no" ))) ? 0 : 1;
+    }
+    return on;
+}
+#endif
+
 /* thread wait timeout */
 static void thread_timeout( void *ptr )
 {
@@ -1507,6 +1523,44 @@ static void thread_timeout( void *ptr )
     wait->user = NULL;
     if (thread->wait != wait) return; /* not the top-level wait, ignore it */
     if (is_thread_suspended( thread )) return;  /* suspended, ignore it */
+
+#ifdef WINE_IOS
+    /* ml1110: ASK THE OBJECTS BEFORE DECLARING A TIMEOUT.
+     *
+     * Upstream does not have to.  There, every change of a synchronisation
+     * object's state is a server request, so a release that happened before
+     * this timer fired has already run wake_up() and this thread is no longer
+     * waiting; "the timer fired, therefore nothing signalled it" is a sound
+     * inference on a server that owns all the state.
+     *
+     * It stops being sound the moment a CLIENT can raise an object without a
+     * request -- which is what the fastsync cell is.  The interleaving is
+     * ordinary, not exotic: a client CASes the count up, reads srv_waiters,
+     * sees this thread queued and sends the `release_semaphore( count = 0 )'
+     * that exists to make the server re-run its own queue; that request is
+     * sitting in the socket when get_next_timeout() picks this timer off the
+     * list.  The old body then told a thread STATUS_TIMEOUT while the token it
+     * was owed was already in the cell, dequeued it (srv_waiters--), and the
+     * request that followed walked an empty queue.  Nothing is LOST -- the
+     * token stays in the cell and the next waiter takes it -- but the hand-off
+     * was delivered by a timer instead of by a wake, which for an infinite
+     * wait costs the whole heartbeat interval and for a job system that is
+     * waiting on the batch it submitted is the difference between a frame and
+     * a stall.
+     *
+     * wake_thread() is exactly the right call and not a new policy: it runs
+     * check_wait(), which tests the objects FIRST, then a queued user APC,
+     * then `wait->when <= current_time' -- and current_time was refreshed by
+     * get_next_timeout() immediately before this handler ran, so when nothing
+     * is signalled it returns STATUS_TIMEOUT and the thread gets the identical
+     * status by the identical path.  The only behaviour that changes is that a
+     * token which is provably there is preferred to a timer, which is the
+     * order every other entry into check_wait() already uses.
+     *
+     * wait->user is NULL from above on both paths, so end_wait() does not try
+     * to remove a timeout that has already fired. */
+    if (madeira_timeout_recheck() && wake_thread( thread ) != 0) return;
+#endif
 
     if (debug_level) fprintf( stderr, "%04x: *wakeup* signaled=TIMEOUT\n", thread->id );
     end_wait( thread, STATUS_TIMEOUT );
