@@ -83,8 +83,18 @@
 /* ml970: the spin governor's streak / time-to-progress histogram, printed
  * by [srv-stats] in build/ntdll-unix/server_ios.c. */
 # include "ios_spin_hist.h"
+/* ml1050: the [frame] critical-path instrument.  This file is one of its two
+ * producers: it is the only place that knows how long the PRESENTING thread
+ * was blocked and on what.  Everything it contributes is gated behind the
+ * inline ios_frame_tracking() predicate, which is a register read and a
+ * compare on every other thread. */
+# include "ios_frame_stats.h"
 #else
 # define ios_srv_nt_count(which) ((void)0)
+# define ios_frame_tracking() 0
+# define ios_frame_wait_add(kind, ns) ((void)0)
+# define IOS_FRAME_WAIT_FAST 0
+# define IOS_FRAME_WAIT_SLEEP 0
 # define IOS_SPIN_HIST_N 16
 struct ios_spin_snapshot
 {
@@ -265,6 +275,40 @@ static inline int futex_wake_one( const LONG *addr )
 #define MADEIRA_FAST_SPIN        96            /* isb ladder before parking     */
 #define MADEIRA_FAST_CAP_NS      2000000ull    /* 2 ms default, then the server */
 
+/* ml1050: THE ADAPTIVE SPIN, AND WHY 96 ISBs WAS THE WRONG SHAPE.
+ *
+ * MADEIRA_FAST_SPIN is an ITERATION count with no clock in it, so what it
+ * actually buys depends on the core it lands on and on nothing else.  On a
+ * P-core 96 `isb`s is a few microseconds; the kprev5 gameplay capture shows
+ * `__ulock_wait2<-madeira_fast_wait` at 4.5 % of all CPU with busy=1.37 of
+ * six cores, i.e. a job system handing work between cores thousands of times
+ * a frame on a machine that is four fifths idle, paying a park and a wake for
+ * handoffs that were often microseconds away.  A park costs two syscalls, a
+ * context switch out and a scheduler wake-up in; on an idle machine spinning
+ * for tens of microseconds is unambiguously cheaper, and on a busy one it is
+ * unambiguously worse.  So the budget cannot be a constant -- it has to be a
+ * function of whether spinning has been paying.
+ *
+ * The controller is deliberately the simplest thing that self-limits:
+ *   credit starts at MAX and the budget is spin_ns * credit / MAX;
+ *   a timed spin that was SATISFIED adds MADEIRA_SPIN_CREDIT_UP,
+ *   a timed spin that had to park subtracts one.
+ * Steady state: the timed spin survives as long as at least 1 in
+ * (UP + 1) = 1 in 3 of them pay off, and decays to nothing -- one clock read
+ * per wait -- when they do not.  That is the "are there spare cores" question
+ * answered by measurement instead of by sampling host_statistics(), which
+ * would cost a syscall to learn something the payoff rate already implies.
+ *
+ * The budget is additionally clamped to the caller's own remaining timeout by
+ * the same rule the park already uses, so a 30 us WaitForSingleObject can
+ * never be turned into a 60 us one.
+ *
+ * MADEIRA_FASTSYNC_SPIN_US=0 removes the timed phase entirely and restores
+ * exactly the pre-ml1050 ladder. */
+#define MADEIRA_FAST_SPIN_NS     40000ull      /* 40 us ceiling, adaptive below */
+#define MADEIRA_SPIN_CREDIT_MAX  64
+#define MADEIRA_SPIN_CREDIT_UP   2
+
 /* Handle -> cell, learnt lazily with one get_inproc_sync_fd request and then
  * answered from here.  Direct-mapped on the handle index; collisions simply
  * re-learn, which is also what keeps this correct across pseudo-processes:
@@ -352,6 +396,77 @@ static unsigned int madeira_fast_auto_reqs = MADEIRA_FS_AUTO_REQS_DEFAULT;
  * still shows a large `w1 inf', the handoffs are simply longer than the cap
  * and this is the knob to raise. */
 static unsigned long long madeira_fast_cap_ns = MADEIRA_FAST_CAP_NS;
+/* ml1050: adaptive spin budget ceiling and its payoff credit.  See the block
+ * comment next to MADEIRA_FAST_SPIN_NS.  `credit' is a plain int touched with
+ * relaxed adds from every waiting thread: it is a shared estimate of whether
+ * spinning is currently worth it, and a lost update costs one wait's worth of
+ * fidelity, never correctness. */
+static unsigned long long madeira_fast_spin_ns = MADEIRA_FAST_SPIN_NS;
+static int madeira_fast_spin_credit = MADEIRA_SPIN_CREDIT_MAX;
+
+static inline unsigned long long madeira_fast_spin_budget_ns( const LARGE_INTEGER *timeout )
+{
+    int credit;
+    unsigned long long ns;
+
+    if (!madeira_fast_spin_ns) return 0;
+    credit = __atomic_load_n( &madeira_fast_spin_credit, __ATOMIC_RELAXED );
+    if (credit <= 0) return 0;
+    if (credit > MADEIRA_SPIN_CREDIT_MAX) credit = MADEIRA_SPIN_CREDIT_MAX;
+    ns = madeira_fast_spin_ns * (unsigned)credit / MADEIRA_SPIN_CREDIT_MAX;
+    /* Never spin past the caller's own relative timeout -- the same rule the
+     * park below applies to its 2 ms cap, for the same reason. */
+    if (timeout && timeout->QuadPart < 0 &&
+        (unsigned long long)(-timeout->QuadPart) * 100 < ns)
+        ns = (unsigned long long)(-timeout->QuadPart) * 100;
+    return ns;
+}
+
+/* ml1050: log2-microsecond buckets of the park-to-satisfied interval, read and
+ * zeroed once per report window by madeira_fast_park_hist_snapshot().  16
+ * buckets covers 1 us .. >=32 ms, which spans "the signaller was already
+ * running" to "this wait was going to the server anyway". */
+#define MADEIRA_PARK_HIST_N 16
+static unsigned int madeira_fast_park_hist[MADEIRA_PARK_HIST_N];
+
+static inline void madeira_fast_park_hist_add( unsigned long long ns )
+{
+    unsigned long long us = ns / 1000;
+    unsigned idx = us ? (unsigned)(63 - __builtin_clzll( us )) + 1 : 0;
+    if (idx >= MADEIRA_PARK_HIST_N) idx = MADEIRA_PARK_HIST_N - 1;
+    __atomic_fetch_add( &madeira_fast_park_hist[idx], 1, __ATOMIC_RELAXED );
+}
+
+/* The adaptive spin's payoff, counted here rather than read back out of
+ * ios_srv_nt_counts[]: that array is exchanged to zero by
+ * ios_srv_stats_report(), and in a MADEIRA_DIAG build both reporters run in
+ * the same window, so a second reader of it would get whatever the first one
+ * left behind.  These are drained by exactly one reader. */
+static unsigned int madeira_fast_spin_hits, madeira_fast_spin_misses;
+
+/* Exported for the reporter in build/ntdll-unix/server_ios.c (a different
+ * translation unit); fills `out' with the window and zeroes the source. */
+void madeira_fast_park_hist_snapshot( unsigned int *out, unsigned n,
+                                      unsigned int *spin_hit, unsigned int *spin_miss,
+                                      int *credit )
+{
+    unsigned i;
+    for (i = 0; i < n; i++)
+        out[i] = i < MADEIRA_PARK_HIST_N
+               ? __atomic_exchange_n( &madeira_fast_park_hist[i], 0, __ATOMIC_RELAXED ) : 0;
+    *spin_hit  = __atomic_exchange_n( &madeira_fast_spin_hits, 0, __ATOMIC_RELAXED );
+    *spin_miss = __atomic_exchange_n( &madeira_fast_spin_misses, 0, __ATOMIC_RELAXED );
+    *credit    = __atomic_load_n( &madeira_fast_spin_credit, __ATOMIC_RELAXED );
+}
+
+static inline void madeira_fast_spin_credit_add( int delta )
+{
+    int c = __atomic_add_fetch( &madeira_fast_spin_credit, delta, __ATOMIC_RELAXED );
+    if (c > MADEIRA_SPIN_CREDIT_MAX)
+        __atomic_store_n( &madeira_fast_spin_credit, MADEIRA_SPIN_CREDIT_MAX, __ATOMIC_RELAXED );
+    else if (c < 0)
+        __atomic_store_n( &madeira_fast_spin_credit, 0, __ATOMIC_RELAXED );
+}
 
 enum madeira_fast_result
 {
@@ -433,6 +548,13 @@ static void madeira_fast_parse_env(void)
         if (n < 1000) n = 1000;
         madeira_fast_auto_reqs = (unsigned int)n;
     }
+    /* ml1050: the adaptive spin budget.  See madeira_fast_spin_budget_ns(). */
+    if ((e = getenv( "MADEIRA_FASTSYNC_SPIN_US" )))
+    {
+        unsigned long us = strtoul( e, NULL, 10 );
+        if (us > 1000) us = 1000;
+        madeira_fast_spin_ns = (unsigned long long)us * 1000;
+    }
 
     __atomic_store_n( &madeira_fast_peek, peek, __ATOMIC_RELAXED );
     __atomic_store_n( &madeira_fast_sem, sem, __ATOMIC_RELAXED );
@@ -440,10 +562,10 @@ static void madeira_fast_parse_env(void)
     __atomic_store_n( &madeira_fast_mode, mode, __ATOMIC_RELAXED );
     if (__atomic_exchange_n( &madeira_fast_ready, 1, __ATOMIC_RELEASE )) return;   /* announce once */
 
-    ERR( "[fastsync] rev=ml1010 mode=%s peek=%s sem=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
-         " gen-packed - MADEIRA_FASTSYNC=0|cells|auto|1 selects (auto is the default);"
-         " MADEIRA_FS_POLLPEEK=0 disables the read-only zero-timeout answer;"
-         " MADEIRA_FASTSYNC_SEM=0 disables the semaphore path only\n",
+    ERR( "[fastsync] rev=ml1060 mode=%s peek=%s sem=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
+         " gen-packed watch=alertable+plain - MADEIRA_FASTSYNC=0|cells|auto|1 selects"
+         " (auto is the default); MADEIRA_FS_POLLPEEK=0 disables the read-only zero-timeout"
+         " answer; MADEIRA_FASTSYNC_SEM=0 disables the semaphore path only\n",
          mode == MADEIRA_FS_MODE_OFF   ? "off (pre-ml952)" :
          mode == MADEIRA_FS_MODE_CELLS ? "cells (wake path OFF)" :
          mode == MADEIRA_FS_MODE_AUTO  ? "auto (wake path armed on traffic)" : "on",
@@ -451,6 +573,12 @@ static void madeira_fast_parse_env(void)
          (unsigned int)MADEIRA_SYNC_CELLS, (unsigned int)MADEIRA_FAST_CACHE_SIZE,
          (unsigned int)MADEIRA_FAST_SPIN, (unsigned int)(madeira_fast_cap_ns / 1000),
          madeira_fast_auto_reqs );
+    ERR( "[fastsync] ml1050 adaptive spin: isb x%u then up to %lluus of timed spin, budget scaled "
+         "by a payoff credit in [0,%u] (+%d on a spin that was paid, -1 on one that had to park); "
+         "MADEIRA_FASTSYNC_SPIN_US=0 restores the fixed %u-iteration ladder\n",
+         (unsigned int)MADEIRA_FAST_SPIN, madeira_fast_spin_ns / 1000,
+         (unsigned int)MADEIRA_SPIN_CREDIT_MAX, MADEIRA_SPIN_CREDIT_UP,
+         (unsigned int)MADEIRA_FAST_SPIN );
 }
 
 static inline void madeira_fast_init(void)
@@ -1126,13 +1254,13 @@ static inline int madeira_peek_cell( struct madeira_sync_cell *cell, unsigned in
  * *fallback is the timeout the caller must use from here (a relative timeout
  * is reduced by the time this function spent, so the total wait is unchanged;
  * an absolute one needs no adjustment). */
-static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
-                                   const LARGE_INTEGER **fallback, LARGE_INTEGER *store )
+static NTSTATUS madeira_fast_wait_inner( HANDLE handle, const LARGE_INTEGER *timeout,
+                                         const LARGE_INTEGER **fallback, LARGE_INTEGER *store )
 {
     struct madeira_sync_cell *cell;
     unsigned int manual = 0, gen = 0, kind = 0;
-    unsigned long long t0, spent = 0, budget_ns;
-    int i, st, rounds;
+    unsigned long long t0, spent = 0, budget_ns, park_t0 = 0;
+    int i, st, rounds, parked = 0;
 
     *fallback = timeout;
     if (!madeira_fastsync_enabled())
@@ -1179,6 +1307,43 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
         }
     }
 
+    /* ml1050 PHASE B: the adaptive, time-bounded spin.  The ladder above is an
+     * iteration count and cannot be a duration; this is a duration and reads
+     * the clock once per block of MADEIRA_FAST_SPIN isbs rather than once per
+     * iteration, so the measurement does not dominate the thing measured.  It
+     * is skipped entirely when the credit has decayed (budget 0), which costs
+     * one relaxed load. */
+    {
+        unsigned long long spin_ns = madeira_fast_spin_budget_ns( timeout );
+
+        if (spin_ns)
+        {
+            unsigned long long s0 = madeira_now_ns();
+            for (;;)
+            {
+                for (i = 0; i < MADEIRA_FAST_SPIN; i++)
+                {
+                    __asm__ __volatile__( "isb" ::: "memory" );
+                    if (madeira_fast_try( cell, manual, gen, kind ))
+                    {
+                        ios_srv_nt_count( IOS_NT_FAST_HIT );
+                        __atomic_fetch_add( &madeira_fast_spin_hits, 1, __ATOMIC_RELAXED );
+                        if (kind == MADEIRA_CELL_KIND_SEM) ios_srv_nt_count( IOS_FS_SEM_WAIT );
+                        madeira_fast_spin_credit_add( MADEIRA_SPIN_CREDIT_UP );
+                        return STATUS_SUCCESS;
+                    }
+                }
+                /* A generation change means the cell was recycled under us:
+                 * stop spinning on a stranger's object and let the loop below
+                 * take the miss. */
+                if (!madeira_cell_alive( cell, gen )) break;
+                if (madeira_now_ns() - s0 >= spin_ns) break;
+            }
+            __atomic_fetch_add( &madeira_fast_spin_misses, 1, __ATOMIC_RELAXED );
+            madeira_fast_spin_credit_add( -1 );
+        }
+    }
+
     /* Never park past the caller's own relative timeout: doing so would turn a
      * 200 us WaitForSingleObject into a 2 ms one. */
     budget_ns = madeira_fast_cap_ns;
@@ -1217,7 +1382,9 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
             ios_srv_nt_count( IOS_NT_FAST_SLEEP );
             /* the value is re-tested inside the syscall, so a set landing
              * between the load above and here does not sleep */
+            park_t0 = madeira_now_ns();
             madeira_fast_park( madeira_cell_futex( cell ), MADEIRA_CELL_RESET, budget_ns - spent );
+            parked = 1;
         }
 
         /* ml972 DEFECT 2: THE PARK IS THE ONE UNBOUNDED PAUSE IN HERE, AND THE
@@ -1270,6 +1437,23 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
         {
             ios_srv_nt_count( IOS_NT_FAST_HIT );
             if (kind == MADEIRA_CELL_KIND_SEM) ios_srv_nt_count( IOS_FS_SEM_WAIT );
+            /* ml1050: THE WAKE-LATENCY DISTRIBUTION, WHICH NOTHING MEASURED.
+             *
+             * This is the interval from entering the park to the CAS that
+             * satisfied the wait -- i.e. how long a handoff that had to go
+             * through the kernel actually took, measured only on handoffs that
+             * completed.  It is the number the spin budget has to be set
+             * against: a p50 of a few microseconds says the 40 us timed spin
+             * will pay for itself, a p50 in the hundreds says the signaller
+             * genuinely was not ready and spinning only burns a core.
+             *
+             * Not measured from the signaller's CAS on purpose: that would
+             * need a timestamp inside the shared cell, and the cell is 32
+             * bytes with two per cache line by design (ios_fastsync.h) and its
+             * size is asserted by build/host-tests/fastsync-cellrace.c.  The
+             * park-to-satisfied interval is an upper bound on the true wake
+             * latency and answers the same question. */
+            if (parked) madeira_fast_park_hist_add( madeira_now_ns() - park_t0 );
             return STATUS_SUCCESS;
         }
     }
@@ -1309,6 +1493,26 @@ static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
     }
     ios_srv_nt_count( IOS_NT_FAST_MISS );
     return STATUS_NOT_IMPLEMENTED;
+}
+
+/* ml1050: the presenting thread's fast-path wait time, for the [frame] line.
+ * A wrapper rather than a stamp at each of the seven returns: the question is
+ * how long the CALL took, and that is one measurement, not seven.  On every
+ * thread but the presenter this is a register read, a compare and a branch --
+ * ios_frame_tracking() is inline and reads no memory the caller did not
+ * already have. */
+static NTSTATUS madeira_fast_wait( HANDLE handle, const LARGE_INTEGER *timeout,
+                                   const LARGE_INTEGER **fallback, LARGE_INTEGER *store )
+{
+    unsigned long long t0;
+    NTSTATUS ret;
+
+    if (!ios_frame_tracking())
+        return madeira_fast_wait_inner( handle, timeout, fallback, store );
+    t0 = madeira_now_ns();
+    ret = madeira_fast_wait_inner( handle, timeout, fallback, store );
+    ios_frame_wait_add( IOS_FRAME_WAIT_FAST, madeira_now_ns() - t0 );
+    return ret;
 }
 
 /***********************************************************************
@@ -1437,7 +1641,30 @@ static unsigned int madeira_fast_watchdog_check( HANDLE handle, unsigned int fla
 
 /* The INFINITE single-object wait, with a heartbeat.  Used only when the wake
  * path is live; otherwise the caller issues the plain infinite server_wait it
- * always did. */
+ * always did.
+ *
+ * ml1060: IT NOW COVERS ALERTABLE WAITS TOO, AND THAT IS THE WHOLE POINT.
+ *
+ * Through ml1050 both callers gated this on `!alertable', alongside the gate on
+ * madeira_fast_wait() -- which genuinely does need it, because a thread parked
+ * on a futex cell cannot notice a queued user APC.  The heartbeat needs no such
+ * thing: every iteration is an ordinary server_wait with the caller's own
+ * `flags' (SELECT_ALERTABLE included), so an APC still comes back as
+ * STATUS_USER_APC and is returned to the caller unchanged; the ONLY difference
+ * from a single infinite wait is that a wait which has produced nothing for
+ * `ms' is re-asked.
+ *
+ * What the gate cost is measurable in a device log: k67, a managed-runtime
+ * title whose worker waits are all `WaitForSingleObjectEx( h, INFINITE, TRUE )',
+ * shows `select: w1 inf=56429' per 10 s -- 56429 infinite single-object waits
+ * that reached the server with timeout == NULL, i.e. that never entered this
+ * function -- together with `watchdog=3(8)' and `desync=0(0)'.  desync=0 there
+ * is not evidence of health: it is evidence that the detector was switched off
+ * for every thread that could hang.  The same gate is why `sem_wait=0(4)' and
+ * `pollpeek=0(1)': an alertable wait sees none of this mechanism.  The wake
+ * path and the peek keep the gate (a peek answering STATUS_TIMEOUT would skip
+ * the STATUS_USER_APC an alertable zero-timeout wait owes its caller); the
+ * heartbeat, which always goes to the server, does not. */
 static unsigned int madeira_fast_watched_wait( const union select_op *op, data_size_t size,
                                                unsigned int flags, HANDLE handle )
 {
@@ -3874,7 +4101,8 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
     select_op.wait.op = type == WaitAll ? SELECT_WAIT_ALL : SELECT_WAIT;
     for (i = 0; i < count; i++) select_op.wait.handles[i] = wine_server_obj_handle( handles[i] );
 #ifdef WINE_IOS
-    if (count == 1 && type != WaitAll && !timeout && !alertable && madeira_fastsync_enabled())
+    /* ml1060: no `!alertable' here any more -- see madeira_fast_watched_wait(). */
+    if (count == 1 && type != WaitAll && !timeout && madeira_fastsync_enabled())
     {
         ret = madeira_fast_watched_wait( &select_op, offsetof( union select_op, wait.handles[1] ),
                                          flags, handles[0] );
@@ -3936,8 +4164,10 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     select_op.wait.handles[0] = wine_server_obj_handle( handle );
 #ifdef WINE_IOS
     /* ml982: an INFINITE single-object wait is the one shape that can hang
-     * forever if the fast path ever loses a set, so give it a heartbeat. */
-    if (!timeout && !alertable && madeira_fastsync_enabled())
+     * forever if the fast path ever loses a set, so give it a heartbeat.
+     * ml1060: including the ALERTABLE ones, which is every wait a managed
+     * runtime issues -- see madeira_fast_watched_wait(). */
+    if (!timeout && madeira_fastsync_enabled())
     {
         ret = madeira_fast_watched_wait( &select_op, offsetof( union select_op, wait.handles[1] ),
                                          flags, handle );
@@ -4465,15 +4695,30 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         ios_srv_nt_count( IOS_NT_DELAY_NONZERO );
         ios_spin_reset();
 
-        for (;;)
+        /* ml1050: charge a real Sleep(n) on the PRESENTING thread to the frame
+         * breakdown's `sleep=' bucket.  This is the bucket that catches a
+         * poll-with-backoff handoff -- libc++'s std::atomic::wait fallback,
+         * which DXMT's CpuFence and chunk ring both ride, escalates to
+         * sleep_for(elapsed/2) once a wait passes ~64 us, and a millisecond
+         * of that per frame is invisible in every other counter this port
+         * has.  Two clock reads, only on the presenting thread. */
         {
-            struct timeval tv;
-            NtQuerySystemTime( &now );
-            diff = (when - now.QuadPart + 9) / 10;
-            if (diff <= 0) break;
-            tv.tv_sec  = diff / 1000000;
-            tv.tv_usec = diff % 1000000;
-            if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+#ifdef WINE_IOS
+            unsigned long long sl0 = ios_frame_tracking() ? madeira_now_ns() : 0;
+#endif
+            for (;;)
+            {
+                struct timeval tv;
+                NtQuerySystemTime( &now );
+                diff = (when - now.QuadPart + 9) / 10;
+                if (diff <= 0) break;
+                tv.tv_sec  = diff / 1000000;
+                tv.tv_usec = diff % 1000000;
+                if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+            }
+#ifdef WINE_IOS
+            if (sl0) ios_frame_wait_add( IOS_FRAME_WAIT_SLEEP, madeira_now_ns() - sl0 );
+#endif
         }
     }
     return STATUS_SUCCESS;
