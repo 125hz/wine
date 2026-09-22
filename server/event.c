@@ -67,8 +67,10 @@ int madeira_fastsync_sem_enabled(void)
     if (madeira_fastsync_sem_on < 0)
     {
         const char *e = getenv( "MADEIRA_FASTSYNC_SEM" );
-        madeira_fastsync_sem_on = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) ||
-                                         !strcmp( e, "no" ))) ? 0 : 1;
+        /* Device A/B testing found a loading stall only with semaphore cells.
+         * Keep the event fast path, and require an explicit semaphore opt-in
+         * until its cross-thread release/consumption behavior is validated. */
+        madeira_fastsync_sem_on = e && (!strcmp( e, "1" ) || !strcmp( e, "on" ) || !strcmp( e, "yes" ));
     }
     return madeira_fastsync_sem_on && madeira_fastsync_enabled();
 }
