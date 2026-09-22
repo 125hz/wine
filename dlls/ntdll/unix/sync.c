@@ -355,7 +355,7 @@ enum
 static int madeira_fast_mode  = -1;   /* MADEIRA_FS_MODE_*, -1 = not parsed   */
 static int madeira_fast_on    = -1;   /* client wake path active              */
 static int madeira_fast_peek  = 1;    /* MADEIRA_FS_POLLPEEK, default ON      */
-static int madeira_fast_sem   = 1;    /* ml1010 MADEIRA_FASTSYNC_SEM, ON      */
+static int madeira_fast_sem   = 0;    /* ml1160 semaphore cells are opt-in   */
 static int madeira_fast_ready = 0;    /* the parse has happened               */
 
 /* How many event/select operations in one 10 s [srv-stats] window arm the wake
@@ -608,8 +608,10 @@ static void madeira_fast_parse_env(void)
      * allocates no cell for a semaphore at all, so "off" is the pre-ml1010
      * behaviour on both sides rather than a client-only opt-out. */
     e = getenv( "MADEIRA_FASTSYNC_SEM" );
-    sem = (e && (!strcmp( e, "0" ) || !strcmp( e, "off" ) || !strcmp( e, "no" ))) ? 0 : 1;
+    sem = e && (!strcmp( e, "1" ) || !strcmp( e, "on" ) || !strcmp( e, "yes" ));
     if (mode == MADEIRA_FS_MODE_OFF) sem = 0;
+    ERR( "[semaphore-policy] ml1160 cells=%s (opt-in via MADEIRA_FASTSYNC_SEM=1); event fastsync unchanged\n",
+         sem ? "on" : "off" );
 
     if ((e = getenv( "MADEIRA_FASTSYNC_CAP_US" )))
     {
