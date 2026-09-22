@@ -128,6 +128,39 @@ static inline void *afd_guest_ptr( ULONG64 addr )
     if (!(base = ios_wow_base())) return (void *)(uintptr_t)addr;
     return (void *)(base + (ULONG_PTR)(ULONG)addr);
 }
+
+/* iOS-Madeira ml1350: IOCTL_AFD_GET_EVENTS carries the event to reset as a
+ * HANDLE in the InputBuffer argument (Windows' convention; ws2_32's
+ * WSAEnumNetworkEvents passes it that way, with an input size of 0).  The
+ * WoW64 thunk converts every buffer argument as a guest address, so a 32-bit
+ * caller's handle arrives as B + handle.  wine_server_obj_handle() turns that
+ * 64-bit value into 0xfffffff0, the server answers STATUS_INVALID_HANDLE, and
+ * winsock reports WSAENOTSOCK for a valid socket whenever the caller passes
+ * an event.  Undo the window offset for that one argument.
+ * MADEIRA_AFD_EVENT_HANDLE=0 keeps the converted value. */
+static HANDLE afd_event_handle_arg( void *in_buffer )
+{
+    static int enabled = -1;
+    static unsigned int reported;
+    ULONG_PTR base = ios_wow_base(), value = (ULONG_PTR)in_buffer;
+    int mode = __atomic_load_n( &enabled, __ATOMIC_RELAXED );
+    HANDLE ret = in_buffer;
+
+    if (mode < 0)
+    {
+        const char *env = getenv( "MADEIRA_AFD_EVENT_HANDLE" );
+        mode = !env || strcmp( env, "0" );
+        __atomic_store_n( &enabled, mode, __ATOMIC_RELAXED );
+    }
+    if (!base || !value) return ret;
+    if (mode && value > base && value - base <= 0xffffffffu)
+        ret = LongToHandle( (LONG)(ULONG)(value - base) );
+    if (__atomic_load_n( &reported, __ATOMIC_RELAXED ) < 8 &&
+        __atomic_fetch_add( &reported, 1, __ATOMIC_RELAXED ) < 8)
+        dprintf( 2, "[afd-event-handle] ml1350 raw=%#lx handle=%#lx enabled=%d\n",
+                 (unsigned long)value, (unsigned long)(ULONG_PTR)ret, mode );
+    return ret;
+}
 #else
 #define afd_is_wow64_caller()   in_wow64_call()
 static inline void *afd_guest_ptr( ULONG64 addr ) { return u64_to_user_ptr( addr ); }
@@ -2164,7 +2197,11 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
         case IOCTL_AFD_GET_EVENTS:
         {
             struct afd_get_events_params *params = out_buffer;
+#ifdef WINE_IOS
+            HANDLE reset_event = afd_event_handle_arg( in_buffer ); /* sic */
+#else
             HANDLE reset_event = in_buffer; /* sic */
+#endif
 
             TRACE( "reset_event %p\n", reset_event );
             if (in_size) FIXME( "unexpected input size %u\n", in_size );
