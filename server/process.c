@@ -68,6 +68,15 @@
 
 static struct list process_list = LIST_INIT(process_list);
 static int running_processes, user_processes;
+
+#ifdef WINE_IOS
+/* Read only on the server thread, after handling process creation/exit. The
+ * session's original client may exit while its descendants still need IPC. */
+int ios_server_user_process_count(void)
+{
+    return user_processes;
+}
+#endif
 static struct event *shutdown_event;           /* signaled when shutdown starts */
 static struct timeout_user *shutdown_timeout;  /* timeout for server shutdown */
 static int shutdown_stage;  /* current stage in the shutdown process */
