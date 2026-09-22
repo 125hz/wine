@@ -617,11 +617,19 @@ static inline void init_unicode_string( UNICODE_STRING *str, const WCHAR *data )
     str->Buffer = (WCHAR *)data;
 }
 
+#ifdef WINE_IOS
+extern ULONG_PTR ios_section_zero_bits(void);
+#endif
+
 static inline NTSTATUS map_section( HANDLE mapping, void **ptr, SIZE_T *size, ULONG protect )
 {
     *ptr = NULL;
     *size = 0;
-    return NtMapViewOfSection( mapping, NtCurrentProcess(), ptr, user_space_wow_limit,
+    ULONG_PTR zero_bits = user_space_wow_limit;
+#ifdef WINE_IOS
+    zero_bits = ios_section_zero_bits();
+#endif
+    return NtMapViewOfSection( mapping, NtCurrentProcess(), ptr, zero_bits,
                                0, NULL, size, ViewShare, 0, protect );
 }
 
