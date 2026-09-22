@@ -1932,7 +1932,9 @@ DECL_HANDLER(init_first_thread)
     if ((fd = get_inproc_device_fd()) >= 0)
     {
         reply->inproc_device = get_process_id( process ) | 1;
+#ifndef WINE_IOS   /* ml1058: the device is a constant pseudo fd on iOS; nothing to send */
         send_client_fd( process, fd, reply->inproc_device );
+#endif
     }
 }
 
@@ -2556,6 +2558,11 @@ DECL_HANDLER(get_inproc_alert_fd)
     else
     {
         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */
+#ifdef WINE_IOS
+        { extern void madsync_post( unsigned int pid, unsigned int handle, int fd );
+          madsync_post( get_process_id( current->process ), reply->handle, fd ); }   /* ml1058 */
+#else
         send_client_fd( current->process, fd, reply->handle );
+#endif
     }
 }

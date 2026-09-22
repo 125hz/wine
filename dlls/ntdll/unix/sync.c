@@ -545,8 +545,69 @@ struct inproc_sync
 #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
 
+#ifdef WINE_IOS
+/* iOS-Madeira ml1058: this cache is indexed by HANDLE VALUE, and on iOS every
+ * pseudo-process shares this one copy of ntdll's unix side while owning its own
+ * handle table. One global cache would hand process B the object behind process
+ * A's handle 0x44. Same rule as the fd cache (ml571): one cache per PEB, dropped
+ * when that pseudo-process dies so a recycled PEB address starts clean. */
+struct ios_inproc_cache
+{
+    void *peb;
+    struct inproc_sync *blocks[INPROC_SYNC_CACHE_ENTRIES];
+    struct inproc_sync  initial[INPROC_SYNC_CACHE_BLOCK_SIZE];
+};
+#define IOS_MAX_INPROC_CACHES 64
+static struct ios_inproc_cache *ios_inproc_caches[IOS_MAX_INPROC_CACHES];
+static pthread_mutex_t ios_inproc_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ios_inproc_cache ios_inproc_cache_fallback;
+
+static struct ios_inproc_cache *ios_get_inproc_cache(void)
+{
+    void *peb = NtCurrentTeb()->Peb;
+    struct ios_inproc_cache *c = NULL;
+    int i, free_slot = -1;
+
+    for (i = 0; i < IOS_MAX_INPROC_CACHES; i++)      /* lock-free hit: entries only appear/disappear under the lock */
+    {
+        struct ios_inproc_cache *e = ios_inproc_caches[i];
+        if (e && e->peb == peb) return e;
+    }
+    pthread_mutex_lock( &ios_inproc_cache_lock );
+    for (i = 0; i < IOS_MAX_INPROC_CACHES; i++)
+    {
+        if (ios_inproc_caches[i] && ios_inproc_caches[i]->peb == peb) { c = ios_inproc_caches[i]; break; }
+        if (!ios_inproc_caches[i] && free_slot < 0) free_slot = i;
+    }
+    if (!c && free_slot >= 0 && (c = calloc( 1, sizeof(*c) )))
+    {
+        c->peb = peb;
+        ios_inproc_caches[free_slot] = c;
+    }
+    pthread_mutex_unlock( &ios_inproc_cache_lock );
+    return c ? c : &ios_inproc_cache_fallback;
+}
+
+/* Called when a pseudo-process dies (next to ios_fd_cache_release). The blocks
+ * are deliberately NOT freed: a laggard thread may still be inside a lookup. */
+void ios_inproc_cache_release( void *peb )
+{
+    int i;
+    pthread_mutex_lock( &ios_inproc_cache_lock );
+    for (i = 0; i < IOS_MAX_INPROC_CACHES; i++)
+        if (ios_inproc_caches[i] && ios_inproc_caches[i]->peb == peb)
+        {
+            ios_inproc_caches[i]->peb = (void *)~(uintptr_t)0;   /* never matches again */
+            ios_inproc_caches[i] = NULL;
+        }
+    pthread_mutex_unlock( &ios_inproc_cache_lock );
+}
+#define inproc_sync_cache               (ios_get_inproc_cache()->blocks)
+#define inproc_sync_cache_initial_block (ios_get_inproc_cache()->initial)
+#else
 static struct inproc_sync *inproc_sync_cache[INPROC_SYNC_CACHE_ENTRIES];
 static struct inproc_sync inproc_sync_cache_initial_block[INPROC_SYNC_CACHE_BLOCK_SIZE];
+#endif
 
 static inline unsigned int inproc_sync_handle_to_index( HANDLE handle, unsigned int *entry )
 {
@@ -673,10 +734,17 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
         req->handle = wine_server_obj_handle( handle );
         if (!(ret = wine_server_call( req )))
         {
-            obj_handle_t fd_handle;
             sync->refcount = 1;
+#ifdef WINE_IOS
+            /* ml1058: the descriptor is a pseudo fd handed over in-process; see
+             * build/madsync. Nothing travels over the socket. */
+            sync->fd = madsync_take( GetCurrentProcessId(), wine_server_obj_handle( handle ) );
+            if (sync->fd < 0) ret = STATUS_INVALID_HANDLE;
+#else
+            obj_handle_t fd_handle;
             sync->fd = wine_server_receive_fd( &fd_handle );
             assert( wine_server_ptr_handle(fd_handle) == handle );
+#endif
             sync->access = reply->access;
             sync->type = reply->type;
             sync->closed = 0;
@@ -884,8 +952,13 @@ static int get_inproc_alert_fd(void)
         {
             if (!server_call_unlocked( req ))
             {
+#ifdef WINE_IOS
+                (void)token;
+                data->alert_fd = fd = madsync_take( GetCurrentProcessId(), reply->handle );
+#else
                 data->alert_fd = fd = wine_server_receive_fd( &token );
                 assert( token == reply->handle );
+#endif
             }
         }
         SERVER_END_REQ;
@@ -2395,6 +2468,32 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
  */
 NTSTATUS WINAPI NtYieldExecution(void)
 {
+#ifdef WINE_IOS
+    /* iOS-Madeira ml1063: ADAPTIVE YIELD. A game thread that spins
+     * WaitForSingleObject(h, 0) / SwitchToThread() waiting for work keeps a whole
+     * core at 100 % (sampled: one such thread pegged for the entire benchmark,
+     * ~290M empty polls in one run), because sched_yield with nothing else
+     * runnable returns at once. On a 16-thread desktop that is harmless; on a
+     * phone with two performance cores it takes one of them from the critical
+     * thread and heats the package into throttling. After a burst of back-to-back
+     * yields the thread is put to sleep for 100 us instead: the same forward
+     * progress with a bounded latency cost. Streaks reset after a 2 ms gap. */
+    {
+        static __thread unsigned long long ios_last_yield_ns;
+        static __thread unsigned ios_yield_streak;
+        struct timespec ts;
+        unsigned long long now;
+        clock_gettime( CLOCK_MONOTONIC, &ts );
+        now = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+        if (now - ios_last_yield_ns < 2000000ull) ios_yield_streak++; else ios_yield_streak = 0;
+        ios_last_yield_ns = now;
+        if (ios_yield_streak > 256)
+        {
+            usleep( 100 );
+            return STATUS_SUCCESS;
+        }
+    }
+#endif
 #ifdef HAVE_SCHED_YIELD
 #ifdef RUSAGE_THREAD
     struct rusage u1, u2;

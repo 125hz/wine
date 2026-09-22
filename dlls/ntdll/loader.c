@@ -1333,6 +1333,52 @@ void ios_eager_delay_resolve( const char *when )
 }
 #endif
 
+#ifdef __arm64ec__
+/* Candidate: preserve the x64-facing side of public import forwarders.
+ * An EC image is mixed-ISA; its primary IAT is not necessarily native-only.
+ * The linker-provided auxiliary import checker remains available to EC callers.
+ * Keep this separate from any broad auxiliary-IAT or call-checker redesign.
+ */
+#include "arm64ec_x64_export_iat.c"
+
+static BOOL arm64ec_iat_is_exported_x64( HMODULE module, const IMAGE_THUNK_DATA *slot )
+{
+    const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
+    const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( module );
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    ULONG export_size;
+    ULONG_PTR slot_rva = (ULONG_PTR)slot - (ULONG_PTR)module;
+
+    BOOL selected;
+
+    if (!metadata || !nt || slot_rva > nt->OptionalHeader.SizeOfImage) return FALSE;
+    exports = RtlImageDirectoryEntryToData( module, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &export_size );
+    if (!exports) return FALSE;
+    selected = arm64ec_iat_slot_is_x64_export( module, nt->OptionalHeader.SizeOfImage, slot_rva,
+                                               (const char *)exports - (const char *)module, export_size,
+                                               metadata->CodeMap, metadata->CodeMapCount );
+    /* ml943: this IS the canary Astra asked for, folded into the real run so one
+     * launch answers both questions. A selected slot must end up holding the
+     * x64-visible FFS of the imported export, NOT its native ARM64 body -- the
+     * body is what a hook resolver was reaching through the FF25 stub and
+     * overwriting with x64 instructions. Print the slot and the value we are
+     * preserving; cross-check the value against the [jit-pool] image lines to
+     * confirm it lands in .hexpthk and not in .text. Capped: import binding is
+     * hot and there are ~1565 selected slots across the shipped DLL set. */
+    if (selected)
+    {
+        static int x64_iat_log;
+        if (x64_iat_log < 40)
+        {
+            x64_iat_log++;
+            ERR( "ml943 [x64-iat] %p slot rva %#x: KEEPING x64 target %p (public FF25 export stub, no native redirect)\n",
+                 module, (unsigned int)slot_rva, (void *)slot->u1.Function );
+        }
+    }
+    return selected;
+}
+#endif
+
 static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, LPCWSTR load_path, WINE_MODREF **pwm )
 {
     HMODULE module = wm->ldr.DllBase;
@@ -1452,7 +1498,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
                      (void *)thunk_list->u1.Function );
             }
 #ifdef __arm64ec__
-            else if (imp_metadata)
+            else if (imp_metadata && !arm64ec_iat_is_exported_x64( module, thunk_list ))
                 thunk_list->u1.Function = (ULONG_PTR)arm64ec_redirect_ptr( imp_mod,
                                                                            (void *)thunk_list->u1.Function,
                                                                            imp_metadata );
@@ -1475,7 +1521,7 @@ static BOOL import_dll( WINE_MODREF *wm, const IMAGE_IMPORT_DESCRIPTOR *descr, L
                      (void *)thunk_list->u1.Function );
             }
 #ifdef __arm64ec__
-            else if (imp_metadata)
+            else if (imp_metadata && !arm64ec_iat_is_exported_x64( module, thunk_list ))
             {
                 void *pre = (void *)thunk_list->u1.Function;
 

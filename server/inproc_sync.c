@@ -31,6 +31,7 @@
 #include "handle.h"
 #include "request.h"
 #include "thread.h"
+#include "process.h"
 #include "user.h"
 
 #ifdef HAVE_LINUX_NTSYNC_H
@@ -47,7 +48,11 @@
 int get_inproc_device_fd(void)
 {
     static int fd = -2;
+#ifdef WINE_IOS
+    if (fd == -2) fd = madsync_enabled() ? MADSYNC_DEVICE_FD : -1;   /* ml1058: the userspace "driver" */
+#else
     if (fd == -2) fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );
+#endif
     return fd;
 }
 
@@ -300,7 +305,11 @@ DECL_HANDLER(get_inproc_sync_fd)
     reply->access = get_handle_access( current->process, req->handle );
 
     if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
+#ifdef WINE_IOS
+    else madsync_post( get_process_id( current->process ), req->handle, fd );   /* ml1058: no SCM_RIGHTS for a pseudo fd */
+#else
     else send_client_fd( current->process, fd, req->handle );
+#endif
 
     release_object( obj );
 }

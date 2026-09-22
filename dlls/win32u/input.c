@@ -1316,7 +1316,7 @@ HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
 
     TRACE_(keyboard)( "layout %p, flags %x\n", layout, flags );
 
-    if (flags) FIXME_(keyboard)( "flags %x not supported\n", flags );
+    if (flags) { static int once; if (!once++) FIXME_(keyboard)( "flags %x not supported (reported once)\n", flags ); }   /* iOS ml1051: 45,713 lines in one run */
 
     if (layout == (HKL)HKL_NEXT || layout == (HKL)HKL_PREV)
     {

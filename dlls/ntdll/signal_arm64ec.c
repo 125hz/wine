@@ -3687,16 +3687,56 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                                 WINE_UNIX_CALL( unix_ios_jit_alias_probe, &pp );
                             }
                             {
+                                /* ml948: THIS DUMP USED TO CRASH THE HANDLER.
+                                 *
+                                 * It dereferenced (grip - 32) directly. `lim` was clipped only
+                                 * when the alias probe returned an `end`, so whenever the probe
+                                 * found NOTHING mapped -- exactly the case for a wild
+                                 * reconstructed RIP, which is when this telemetry matters most --
+                                 * it read 64 bytes from an unmapped address INSIDE exception
+                                 * dispatch and faulted recursively.
+                                 *
+                                 * Measured: a run whose guest RIP became 0x204d5241 then showed
+                                 * a native fault at 0x204d5221 = RIP-32, i.e. this loop, and the
+                                 * faulting `ldrb w2,[x25],#1` is the byte-formatting read. That
+                                 * artefact was mistaken for a guest string parser and cost a
+                                 * whole line of investigation. Same recurrence at 0x48d28a41-32.
+                                 *
+                                 * Copy through NtReadVirtualMemory instead: it returns a status
+                                 * and cannot fault us. An alias-probe hit is NOT a lifetime
+                                 * guarantee, so the probe's `end` is now only a clip hint, never
+                                 * the safety check -- do not go back to query-then-dereference.
+                                 * Underflow is handled explicitly. */
                                 unsigned lim = 64;
+                                unsigned char buf[64];
+                                SIZE_T got = 0;
+                                NTSTATUS rst;
+
                                 if (pp.end && grip - 32 < pp.end && pp.end - (grip - 32) < 64)
                                     lim = (unsigned)(pp.end - (grip - 32));
-                                for (i = 0; i < lim; i++)
-                                    off += sprintf( line + off, "%02x ", rx[i] );
-                                /* ml637: `lim - 32 - 1` wrapped when lim==32 and printed
-                                 * "+4294967295". Print the byte count, not a signed range. */
-                                ERR( "[guest-bytes] ml631 #%d RIP=0x%I64x RX from -32, %u bytes: %s%s\n",
-                                     gb_n, grip, lim, line,
-                                     lim < 64 ? "   (clipped at mapping end)" : "" );
+                                if (grip < 32)
+                                {
+                                    ERR( "[guest-bytes] ml948 #%d RIP=0x%I64x < 32 — no window to dump\n",
+                                         gb_n, grip );
+                                }
+                                else if (!NT_SUCCESS( (rst = NtReadVirtualMemory( GetCurrentProcess(),
+                                                                (const void *)(ULONG_PTR)(grip - 32),
+                                                                buf, lim, &got )) ) || !got)
+                                {
+                                    ERR( "[guest-bytes] ml948 #%d RIP=0x%I64x window [-32,+%u) UNREADABLE "
+                                         "(status %08x, got %u) — dump skipped, handler intact\n",
+                                         gb_n, grip, lim, (unsigned int)rst, (unsigned)got );
+                                }
+                                else
+                                {
+                                    for (i = 0; i < (unsigned)got; i++)
+                                        off += sprintf( line + off, "%02x ", buf[i] );
+                                    /* ml637: `lim - 32 - 1` wrapped when lim==32 and printed
+                                     * "+4294967295". Print the byte count, not a signed range. */
+                                    ERR( "[guest-bytes] ml631 #%d RIP=0x%I64x RX from -32, %u of %u bytes: %s%s\n",
+                                         gb_n, grip, (unsigned)got, lim, line,
+                                         (unsigned)got < 64 ? "   (short read / clipped)" : "" );
+                                }
                             }
                             if (pp.base)
                             {
@@ -4744,6 +4784,44 @@ static void __attribute__((naked)) arm64x_check_call(void)
           * So: correct-but-unlandable until that false positive is found. The fixed version
           * is preserved in the task notes. Do not "fix" this without re-running the CEF
           * check -- verifying IsEcCode flips 0->1 does NOT prove the outcome still works. */
+         /* iOS-Madeira ml975: BOUNDS-CHECK THE TARGET BEFORE INDEXING THE BITMAP.
+          *
+          * RtlIsEcCode (the C reader, same file) already does this, and its comment
+          * records why: alloc_arm64ec_map() sizes EcCodeBitMap from
+          * min(address_space_limit, host_addr_space_limit) rather than Windows'
+          * 128TB, because one bit per 4KB page over the full range would cost a
+          * 4.06GB reservation. On iOS that yields 0x8000000000 (512GB) of coverage
+          * in a 16MB view. Steam hit the unchecked case in ml161:
+          * RtlIsEcCode(0x7300ffffffff) indexed 0x74d6ddfff8, past the view, and
+          * segfaulted. This asm fast path never received the same guard.
+          *
+          * rdr38/rdr39 is the same failure from a different caller: the guest made
+          * an indirect call to a garbage target (x11 = 0xc0be0f4800b60f00, eight
+          * bytes that disassemble as x86 -- read out of an instruction stream), the
+          * `ldr x16,[x16,x17,lsl #3]` below indexed 0x1817c1e900168 past the bitmap
+          * base and faulted at 0x1818775d80168. x18, the PEB and the bitmap pointer
+          * were all VALID; only the target was bad.
+          *
+          * iOS user VA is 39-bit (512GB), which is also exactly the bitmap's
+          * coverage, so one shift tests both: any bit at or above 2^39 means the
+          * address can be neither legitimate code nor representable in the map.
+          * Branch to .Lexit -- the "not EC code, use the x64 exit thunk" path, which
+          * is the same answer RtlIsEcCode gives for an out-of-range pointer, and the
+          * only exit that does NOT dereference x11 (both .Ljmp and the
+          * fast-forward/syscall checks load from [x11], so they would fault too).
+          * The guest's bad call then faults in the guest, attributed to the guest,
+          * instead of killing a thread inside ntdll.
+          *
+          * Deliberately does NOT touch the `ldr x16,[x18,#0x60]` line below: ml246
+          * A/B-proved over 8 runs that "correcting" that read breaks CEF. This only
+          * changes addresses that currently crash, and it moves them in the same
+          * direction ml246 documents as safe (more targets taking the exit thunk).
+          *
+          * Not covered, deliberately, to keep the scope to the observed fault: a
+          * NULL or small-but-invalid target still reaches `ldr x16,[x11]` below and
+          * faults there, which is what Windows would also do. */
+         "lsr x16, x11, #39\n\t"            /* ml975: beyond 39-bit VA / map coverage? */
+         "cbnz x16, .Lexit\n\t"             /*        -> not EC code, exit thunk */
          "ldr x16, [x18, #0x60]\n\t"        /* peb -- see above, intentionally x18 */
          "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
          "ldr x16, [x16, #0x368]\n\t"       /* peb->EcCodeBitMap */
