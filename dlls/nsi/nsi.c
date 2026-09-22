@@ -196,7 +196,7 @@ DWORD WINAPI NsiEnumerateObjectsAllParametersEx( struct nsi_enumerate_all_ex *pa
         if (!nsi_unix_fallback()) return device_err;
         status = WINE_UNIX_CALL( 0, params );
         if (!InterlockedExchange( &logged, 1 ))
-            ERR( "no \\\\.\\Nsi (err %lu); serviced in-process, status %#lx rev=ml472\n",
+            ERR( "no \\\\.\\Nsi (err %lu); serviced in-process, status %#lx rev=ml1290\n",
                  device_err, status );
         if (status == STATUS_BUFFER_OVERFLOW) return ERROR_MORE_DATA;
         /* ml472: unserviced tables keep the exact pre-fallback error so callers
@@ -286,7 +286,14 @@ DWORD WINAPI NsiGetAllParametersEx( struct nsi_get_all_parameters_ex *params )
     DWORD err = ERROR_SUCCESS;
     BYTE *out, *ptr;
 
-    if (device == INVALID_HANDLE_VALUE) return GetLastError();
+    if (device == INVALID_HANDLE_VALUE)
+    {
+        DWORD device_err = GetLastError();
+        NTSTATUS status;
+        if (!nsi_unix_fallback()) return device_err;
+        status = WINE_UNIX_CALL( 1, params );
+        return status == STATUS_NOT_SUPPORTED ? device_err : RtlNtStatusToDosError( status );
+    }
 
     in = malloc( in_size );
     out = malloc( out_size );
@@ -353,7 +360,14 @@ DWORD WINAPI NsiGetParameterEx( struct nsi_get_parameter_ex *params )
     ULONG in_size = FIELD_OFFSET( struct nsiproxy_get_parameter, key[params->key_size] ), received;
     DWORD err = ERROR_SUCCESS;
 
-    if (device == INVALID_HANDLE_VALUE) return GetLastError();
+    if (device == INVALID_HANDLE_VALUE)
+    {
+        DWORD device_err = GetLastError();
+        NTSTATUS status;
+        if (!nsi_unix_fallback()) return device_err;
+        status = WINE_UNIX_CALL( 2, params );
+        return status == STATUS_NOT_SUPPORTED ? device_err : RtlNtStatusToDosError( status );
+    }
 
     in = malloc( in_size );
     if (!in) return ERROR_OUTOFMEMORY;
