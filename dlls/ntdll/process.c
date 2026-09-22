@@ -463,6 +463,26 @@ BOOLEAN WINAPI RtlWow64RequestCrossProcessHeavyFlush( CROSS_PROCESS_WORK_HDR *li
     return TRUE;
 }
 
+/***********************************************************************
+ *              RtlWow64SuspendThread (NTDLL.@)
+ */
+NTSTATUS WINAPI RtlWow64SuspendThread( HANDLE thread, ULONG *count )
+{
+    UNICODE_STRING name, value;
+    WCHAR buffer[2];
+    static LONG reports;
+    BOOL enabled;
+
+    RtlInitUnicodeString( &name, L"MADEIRA_WOW_SUSPEND" );
+    value.Buffer = buffer; value.Length = 0; value.MaximumLength = sizeof(buffer);
+    enabled = RtlQueryEnvironmentVariable_U( NULL, &name, &value ) ||
+              value.Length != sizeof(WCHAR) || buffer[0] != '0';
+    if (InterlockedIncrement( &reports ) <= 4)
+        DbgPrint( "[wow-suspend] ml1280 enabled=%u\n", enabled );
+    if (!enabled) return STATUS_NOT_IMPLEMENTED;
+    return NtSuspendThread( thread, count );
+}
+
 #endif /* _WIN64 */
 
 /**********************************************************************
