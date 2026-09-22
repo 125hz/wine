@@ -666,6 +666,16 @@ static inline void madeira_fast_init(void)
     if (!__atomic_load_n( &madeira_fast_ready, __ATOMIC_ACQUIRE )) madeira_fast_parse_env();
 }
 
+/* Called by the iOS session launcher only after the previous server has
+ * joined and before its replacement or any guest thread starts. Preserve
+ * cells/generations: resetting the table would make old handles alias. The
+ * next guest-side init reparses its policy with a valid TEB; doing that here
+ * on the Swift launch worker would run Wine diagnostics without a TEB. */
+void madeira_fast_reload_session(void)
+{
+    __atomic_store_n( &madeira_fast_ready, 0, __ATOMIC_RELEASE );
+}
+
 /* "may this call take a token, park, or publish a wake" -- the client half. */
 static inline int madeira_fastsync_enabled(void)
 {

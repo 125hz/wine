@@ -57,6 +57,14 @@ static int madeira_fastsync_sem_on = -1;   /* ml1010 MADEIRA_FASTSYNC_SEM       
 
 static int madeira_fastsync_enabled(void);
 
+/* Session boundary only, before the server thread starts. Existing objects
+ * retain their cell representation; these flags govern new allocations. */
+void madeira_fastsync_reload_session(void)
+{
+    madeira_fastsync_on = -1;
+    madeira_fastsync_sem_on = -1;
+}
+
 /* ml1010: the SEMAPHORE half of the cell table, which is off with one env var
  * of its own so that a bad semaphore round can be turned off without giving up
  * the event path that has already shipped and run with desync=0.  Off also
