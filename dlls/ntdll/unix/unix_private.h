@@ -505,9 +505,16 @@ static inline NTSTATUS wait_async( HANDLE handle, BOOL alertable )
     return server_wait_for_object( handle, alertable, NULL );
 }
 
+#ifdef WINE_IOS
+extern BOOL ios_in_wow64_call(void);
+#endif
 static inline BOOL in_wow64_call(void)
 {
+#ifdef WINE_IOS
+    return ios_in_wow64_call();
+#else
     return is_win64 && is_wow64();
+#endif
 }
 
 static inline void set_async_iosb( client_ptr_t iosb, NTSTATUS status, ULONG_PTR info )
