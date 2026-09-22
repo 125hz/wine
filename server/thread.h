@@ -116,6 +116,11 @@ struct thread
      * GetThreadContext/debug paths, so the counter cannot distinguish "capture and
      * let it run" from "capture and keep it stopped". */
     int                    ios_mach_suspended;
+    /* ml1330: created suspended and has not yet posted its own start context
+     * from wait_suspend(). While set, stop_thread() leaves the context pending
+     * for the thread to fill instead of taking a Mach snapshot of a thread that
+     * is still initialising. */
+    int                    ios_start_pending;
 #endif
 };
 

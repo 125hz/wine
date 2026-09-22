@@ -436,6 +436,7 @@ static inline void init_thread_structure( struct thread *thread )
      * thread_resume() on threads that were never suspended (KERN_FAILURE 5).
      * The ml730 run silently measured nothing because of this line's absence. */
     thread->ios_mach_suspended = 0;
+    thread->ios_start_pending = 0;   /* ml1330; same 0x55 poisoning as above */
 #endif
     thread->dbg_hidden      = 0;
     thread->bypass_proc_suspend = 0;
@@ -1043,6 +1044,29 @@ void stop_thread( struct thread *thread )
      * fails (no port yet, init not finished) does not wedge the context in
      * STATUS_PENDING for the rest of the thread's life. */
     thread->context->ios_snapshot = 1;
+    /* ml1330: A THREAD STILL STARTING UP REPORTS ITS OWN CONTEXT.
+     *
+     * A thread created suspended parks in wait_suspend() during its startup
+     * (init_thread tells it to, because it is suspended or a context is
+     * pending here) and posts its real initial registers through select. A
+     * Mach snapshot taken before it gets there reads a half-initialised thread:
+     * no syscall frame, no CPU area, guest Rip/Rsp zero (device log: `state=
+     * unknown ... rip=0x0 rsp=0x0'). The caller then acts on garbage, and the
+     * thread's own post is refused by select because a non-pending context is
+     * already there, so its correct start context is lost. Leave the context
+     * PENDING instead, exactly as upstream does before the target stops: the
+     * reader waits on the context sync and receives what the thread posts, and
+     * a SetThreadContext made meanwhile is applied by the thread on resume.
+     * MADEIRA_CTX_START_WAIT=0 restores the immediate snapshot. */
+    if (thread->ios_start_pending && thread != current)
+    {
+        static unsigned int n_wait;
+        thread->context->ios_snapshot = 0;
+        if (++n_wait <= 8)
+            fprintf( stderr, "[ctx-start] ml1330 tid=%04x read before its start: waiting for the "
+                     "thread's own context instead of a snapshot\n", thread->id );
+        return;
+    }
 #endif
     /* can't stop a thread while initialisation is in progress */
     if (!is_process_init_done(thread->process)) return;
@@ -1998,7 +2022,15 @@ DECL_HANDLER(new_thread)
                  thread->id, process->id, current->id, request_fd );
 #endif
         thread->system_regs = current->system_regs;
-        if (req->flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
+        if (req->flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED)
+        {
+            thread->suspend++;
+#ifdef WINE_IOS
+            /* ml1330: see the start-context note in stop_thread(). */
+            extern int ios_ctx_start_wait_enabled( void );
+            thread->ios_start_pending = ios_ctx_start_wait_enabled();
+#endif
+        }
         thread->dbg_hidden = !!(req->flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
         thread->bypass_proc_suspend = !!(req->flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
         reply->tid = get_thread_id( thread );
@@ -2112,6 +2144,11 @@ DECL_HANDLER(init_thread)
     set_thread_affinity( current, current->affinity );
 
     reply->suspend = (is_thread_suspended( current ) || current->context != NULL);
+#ifdef WINE_IOS
+    /* ml1330: a thread told not to park will never post a start context, so
+     * later reads fall back to the ordinary capture. */
+    if (!reply->suspend) current->ios_start_pending = 0;
+#endif
 }
 
 /* terminate a thread */
@@ -2297,6 +2334,16 @@ DECL_HANDLER(select)
         ctx->status = STATUS_SUCCESS;
         current->suspend_cookie = req->cookie;
         signal_sync( ctx->sync );
+#ifdef WINE_IOS
+        if (current->ios_start_pending)
+        {
+            static unsigned int n_done;
+            current->ios_start_pending = 0;
+            if (++n_done <= 8)
+                fprintf( stderr, "[ctx-start] ml1330 tid=%04x posted its start context (pending read completed=%d)\n",
+                         current->id, ctx->ios_snapshot ? 0 : 1 );
+        }
+#endif
     }
 
     if (!req->cookie) goto invalid_param;
