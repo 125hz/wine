@@ -978,6 +978,8 @@ static void free_accept_req( void *private )
     free( req );
 }
 
+static void ios_accept_trace( struct sock *sock, const char *phase, unsigned int status );
+
 static void fill_accept_output( struct accept_req *req )
 {
     const data_size_t out_size = req->iosb->out_size;
@@ -1003,10 +1005,12 @@ static void fill_accept_output( struct accept_req *req )
         if (!req->accepted && errno == EWOULDBLOCK)
         {
             req->accepted = 1;
+            ios_accept_trace( req->acceptsock, "recv-wait", 0 );
             sock_reselect( req->acceptsock );
             return;
         }
 
+        ios_accept_trace( req->acceptsock, "recv-failed", sock_get_ntstatus( errno ) );
         async_terminate( async, sock_get_ntstatus( errno ) );
         free( out_data );
         return;
@@ -1045,22 +1049,29 @@ static void fill_accept_output( struct accept_req *req )
     }
     memcpy( out_data + req->recv_len + req->local_len, &win_len, sizeof(int) );
 
+    ios_accept_trace( req->acceptsock, "delivered", size );
     async_request_complete( req->async, STATUS_SUCCESS, size, out_size, out_data );
 }
 
 /* Bounded metadata only: diagnose an accepted socket whose completion never
- * reaches its owner without recording network payloads or account details. */
+ * reaches its owner without recording network payloads or account details.
+ * ml1360: "queued" has its own small budget. A listener queues many AcceptEx
+ * requests up front, and in device log 163 they used the whole shared budget,
+ * so no completion or failure was ever recorded. The status of "delivered" is
+ * the number of first-data bytes handed to AcceptEx, not their content. */
 static void ios_accept_trace( struct sock *sock, const char *phase, unsigned int status )
 {
     static int enabled = -1;
-    static unsigned int count;
+    static unsigned int queued, outcomes;
+    int is_queued = !strcmp( phase, "queued" );
+    unsigned int *count = is_queued ? &queued : &outcomes;
     if (enabled < 0)
     {
         const char *env = getenv( "MADEIRA_SOCKET_ACCEPT_TRACE" );
         enabled = !env || strcmp( env, "0" );
     }
-    if (enabled && count++ < 24)
-        fprintf( stderr, "[socket-accept] ml1300 phase=%s port=%u status=%08x\n",
+    if (enabled && (*count)++ < (is_queued ? 6u : 48u))
+        fprintf( stderr, "[socket-accept] ml1360 phase=%s port=%u status=%08x\n",
                  phase, ntohs( sock->addr.in.sin_port ), status );
 }
 
