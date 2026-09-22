@@ -7961,6 +7961,33 @@ static BOOL async_write_proc( void *user, ULONG_PTR *info, unsigned int *status 
     return TRUE;
 }
 
+#ifdef WINE_IOS
+/* A session contains native and WoW pseudo-processes at the same time.
+ * The loader temporarily clears wow_peb while booting a child, and otherwise
+ * leaves it pointing at the last WoW child. Neither value identifies this
+ * caller's I/O ABI. The window registry is keyed by the calling TEB/PEB. */
+extern ULONG_PTR ios_wow_base(void);
+BOOL ios_in_wow64_call(void)
+{
+    static int enabled = -1;
+    static unsigned int reported;
+    int mode = __atomic_load_n( &enabled, __ATOMIC_RELAXED );
+    BOOL legacy = is_win64 && is_wow64();
+    BOOL owner = is_win64 && ios_wow_base() != 0;
+    if (mode < 0)
+    {
+        const char *env = getenv( "MADEIRA_IO_STATUS_OWNER" );
+        mode = !env || strcmp( env, "0" );
+        __atomic_store_n( &enabled, mode, __ATOMIC_RELAXED );
+    }
+    if (owner != legacy && __atomic_load_n( &reported, __ATOMIC_RELAXED ) < 8 &&
+        __atomic_fetch_add( &reported, 1, __ATOMIC_RELAXED ) < 8)
+        dprintf( 2, "[io-status-owner] ml1300 owner32=%u session32=%u enabled=%u\n",
+                 owner, legacy, !!mode );
+    return mode ? owner : legacy;
+}
+#endif
+
 static void set_sync_iosb( IO_STATUS_BLOCK *io, NTSTATUS status, ULONG_PTR info, unsigned int options )
 {
     if (in_wow64_call() && !(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)))
@@ -8816,7 +8843,7 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
         __atomic_store_n( &enabled, mode, __ATOMIC_RELAXED );
     }
     if (!__atomic_exchange_n( &reported, 1, __ATOMIC_RELAXED ))
-        dprintf( 2, "[guest-log] ml1180 error excerpts=%d limit=32 (MADEIRA_GUEST_LOG_ERRORS=0 disables)\n", !!mode );
+        dprintf( 2, "[guest-log] ml1300 text-log support; error excerpts=%d limit=32 (MADEIRA_GUEST_LOG_ERRORS=0 disables)\n", !!mode );
     if (!mode || length < 5 || __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32) goto out;
     n = min( length, sizeof(text) - 1 );
     for (i = 0; i < n; ++i)
@@ -8834,7 +8861,14 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
     name = strrchr( path, '/' );
     name = name ? name + 1 : path;
     ext = strrchr( name, '.' );
-    if ((!ext || strcasecmp( ext, ".log" )) && strcasecmp( name, "output_log.txt" )) goto out;
+    if ((!ext || strcasecmp( ext, ".log" )) && strcasecmp( name, "output_log.txt" ))
+    {
+        const char *env = getenv( "MADEIRA_TEXT_LOG_ERRORS" );
+        /* Text-named logs use the same error-only budget; never scan arbitrary
+         * text files or mirror normal login/account messages. */
+        if ((env && !strcmp( env, "0" )) ||
+            (strcasecmp( name, "cef_log.txt" ) && strcasecmp( name, "webhelper.txt" ))) goto out;
+    }
     if (__atomic_exchange_n( &previous_hash, hash, __ATOMIC_RELAXED ) == hash) goto out;
     serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
     if (serial < 32)

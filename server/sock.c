@@ -1048,6 +1048,22 @@ static void fill_accept_output( struct accept_req *req )
     async_request_complete( req->async, STATUS_SUCCESS, size, out_size, out_data );
 }
 
+/* Bounded metadata only: diagnose an accepted socket whose completion never
+ * reaches its owner without recording network payloads or account details. */
+static void ios_accept_trace( struct sock *sock, const char *phase, unsigned int status )
+{
+    static int enabled = -1;
+    static unsigned int count;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_SOCKET_ACCEPT_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (enabled && count++ < 24)
+        fprintf( stderr, "[socket-accept] ml1300 phase=%s port=%u status=%08x\n",
+                 phase, ntohs( sock->addr.in.sin_port ), status );
+}
+
 static void complete_async_accept( struct sock *sock, struct accept_req *req )
 {
     struct sock *acceptsock = req->acceptsock;
@@ -1055,13 +1071,16 @@ static void complete_async_accept( struct sock *sock, struct accept_req *req )
 
     if (debug_level) fprintf( stderr, "completing accept request for socket %p\n", sock );
 
+    ios_accept_trace( sock, "completing", 0 );
     if (acceptsock)
     {
         if (!accept_into_socket( sock, acceptsock ))
         {
+            ios_accept_trace( sock, "failed", get_error() );
             async_terminate( async, get_error() );
             return;
         }
+        ios_accept_trace( sock, "accepted", 0 );
         fill_accept_output( req );
     }
     else
@@ -2746,6 +2765,7 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         release_object( acceptsock );
 
         acceptsock->wparam = params->accept_handle;
+        ios_accept_trace( sock, "queued", 0 );
         async_set_completion_callback( async, free_accept_req, req );
         queue_async( &sock->accept_q, async );
         sock_reselect( sock );
