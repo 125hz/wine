@@ -24,6 +24,11 @@
 #endif
 
 #include <assert.h>
+#ifdef WINE_IOS
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#endif
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -474,7 +479,26 @@ WND *get_win_ptr( HWND hwnd )
 {
     WND *win;
 
-    if ((win = get_user_handle_ptr( hwnd, NTUSER_OBJ_WINDOW )) == WND_OTHER_PROCESS)
+    win = get_user_handle_ptr( hwnd, NTUSER_OBJ_WINDOW );
+#ifdef WINE_IOS
+    /* A forced, shell-less desktop is allocated by the server for the calling
+     * process, but never gets a client WND. Its shared entry therefore has our
+     * pid while client_objects[index] is NULL. Recognize that valid desktop
+     * just as we recognize one owned by another process below. Otherwise parent
+     * walks fail at the desktop and rectangle queries fail before synthesizing
+     * the monitor bounds. Never turn a stale or ordinary empty handle into a
+     * desktop, and leave a real local WND (and its held lock) untouched. */
+    if (!win && is_desktop_window( hwnd ) && is_valid_entry( hwnd, NTUSER_OBJ_WINDOW ))
+    {
+        static unsigned int count;
+        const char *env = getenv( "MADEIRA_DESKTOP_HANDLE_FIX" );
+        BOOL enabled = !env || strcmp( env, "0" );
+        if (__atomic_fetch_add( &count, 1, __ATOMIC_RELAXED ) < 4)
+            fprintf( stderr, "[desktop-handle] ml1210 hwnd=%p valid server-only desktop fix=%u\n", hwnd, enabled );
+        if (enabled) win = WND_DESKTOP;
+    }
+#endif
+    if (win == WND_OTHER_PROCESS)
     {
         if (is_desktop_window( hwnd )) win = WND_DESKTOP;
     }
