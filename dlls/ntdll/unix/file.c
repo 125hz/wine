@@ -8852,6 +8852,61 @@ error:
 }
 
 
+#ifdef WINE_IOS
+/* ml1180: a managed program may catch its exception and keep presenting a
+ * loading screen forever. Its text log then has the failure, while our SEH
+ * log only has a handled null dereference. Mirror a bounded error excerpt
+ * from successful regular-file writes, without changing guest I/O results.
+ * No filename lookup for ordinary binary writes; no scans of the prefix.
+ * A fixed app-lifetime budget and consecutive dedup keep this low volume. */
+static void ios_guest_log_error( int fd, const void *buffer, unsigned int length )
+{
+    static int enabled = -1, reported;
+    static unsigned int emitted;
+    static unsigned long long previous_hash;
+    char text[1025], lower[1025], path[PATH_MAX];
+    const char *name, *ext;
+    unsigned int i, n, serial;
+    unsigned long long hash = 14695981039346656037ULL;
+    int mode = __atomic_load_n( &enabled, __ATOMIC_RELAXED );
+    int saved_errno = errno;
+
+    if (mode < 0)
+    {
+        const char *env = getenv( "MADEIRA_GUEST_LOG_ERRORS" );
+        mode = !env || strcmp( env, "0" );
+        __atomic_store_n( &enabled, mode, __ATOMIC_RELAXED );
+    }
+    if (!__atomic_exchange_n( &reported, 1, __ATOMIC_RELAXED ))
+        dprintf( 2, "[guest-log] ml1180 error excerpts=%d limit=32 (MADEIRA_GUEST_LOG_ERRORS=0 disables)\n", !!mode );
+    if (!mode || length < 5 || __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32) goto out;
+    n = min( length, sizeof(text) - 1 );
+    for (i = 0; i < n; ++i)
+    {
+        unsigned char c = ((const unsigned char *)buffer)[i];
+        if (c < 32 && c != '\n' && c != '\r' && c != '\t') goto out;
+        text[i] = c < 32 ? ' ' : c;
+        lower[i] = c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
+        hash = (hash ^ c) * 1099511628211ULL;
+    }
+    text[n] = lower[n] = 0;
+    if (!strstr( lower, "exception" ) && !strstr( lower, "error" ) &&
+        !strstr( lower, "failed" ) && !strstr( lower, "unsupported" )) goto out;
+    if (fcntl( fd, F_GETPATH, path ) == -1) goto out;
+    name = strrchr( path, '/' );
+    name = name ? name + 1 : path;
+    ext = strrchr( name, '.' );
+    if ((!ext || strcasecmp( ext, ".log" )) && strcasecmp( name, "output_log.txt" )) goto out;
+    if (__atomic_exchange_n( &previous_hash, hash, __ATOMIC_RELAXED ) == hash) goto out;
+    serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
+    if (serial < 32)
+        dprintf( 2, "[guest-log] ml1180 #%u tid=%04x bytes=%u excerpt=%s%s\n", serial + 1,
+                 GetCurrentThreadId(), length, text, length > n ? " [truncated]" : "" );
+out:
+    errno = saved_errno;
+}
+#endif
+
 /******************************************************************************
  *              NtWriteFile   (NTDLL.@)
  */
@@ -9053,6 +9108,10 @@ done:
     send_completion = cvalue != 0;
 
 err:
+#ifdef WINE_IOS
+    if (status == STATUS_SUCCESS && type == FD_TYPE_FILE && total)
+        ios_guest_log_error( unix_handle, buffer, total );
+#endif
     if (needs_close) close( unix_handle );
 
     if (type == FD_TYPE_SERIAL && (status == STATUS_SUCCESS || status == STATUS_PENDING))
