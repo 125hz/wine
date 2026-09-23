@@ -1132,6 +1132,13 @@ static void complete_async_accept( struct sock *sock, struct accept_req *req )
             return;
         }
         ios_accept_trace( sock, "accepted", 0 );
+        /* ml1460: follow the completion of accepts on loopback listeners (async.c) */
+        if ((sock->addr.addr.sa_family == WS_AF_INET && sock->addr.in.sin_addr.S_un.S_un_b.s_b1 == 127) ||
+            sock->addr.addr.sa_family == WS_AF_INET6)
+        {
+            extern void async_set_ios_trace( struct async *async );
+            async_set_ios_trace( async );
+        }
         fill_accept_output( req );
     }
     else
