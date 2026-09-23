@@ -38,6 +38,9 @@
 
 static const WCHAR completion_name[] = {'I','o','C','o','m','p','l','e','t','i','o','n'};
 
+/* ml1460: accept completion chain (async.c) */
+extern void ios_chain_note_dequeue( apc_param_t cvalue, const char *how );
+
 struct type_descr completion_type =
 {
     { completion_name, sizeof(completion_name) },   /* name */
@@ -414,6 +417,7 @@ DECL_HANDLER(remove_completion)
         reply->cvalue = msg->cvalue;
         reply->status = msg->status;
         reply->information = msg->information;
+        ios_chain_note_dequeue( msg->cvalue, "immediate" ); /* ml1460, async.c */
         free( msg );
         reply->wait_handle = 0;
         if (list_empty( &completion->queue )) reset_sync( completion->sync );
@@ -437,6 +441,7 @@ DECL_HANDLER(get_thread_completion)
     reply->cvalue = msg->cvalue;
     reply->status = msg->status;
     reply->information = msg->information;
+    ios_chain_note_dequeue( msg->cvalue, "after wait" ); /* ml1460, async.c */
     free( msg );
     current->completion_wait->msg = NULL;
     if (!current->completion_wait->completion) cleanup_thread_completion( current );
