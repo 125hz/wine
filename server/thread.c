@@ -1715,6 +1715,61 @@ static inline int is_in_apc_wait( struct thread *thread )
     return (is_thread_suspended( thread ) || (thread->wait && (thread->wait->flags & SELECT_INTERRUPTIBLE)));
 }
 
+#ifdef WINE_IOS
+/* ml1480: AN ASYNC I/O APC FOR A BUSY THREAD WAS DROPPED, AND THE I/O COMPLETED WITH NOTHING DONE.
+ *
+ * When an overlapped operation becomes ready, async_terminate queues APC_ASYNC_IO to the thread
+ * that started it; that thread's ntdll then does the client half (the actual recv, or fetching an
+ * accept's addresses) and reports the result. If the thread is not waiting in the server, upstream
+ * interrupts it with SIGUSR1. On iOS that can never work: there is no per-process task port, so
+ * send_thread_signal always fails, queue_apc returned 0, and thread_apc_destroy then completed
+ * the async with the APC's own status -- STATUS_ALERTED and 0 bytes. The program saw a successful
+ * receive of 0 bytes (a graceful close to any TCP user) or an accept with no addresses (device
+ * log 184: posted with status 0x101 while the issuing thread was busy).
+ *
+ * The client half of APC_ASYNC_IO is not tied to the issuing thread (upstream already hands it to
+ * another thread when the issuer has exited), and the server wakes one alerted async per queue at
+ * a time, so ordering on a socket is unchanged. So instead of dropping it: give it to a thread of
+ * the same process that is waiting in the server, or, if none is, leave it queued on the issuing
+ * thread, which runs it on its next server wait. MADEIRA_APC_REQUEUE=0 restores the drop. */
+static int ios_apc_requeue_enabled( void )
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_APC_REQUEUE" );
+        enabled = !(e && e[0] == '0');
+        fprintf( stderr, "[apc-requeue] ml1480 %s (MADEIRA_APC_REQUEUE=0 restores dropping async APCs "
+                 "for busy threads)\n", enabled ? "on" : "off" );
+    }
+    return enabled;
+}
+
+/* the thread to queue an undeliverable async APC on, or NULL to drop it as upstream does */
+static struct thread *ios_apc_requeue_target( struct thread *thread, const struct thread_apc *apc )
+{
+    static unsigned int count;
+    struct thread *candidate, *target = thread;
+
+    if (apc->call.type != APC_ASYNC_IO || !ios_apc_requeue_enabled()) return NULL;
+    LIST_FOR_EACH_ENTRY( candidate, &thread->process->thread_list, struct thread, proc_entry )
+    {
+        if (candidate == thread || candidate->state == TERMINATED || is_thread_suspended( candidate )) continue;
+        if (candidate->wait && (candidate->wait->flags & SELECT_INTERRUPTIBLE))
+        {
+            target = candidate;
+            break;
+        }
+    }
+    count++;
+    if (count <= 32 || !(count & 1023))
+        fprintf( stderr, "[apc-requeue] ml1480 #%u async APC status=%08x for busy thread %04x -> %s %04x\n",
+                 count, apc->call.async_io.status, thread->id,
+                 target == thread ? "kept on" : "waiting thread", target->id );
+    return target;
+}
+#endif
+
 /* queue an existing APC to a given thread */
 static int queue_apc( struct process *process, struct thread *thread, struct thread_apc *apc )
 {
@@ -1759,7 +1814,17 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
         /* send signal for system APCs if needed */
         if (queue == &thread->system_apc && list_empty( queue ) && !is_in_apc_wait( thread ))
         {
-            if (!send_thread_signal( thread, SIGUSR1 )) return 0;
+            if (!send_thread_signal( thread, SIGUSR1 ))
+            {
+#ifdef WINE_IOS
+                struct thread *target = ios_apc_requeue_target( thread, apc );
+                if (!target) return 0;
+                thread = target;
+                if (!(queue = get_apc_queue( thread, apc->call.type ))) return 1;
+#else
+                return 0;
+#endif
+            }
         }
         /* cancel a possible previous APC with the same owner */
         if (apc->owner) thread_cancel_apc( thread, apc->owner, apc->call.type );
