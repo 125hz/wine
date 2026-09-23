@@ -2883,7 +2883,12 @@ static void madeira_log_chain(PCCERT_CHAIN_CONTEXT chain, DWORD flags, BOOL addi
     static LONG logged;
     DWORD i, j;
 
-    if (!chain || InterlockedIncrement(&logged) > 16) return;
+    /* ml1390: root-store import validates each bundled root on its own
+     * (one element, cache-only retrieval); those used the whole budget in
+     * device log 168 before any server chain was built. */
+    if (!chain || (chain->cChain == 1 && chain->rgpChain[0]->cElement == 1 &&
+                   (flags & CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL))) return;
+    if (InterlockedIncrement(&logged) > 16) return;
     ERR_(chain)("[cert-chain] ml1380 error=%08lx info=%08lx flags=%08lx additional=%d chains=%lu elements=%lu\n",
                 chain->TrustStatus.dwErrorStatus, chain->TrustStatus.dwInfoStatus, flags, additional,
                 chain->cChain, chain->cChain ? chain->rgpChain[0]->cElement : 0);
