@@ -2870,6 +2870,39 @@ static void dump_chain_para(const CERT_CHAIN_PARA *pChainPara)
     }
 }
 
+/* Madeira ml1380: bounded chain verdicts for the error log. A client that
+ * validates its TLS peer through CryptoAPI and then silently drops the
+ * connection leaves no other trace of WHY (device log 167: the Steam client
+ * finished every connection-manager TLS handshake, then closed without its
+ * WebSocket request while cryptnet was active). The first 16 chains per
+ * process are summarised on one line; chains with errors also list each
+ * element's name and status. Certificate names and status bits only.
+ * WINEDEBUG=err-chain disables it. */
+static void madeira_log_chain(PCCERT_CHAIN_CONTEXT chain, DWORD flags, BOOL additional)
+{
+    static LONG logged;
+    DWORD i, j;
+
+    if (!chain || InterlockedIncrement(&logged) > 16) return;
+    ERR_(chain)("[cert-chain] ml1380 error=%08lx info=%08lx flags=%08lx additional=%d chains=%lu elements=%lu\n",
+                chain->TrustStatus.dwErrorStatus, chain->TrustStatus.dwInfoStatus, flags, additional,
+                chain->cChain, chain->cChain ? chain->rgpChain[0]->cElement : 0);
+    if (!chain->TrustStatus.dwErrorStatus) return;
+    for (i = 0; i < chain->cChain && i < 2; i++)
+    {
+        for (j = 0; j < chain->rgpChain[i]->cElement && j < 6; j++)
+        {
+            const CERT_CHAIN_ELEMENT *e = chain->rgpChain[i]->rgpElement[j];
+            char name[80];
+
+            if (!CertGetNameStringA(e->pCertContext, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL, name, sizeof(name)))
+                strcpy(name, "?");
+            ERR_(chain)("[cert-chain] ml1380   [%lu.%lu] %s error=%08lx info=%08lx\n",
+                        i, j, name, e->TrustStatus.dwErrorStatus, e->TrustStatus.dwInfoStatus);
+        }
+    }
+}
+
 BOOL WINAPI CertGetCertificateChain(HCERTCHAINENGINE hChainEngine,
  PCCERT_CONTEXT pCertContext, LPFILETIME pTime, HCERTSTORE hAdditionalStore,
  PCERT_CHAIN_PARA pChainPara, DWORD dwFlags, LPVOID pvReserved,
@@ -2930,6 +2963,7 @@ BOOL WINAPI CertGetCertificateChain(HCERTCHAINENGINE hChainEngine,
         CRYPT_CheckUsages(pChain, pChainPara);
         TRACE_(chain)("error status: %08lx\n",
          pChain->TrustStatus.dwErrorStatus);
+        madeira_log_chain(pChain, dwFlags, hAdditionalStore != NULL);
         if (ppChainContext)
             *ppChainContext = pChain;
         else
@@ -3868,5 +3902,25 @@ BOOL WINAPI CertVerifyCertificateChainPolicy(LPCSTR szPolicyOID,
     if (hFunc)
         CryptFreeOIDFunctionAddress(hFunc, 0);
     TRACE("returning %d (%08lx)\n", ret, pPolicyStatus->dwError);
+    /* Madeira ml1380: see madeira_log_chain. WINEDEBUG=err-chain disables. */
+    if (pPolicyStatus && pPolicyStatus->dwError)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 16)
+        {
+            const WCHAR *server = NULL;
+            DWORD checks = 0;
+            if (szPolicyOID == CERT_CHAIN_POLICY_SSL && pPolicyPara && pPolicyPara->pvExtraPolicyPara)
+            {
+                const SSL_EXTRA_CERT_CHAIN_POLICY_PARA *ssl = pPolicyPara->pvExtraPolicyPara;
+                server = ssl->pwszServerName;
+                checks = ssl->fdwChecks;
+            }
+            ERR_(chain)("[cert-policy] ml1380 policy=%s error=%08lx chain=%ld element=%ld flags=%08lx server=%s checks=%08lx\n",
+                        debugstr_a(szPolicyOID), pPolicyStatus->dwError, pPolicyStatus->lChainIndex,
+                        pPolicyStatus->lElementIndex, pPolicyPara ? pPolicyPara->dwFlags : 0,
+                        debugstr_w(server), checks);
+        }
+    }
     return ret;
 }
