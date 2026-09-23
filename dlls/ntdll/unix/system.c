@@ -78,6 +78,7 @@
 #include "winternl.h"
 #include "ddk/wdm.h"
 #include "wine/asm.h"
+#include "../../../../build/madeira_cfg.h"   /* ml1122 */
 #include "unix_private.h"
 #include "wine/debug.h"
 
@@ -1652,6 +1653,17 @@ void init_cpu_info(void)
 #else
     num = 1;
     FIXME("Detecting the number of processors is not supported.\n");
+#endif
+#ifdef __APPLE__
+    {   /* ml1122: madeira.cfg cpu-count = N reports N processors to Windows code
+         * (experiment: RDR2 sizes its job system from it; iPhone = 2 P + 4 E cores). */
+        long long want = madeira_cfg_int( "cpu-count", 0 );
+        if (want > 0 && want < 64)
+        {
+            fprintf( stderr, "[madeira] ml1122 cpu-count override: reporting %lld processors (host %ld)\n", want, num );
+            num = (long)want;
+        }
+    }
 #endif
     peb->NumberOfProcessors = num;
     init_cpu_model();

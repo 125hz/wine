@@ -37,6 +37,44 @@
 #include "unixlib.h"   /* ml672: ios_jit_alias_probe_params */
 #include "ntdll_misc.h"
 
+/* ml1131: [xp-api] probe block (measurement only). Exported as DATA
+ * (ntdll.spec: ios_xp_nt) and read once a second by ntdll-unix's sampler
+ * (server_ios.c), which finds it through the game process's own module list.
+ * Only CONTENDED lock paths and wait/wake-by-address are counted here (they are
+ * slow paths already); call RATES come from FEX's x64->EC call sampler. Layout
+ * is mirrored in server_ios.c (struct ios_xp_nt_view): append only. */
+struct ios_xp_nt ios_xp_nt;   /* layout: ntdll_misc.h */
+
+static inline ULONGLONG ios_xp_ticks(void)
+{
+    ULONGLONG v;
+    __asm__ __volatile__( "mrs %0, cntvct_el0" : "=r"(v) );
+    return v;
+}
+void ios_xp_nt_init(void)
+{
+    if (!ios_xp_nt.freq)
+    {
+        ULONGLONG f;
+        __asm__ __volatile__( "mrs %0, cntfrq_el0" : "=r"(f) );
+        ios_xp_nt.freq = f;
+        ios_xp_nt.magic = 0x31544e5058444d41ull;   /* 'AMDXPNT1' */
+    }
+}
+static void ios_xp_cs_waited( RTL_CRITICAL_SECTION *crit, ULONGLONG t0 )
+{
+    ULONGLONG d = ios_xp_ticks() - t0, us;
+    LONG64 idx;
+    ios_xp_nt_init();
+    us = ios_xp_nt.freq ? d * 1000000 / ios_xp_nt.freq : 0;
+    InterlockedIncrement64( &ios_xp_nt.cs_contended );
+    if (!crit->SpinCount) InterlockedIncrement64( &ios_xp_nt.cs_contended_spin0 );
+    InterlockedExchangeAdd64( &ios_xp_nt.cs_wait_ticks, (LONG64)d );
+    InterlockedIncrement64( &ios_xp_nt.cs_wait_hist[us < 2 ? 0 : us < 10 ? 1 : us < 50 ? 2 : us < 200 ? 3 : us < 1000 ? 4 : 5] );
+    idx = InterlockedIncrement64( &ios_xp_nt.cs_ring_idx );
+    if (!(idx & 3)) ios_xp_nt.cs_ring[(idx >> 2) & 1023] = (ULONG_PTR)crit;
+}
+
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
 
@@ -510,6 +548,16 @@ static LONG ios_cs_seq;
 
 static void ios_cs_note( RTL_CRITICAL_SECTION *crit, int op, void *caller )
 {
+#ifndef IOS_CS_HISTORY
+    /* ml1117: compiled out by default. Every Enter/Leave paid an
+     * InterlockedIncrement on ONE global counter (ios_cs_seq) plus writes into a
+     * shared table; at the tens of thousands of lock operations per second RDR2
+     * performs across six cores that cache line bounced on every call, and
+     * Enter/Leave were the two hottest guest call sites (ml1112 profile).
+     * Rebuild with -DIOS_CS_HISTORY to get the ml810 acquire/release history. */
+    (void)crit; (void)op; (void)caller;
+    return;
+#else
     unsigned int tid = GetCurrentThreadId();
     unsigned int b = tid & (IOS_CS_BUCKETS - 1);
     unsigned char slot = ios_cs_next[b];
@@ -523,6 +571,7 @@ static void ios_cs_note( RTL_CRITICAL_SECTION *crit, int op, void *caller )
     r->seq = (unsigned int)InterlockedIncrement( &ios_cs_seq );
     r->op = (unsigned char)op;
     ios_cs_next[b] = (unsigned char)(slot + 1);
+#endif
 }
 
 /* Print one thread's recorded acquires/releases, oldest first. */
@@ -648,7 +697,11 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
             if (crit->LockCount > 0) break;  /* more than one waiter, don't bother spinning */
             if (crit->LockCount == -1)       /* try again */
             {
-                if (InterlockedCompareExchange( &crit->LockCount, 0, -1 ) == -1) goto done;
+                if (InterlockedCompareExchange( &crit->LockCount, 0, -1 ) == -1)
+                {
+                    InterlockedIncrement64( &ios_xp_nt.cs_spin_acquired );   /* ml1131 */
+                    goto done;
+                }
             }
             YieldProcessor();
         }
@@ -666,7 +719,12 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 
         /* Now wait for it */
         ios_cs_check_transition( crit, "Enter" );
-        if ((status = RtlpWaitForCriticalSection( crit )))
+        {   /* ml1131: time the contended wait */
+            ULONGLONG xp_t0 = ios_xp_ticks();
+            status = RtlpWaitForCriticalSection( crit );
+            ios_xp_cs_waited( crit, xp_t0 );
+        }
+        if (status)
         {
             static LONG cs_wait_n;   /* ml671: the other RtlRaiseStatus site */
             if (InterlockedIncrement( &cs_wait_n ) <= 16)
@@ -746,6 +804,7 @@ NTSTATUS WINAPI RtlLeaveCriticalSection( RTL_CRITICAL_SECTION *crit )
         if (InterlockedDecrement( &crit->LockCount ) >= 0)
         {
             /* someone is waiting */
+            InterlockedIncrement64( &ios_xp_nt.cs_wakes );   /* ml1131 */
             RtlpUnWaitCriticalSection( crit );
         }
     }
@@ -1291,6 +1350,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
     NTSTATUS ret;
 
     TRACE("addr %p cmp %p size %#Ix timeout %s\n", addr, cmp, size, debugstr_timeout( timeout ));
+    InterlockedIncrement64( &ios_xp_nt.woa_waits );   /* ml1131 */
 
     if (size != 1 && size != 2 && size != 4 && size != 8)
         return STATUS_INVALID_PARAMETER;
@@ -1367,6 +1427,8 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     unsigned int count = 0;
     HANDLE tids[256];
 
+    InterlockedIncrement64( &ios_xp_nt.woa_wake_all );   /* ml1131 */
+
     TRACE("%p\n", addr);
 
     if (!addr) return;
@@ -1407,6 +1469,8 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
     struct futex_queue *queue = get_futex_queue( addr );
     struct futex_entry *entry;
     DWORD tid = 0;
+
+    InterlockedIncrement64( &ios_xp_nt.woa_wake_single );   /* ml1131 */
 
     TRACE("%p\n", addr);
 

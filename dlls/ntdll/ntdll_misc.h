@@ -190,4 +190,27 @@ extern void *__os_arm64x_helper8;
 
 #endif
 
+
+/* ml1131: [xp-api] probe block (sync.c defines it; exported as DATA, read by
+ * ntdll-unix's sampler in server_ios.c -- keep struct ios_xp_nt_view there in
+ * sync, append only). Measurement only. */
+struct ios_xp_nt_qpc { DWORD tid, pad; ULONGLONG last, calls, hist[5]; };
+struct ios_xp_nt
+{
+    ULONGLONG magic;                 /* 'AMDXPNT1' once initialised */
+    ULONGLONG freq;                  /* CNTFRQ, for the tick fields below */
+    LONG64 cs_contended;             /* enter had to wait (owner != self) */
+    LONG64 cs_contended_spin0;       /* ... on a section with SpinCount == 0 */
+    LONG64 cs_spin_acquired;         /* acquired inside the SpinCount loop */
+    LONG64 cs_wait_ticks;            /* CNTVCT ticks inside RtlpWaitForCriticalSection */
+    LONG64 cs_wait_hist[6];          /* < 2, 10, 50, 200, 1000 us, >= 1000 us */
+    LONG64 cs_wakes;                 /* leave found a waiter and woke it */
+    LONG64 woa_waits, woa_wake_single, woa_wake_all;
+    LONG64 cs_ring_idx;              /* every 4th contended enter records its section */
+    ULONG_PTR cs_ring[1024];
+    struct ios_xp_nt_qpc qpc[256];   /* per-thread slot (tid hash): gap between QPC reads */
+};
+extern struct ios_xp_nt ios_xp_nt;
+extern void ios_xp_nt_init(void);
+
 #endif
