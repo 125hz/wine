@@ -1284,10 +1284,69 @@ done:
 #endif
 }
 
+/* iOS-Madeira ml1370: LOOPBACK TRANSPORT METADATA. ml591's timeline skips
+ * loopback on purpose, so nothing recorded whether a local WebSocket upgrade
+ * request and its reply ever crossed. Device logs 163 and 166: both local
+ * transport connections were accepted by the listening process, and the
+ * browser gave up on them 11 s later without showing a window. The first
+ * six successful sends/receives (and any hard error) per loopback connection
+ * are logged as direction, byte count and ports only, never contents, with an
+ * app-lifetime cap. MADEIRA_LOOPBACK_IO_TRACE=0 disables. */
+static void ios_loopback_io( int fd, int is_send, long ret_bytes, int err )
+{
+    enum { SLOTS = 32, PER_CONN = 6, TOTAL = 120, CHECKS = 100000 };
+    static struct { int fd; unsigned short lport, pport; unsigned int n; } tab[SLOTS];
+    static unsigned int total, next_slot, checks;
+    static int enabled = -1;
+    struct sockaddr_storage la, pa;
+    socklen_t ll = sizeof(la), pl = sizeof(pa);
+    unsigned short lport, pport;
+    unsigned int i;
+    int loop;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_LOOPBACK_IO_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (!enabled || fd < 0 || __atomic_load_n( &total, __ATOMIC_RELAXED ) >= TOTAL) return;
+    if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) return;
+    /* two socket queries per call: stop looking after a bounded number of calls
+     * so ordinary network traffic does not pay for this for the whole session */
+    if (__atomic_fetch_add( &checks, 1, __ATOMIC_RELAXED ) >= CHECKS) return;
+    if (getpeername( fd, (struct sockaddr *)&pa, &pl ) || getsockname( fd, (struct sockaddr *)&la, &ll )) return;
+    if (pa.ss_family == AF_INET)
+    {
+        loop = (ntohl( ((struct sockaddr_in *)&pa)->sin_addr.s_addr ) >> 24) == 127;
+        pport = ntohs( ((struct sockaddr_in *)&pa)->sin_port );
+        lport = ntohs( ((struct sockaddr_in *)&la)->sin_port );
+    }
+    else if (pa.ss_family == AF_INET6)
+    {
+        loop = IN6_IS_ADDR_LOOPBACK( &((struct sockaddr_in6 *)&pa)->sin6_addr );
+        pport = ntohs( ((struct sockaddr_in6 *)&pa)->sin6_port );
+        lport = ntohs( ((struct sockaddr_in6 *)&la)->sin6_port );
+    }
+    else return;
+    if (!loop) return;
+    for (i = 0; i < SLOTS; i++)
+        if (tab[i].fd == fd + 1 && tab[i].lport == lport && tab[i].pport == pport) break;
+    if (i == SLOTS)
+    {
+        i = __atomic_fetch_add( &next_slot, 1, __ATOMIC_RELAXED ) % SLOTS;
+        tab[i].fd = fd + 1; tab[i].lport = lport; tab[i].pport = pport; tab[i].n = 0;
+    }
+    if (tab[i].n++ >= PER_CONN && !err) return;
+    if (__atomic_fetch_add( &total, 1, __ATOMIC_RELAXED ) >= TOTAL) return;
+    dprintf( 2, "[loopback-io] ml1370 fd=%d local=%u peer=%u %s bytes=%ld errno=%d\n",
+             fd, lport, pport, is_send ? "send" : "recv", err ? -1L : ret_bytes, err );
+}
+
 #else
 #define ios_sock_big_note( fd, is_send, ret_bytes, err ) do { } while (0)
 #define ios_sock_wire( fd, is_send, buf, ret_bytes, err ) do { } while (0)
 #define ios_sock_tl( fd, is_send, buf, ret_bytes, err ) do { } while (0)
+#define ios_loopback_io( fd, is_send, ret_bytes, err ) do { } while (0)
 #endif
 
 static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
@@ -1322,11 +1381,13 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
         ios_sock_big_note( fd, 0, 0, errno );
         ios_sock_wire( fd, 0, NULL, 0, errno );
         ios_sock_tl( fd, 0, NULL, 0, errno );
+        ios_loopback_io( fd, 0, 0, errno );
         return sock_errno_to_status( errno );
     }
     ios_sock_big_note( fd, 0, ret, 0 );
     ios_sock_wire( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
     ios_sock_tl( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+    ios_loopback_io( fd, 0, ret, 0 );
 
     status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
@@ -1625,6 +1686,7 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
             ios_sock_big_note( fd, 1, 0, errno );
             ios_sock_wire( fd, 1, NULL, 0, errno );
             ios_sock_tl( fd, 1, NULL, 0, errno );
+            ios_loopback_io( fd, 1, 0, errno );
             return sock_errno_to_status( errno );
         }
     }
@@ -1633,6 +1695,7 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
     ios_sock_big_note( fd, 1, ret, 0 );
     ios_sock_wire( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
     ios_sock_tl( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+    ios_loopback_io( fd, 1, ret, 0 );
 
     while (async->iov_cursor < async->count && ret >= async->iov[async->iov_cursor].iov_len)
         ret -= async->iov[async->iov_cursor++].iov_len;

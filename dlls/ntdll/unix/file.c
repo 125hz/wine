@@ -8886,10 +8886,55 @@ error:
  * from successful regular-file writes, without changing guest I/O results.
  * No filename lookup for ordinary binary writes; no scans of the prefix.
  * A fixed app-lifetime budget and consecutive dedup keep this low volume. */
+/* ml1370: Steam's connection_log.txt records the client's connection-manager
+ * attempts, the one thing a Madeira log could not show when the client said
+ * "NO CONNECTION". Its lines are mirrored on their own budget, with SteamIDs
+ * and IPv4 addresses masked (ports and host names kept). */
+static void ios_mask_account_data( char *s )
+{
+    char *p = s;
+    while ((p = strstr( p, "[U:1:" )))
+    {
+        char *d = p + 5, *e = d;
+        while (*e >= '0' && *e <= '9') e++;
+        if (e > d) { *d = '#'; memmove( d + 1, e, strlen( e ) + 1 ); }
+        p = d;
+    }
+    for (p = s; *p; p++)
+    {
+        int dots = 0, digits = 0;
+        char *q = p;
+        if (!(*p >= '0' && *p <= '9') || (p > s && ((p[-1] >= '0' && p[-1] <= '9') || p[-1] == '.'))) continue;
+        while ((*q >= '0' && *q <= '9') || (*q == '.' && dots < 3 && q[1] >= '0' && q[1] <= '9'))
+        {
+            if (*q == '.') dots++; else digits++;
+            q++;
+        }
+        if (dots == 3 && digits >= 4 && !(*q >= '0' && *q <= '9'))
+        {
+            static const char mask[] = "x.x.x.x";
+            memmove( p + sizeof(mask) - 1, q, strlen( q ) + 1 );
+            memcpy( p, mask, sizeof(mask) - 1 );
+            p += sizeof(mask) - 2;
+        }
+    }
+}
+
+static int ios_steam_log_mirror_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_STEAM_LOG_MIRROR" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    return enabled;
+}
+
 static void ios_guest_log_error( int fd, const void *buffer, unsigned int length )
 {
     static int enabled = -1, reported;
-    static unsigned int emitted;
+    static unsigned int emitted, conn_emitted;
     static unsigned long long previous_hash;
     char text[1025], lower[1025], path[PATH_MAX];
     const char *name, *ext;
@@ -8897,6 +8942,7 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
     unsigned long long hash = 14695981039346656037ULL;
     int mode = __atomic_load_n( &enabled, __ATOMIC_RELAXED );
     int saved_errno = errno;
+    int is_error, is_conn_word, steam_mirror = ios_steam_log_mirror_enabled();
 
     if (mode < 0)
     {
@@ -8906,7 +8952,9 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
     }
     if (!__atomic_exchange_n( &reported, 1, __ATOMIC_RELAXED ))
         dprintf( 2, "[guest-log] ml1300 text-log support; error excerpts=%d limit=32 (MADEIRA_GUEST_LOG_ERRORS=0 disables)\n", !!mode );
-    if (!mode || length < 5 || __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32) goto out;
+    if (!mode || length < 5) goto out;
+    if (__atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32 &&
+        (!steam_mirror || __atomic_load_n( &conn_emitted, __ATOMIC_RELAXED ) >= 96)) goto out;
     n = min( length, sizeof(text) - 1 );
     for (i = 0; i < n; ++i)
     {
@@ -8917,11 +8965,28 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
         hash = (hash ^ c) * 1099511628211ULL;
     }
     text[n] = lower[n] = 0;
-    if (!strstr( lower, "exception" ) && !strstr( lower, "error" ) &&
-        !strstr( lower, "failed" ) && !strstr( lower, "unsupported" )) goto out;
+    is_error = strstr( lower, "exception" ) || strstr( lower, "error" ) ||
+               strstr( lower, "failed" ) || strstr( lower, "unsupported" );
+    is_conn_word = steam_mirror && (strstr( lower, "connect" ) || strstr( lower, "logged" ) ||
+                                    strstr( lower, "timeout" ) || strstr( lower, "cm" ));
+    if (!is_error && !is_conn_word) goto out;
     if (fcntl( fd, F_GETPATH, path ) == -1) goto out;
     name = strrchr( path, '/' );
     name = name ? name + 1 : path;
+    if (steam_mirror && !strcasecmp( name, "connection_log.txt" ))
+    {
+        serial = __atomic_fetch_add( &conn_emitted, 1, __ATOMIC_RELAXED );
+        if (serial < 96)
+        {
+            ios_mask_account_data( text );
+            dprintf( 2, "[steam-connlog] ml1370 #%u %s%s\n", serial + 1, text, length > n ? " [truncated]" : "" );
+        }
+        goto out;
+    }
+    if (!is_error || __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32) goto out;
+    /* ml1370: Chromium's VERBOSE lines mention socket "error" codes for
+     * optional services and used the whole budget in device logs 164-166. */
+    if (steam_mirror && strstr( lower, ":verbose" )) goto out;
     ext = strrchr( name, '.' );
     if ((!ext || strcasecmp( ext, ".log" )) && strcasecmp( name, "output_log.txt" ))
     {
