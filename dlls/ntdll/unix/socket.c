@@ -1352,7 +1352,61 @@ static void ios_loopback_io( int fd, int is_send, long ret_bytes, int err )
              fd, lport, pport, is_send ? "send" : "recv", err ? -1L : ret_bytes, err );
 }
 
+/* iOS-Madeira ml1450: HOW A REMOTE TCP CONNECTION ENDED. Device log 179: the
+ * Steam client's server connection (WebSocket, port 27018) carried normal
+ * traffic, then the client reported ConnectionDisconnected('I/O Operation
+ * Failed') and its own HTTP connectivity test failed in the same second, and
+ * nothing in the log said whether the peer closed the connection, a receive or
+ * send failed, or the program gave up on it. For stream sockets with a
+ * non-loopback peer this logs a receive that returns 0 (the peer closed) and
+ * any send/receive error other than would-block, with ports and errno only,
+ * never contents; 48 lines per app lifetime. The zero-length case is only
+ * checked on the success path, which is not the per-byte hot path.
+ * MADEIRA_TCP_END_TRACE=0 disables. */
+static void ios_tcp_end_trace( int fd, int is_send, long ret_bytes, int err )
+{
+    static int enabled = -1;
+    static unsigned int total;
+    struct sockaddr_storage la, pa;
+    socklen_t ll = sizeof(la), pl = sizeof(pa);
+    unsigned short lport, pport;
+    int type = 0;
+    socklen_t tl = sizeof(type);
+
+    if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) return;
+    if (!err && (is_send || ret_bytes != 0)) return;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_TCP_END_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (!enabled || fd < 0 || __atomic_load_n( &total, __ATOMIC_RELAXED ) >= 48) return;
+    if (getsockopt( fd, SOL_SOCKET, SO_TYPE, &type, &tl ) || type != SOCK_STREAM) return;
+    /* The LOCAL address decides loopback: after a reset the peer is often gone
+     * (getpeername fails with ENOTCONN), and that is the case worth logging. */
+    if (getsockname( fd, (struct sockaddr *)&la, &ll )) return;
+    if (la.ss_family == AF_INET)
+    {
+        if ((ntohl( ((struct sockaddr_in *)&la)->sin_addr.s_addr ) >> 24) == 127) return;
+        lport = ntohs( ((struct sockaddr_in *)&la)->sin_port );
+    }
+    else if (la.ss_family == AF_INET6)
+    {
+        if (IN6_IS_ADDR_LOOPBACK( &((struct sockaddr_in6 *)&la)->sin6_addr )) return;
+        lport = ntohs( ((struct sockaddr_in6 *)&la)->sin6_port );
+    }
+    else return;
+    pport = 0;
+    if (!getpeername( fd, (struct sockaddr *)&pa, &pl ))
+        pport = pa.ss_family == AF_INET6 ? ntohs( ((struct sockaddr_in6 *)&pa)->sin6_port )
+                                          : ntohs( ((struct sockaddr_in *)&pa)->sin_port );
+    if (__atomic_fetch_add( &total, 1, __ATOMIC_RELAXED ) >= 48) return;
+    dprintf( 2, "[tcp-end] ml1450 fd=%d local=%u peer-port=%u %s errno=%d\n", fd, lport, pport,
+             err ? (is_send ? "send-error" : "recv-error") : "peer-closed", err );
+}
+
 #else
+#define ios_tcp_end_trace( fd, is_send, ret_bytes, err ) do { } while (0)
 #define ios_sock_big_note( fd, is_send, ret_bytes, err ) do { } while (0)
 #define ios_sock_wire( fd, is_send, buf, ret_bytes, err ) do { } while (0)
 #define ios_sock_tl( fd, is_send, buf, ret_bytes, err ) do { } while (0)
@@ -1388,16 +1442,24 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
             errno = EWOULDBLOCK;
 
         if (errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( errno ) );
-        ios_sock_big_note( fd, 0, 0, errno );
-        ios_sock_wire( fd, 0, NULL, 0, errno );
-        ios_sock_tl( fd, 0, NULL, 0, errno );
-        ios_loopback_io( fd, 0, 0, errno );
-        return sock_errno_to_status( errno );
+        {
+            /* ml1450: the probes below query the socket (getpeername and the
+             * like), which sets errno when it fails, as it does on a reset
+             * connection; the program must see the receive's own error. */
+            const int recv_err = errno;
+            ios_sock_big_note( fd, 0, 0, recv_err );
+            ios_sock_wire( fd, 0, NULL, 0, recv_err );
+            ios_sock_tl( fd, 0, NULL, 0, recv_err );
+            ios_loopback_io( fd, 0, 0, recv_err );
+            ios_tcp_end_trace( fd, 0, 0, recv_err );
+            return sock_errno_to_status( recv_err );
+        }
     }
     ios_sock_big_note( fd, 0, ret, 0 );
     ios_sock_wire( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
     ios_sock_tl( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
     ios_loopback_io( fd, 0, ret, 0 );
+    ios_tcp_end_trace( fd, 0, ret, 0 );
 
     status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
@@ -1693,11 +1755,15 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
                 continue;
             }
 
-            ios_sock_big_note( fd, 1, 0, errno );
-            ios_sock_wire( fd, 1, NULL, 0, errno );
-            ios_sock_tl( fd, 1, NULL, 0, errno );
-            ios_loopback_io( fd, 1, 0, errno );
-            return sock_errno_to_status( errno );
+            {
+                const int send_err = errno; /* ml1450: see try_recv */
+                ios_sock_big_note( fd, 1, 0, send_err );
+                ios_sock_wire( fd, 1, NULL, 0, send_err );
+                ios_sock_tl( fd, 1, NULL, 0, send_err );
+                ios_loopback_io( fd, 1, 0, send_err );
+                ios_tcp_end_trace( fd, 1, 0, send_err );
+                return sock_errno_to_status( send_err );
+            }
         }
     }
 

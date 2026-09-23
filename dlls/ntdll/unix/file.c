@@ -8869,6 +8869,12 @@ static int ios_steam_log_mirror_enabled(void)
     return enabled;
 }
 
+/* ml1450: per-log mirror budget for connection_log.txt and content_log.txt
+ * (was 96 each). Log 179 used all 96 connection lines within 15 s of the first
+ * logon, before the reconnects and the stalled download it needed to show;
+ * both logs are keyword-filtered and low-rate outside those bursts. */
+#define IOS_STEAM_MIRROR_LINES 320
+
 static void ios_guest_log_error( int fd, const void *buffer, unsigned int length )
 {
     static int enabled = -1, reported;
@@ -8892,8 +8898,8 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
         dprintf( 2, "[guest-log] ml1300 text-log support; error excerpts=%d limit=32 (MADEIRA_GUEST_LOG_ERRORS=0 disables)\n", !!mode );
     if (!mode || length < 5) goto out;
     if (__atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32 &&
-        (!steam_mirror || (__atomic_load_n( &conn_emitted, __ATOMIC_RELAXED ) >= 96 &&
-                           __atomic_load_n( &content_emitted, __ATOMIC_RELAXED ) >= 96))) goto out;
+        (!steam_mirror || (__atomic_load_n( &conn_emitted, __ATOMIC_RELAXED ) >= IOS_STEAM_MIRROR_LINES &&
+                           __atomic_load_n( &content_emitted, __ATOMIC_RELAXED ) >= IOS_STEAM_MIRROR_LINES))) goto out;
     n = min( length, sizeof(text) - 1 );
     for (i = 0; i < n; ++i)
     {
@@ -8920,7 +8926,7 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
     if (steam_mirror && !strcasecmp( name, "connection_log.txt" ))
     {
         serial = __atomic_fetch_add( &conn_emitted, 1, __ATOMIC_RELAXED );
-        if (serial < 96)
+        if (serial < IOS_STEAM_MIRROR_LINES)
         {
             ios_mask_account_data( text );
             dprintf( 2, "[steam-connlog] ml1370 #%u %s%s\n", serial + 1, text, length > n ? " [truncated]" : "" );
@@ -8932,7 +8938,7 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
     if (steam_mirror && !strcasecmp( name, "content_log.txt" ))
     {
         serial = __atomic_fetch_add( &content_emitted, 1, __ATOMIC_RELAXED );
-        if (serial < 96)
+        if (serial < IOS_STEAM_MIRROR_LINES)
         {
             ios_mask_account_data( text );
             dprintf( 2, "[steam-contentlog] ml1390 #%u %s%s\n", serial + 1, text, length > n ? " [truncated]" : "" );
