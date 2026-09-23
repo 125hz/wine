@@ -333,6 +333,7 @@ struct sock
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
+    unsigned char       ios_lb_n;    /* iOS-Madeira ml1410: loopback wait trace lines for this socket */
 };
 
 static int is_tcp_socket( struct sock *sock )
@@ -1075,6 +1076,45 @@ static void ios_accept_trace( struct sock *sock, const char *phase, unsigned int
                  phase, ntohs( sock->addr.in.sin_port ), status );
 }
 
+/* iOS-Madeira ml1410: LOOPBACK WAIT TRACE. Device log 171: a browser process
+ * sent its upgrade request on both accepted local transport connections; the
+ * listening process read one and never the other, and the browser reported a
+ * transport error. ml1370 records only completed transfers, so it cannot tell
+ * a read that was never requested from one left pending or woken without
+ * data. For stream sockets with a loopback peer only, this records the first
+ * read requests (with the server's verdict), poll requests and read-queue
+ * wake-ups per socket: process, ports, flags and status only, never contents.
+ * MADEIRA_LOOPBACK_WAIT_TRACE=0 disables. */
+static int ios_lb_wait_enabled( struct sock *sock )
+{
+    static int enabled = -1;
+    static const unsigned char loop6[16] = { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
+    static unsigned int total;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_LOOPBACK_WAIT_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (!enabled || sock->type != WS_SOCK_STREAM || sock->ios_lb_n >= 12 || total >= 160) return 0;
+    if (sock->peer_addr.addr.sa_family == WS_AF_INET)
+    {
+        if (sock->peer_addr.in.sin_addr.S_un.S_un_b.s_b1 != 127) return 0;
+    }
+    else if (sock->peer_addr.addr.sa_family != WS_AF_INET6 ||
+             memcmp( &sock->peer_addr.in6.sin6_addr, loop6, sizeof(loop6) ))
+        return 0;
+    sock->ios_lb_n++;
+    total++;
+    return 1;
+}
+
+#define IOS_LB_WAIT( sock, fmt, ... ) \
+    do { if (ios_lb_wait_enabled( sock )) \
+        fprintf( stderr, "[loopback-wait] ml1410 pid=%04x local=%u peer=%u " fmt "\n", \
+                 current && current->process ? current->process->id : 0, \
+                 ntohs( (sock)->addr.in.sin_port ), ntohs( (sock)->peer_addr.in.sin_port ), __VA_ARGS__ ); } while (0)
+
 static void complete_async_accept( struct sock *sock, struct accept_req *req )
 {
     struct sock *acceptsock = req->acceptsock;
@@ -1317,6 +1357,7 @@ static void complete_async_polls( struct sock *sock, int event, int error )
 
             if (req->pending)
             {
+                IOS_LB_WAIT( sock, "poll-complete wanted=%x got=%x", req->sockets[i].mask, flags );
                 complete_async_poll( req, STATUS_SUCCESS );
                 break;
             }
@@ -1363,6 +1404,7 @@ static int sock_dispatch_asyncs( struct sock *sock, int event, int error )
         if (async_waiting( &sock->read_q ))
         {
             if (debug_level) fprintf( stderr, "activating read queue for socket %p\n", sock );
+            IOS_LB_WAIT( sock, "wake-read event=%x", event );
             async_wake_up( &sock->read_q, STATUS_ALERTED );
         }
         event &= ~(POLLIN | POLLPRI);
@@ -1944,6 +1986,7 @@ static struct sock *create_socket(void)
     sock->reset = 0;
     sock->reuseaddr = 0;
     sock->exclusiveaddruse = 0;
+    sock->ios_lb_n = 0;
     sock->rcvbuf = 0;
     sock->sndbuf = 0;
     sock->rcvtimeo = 0;
@@ -3816,8 +3859,11 @@ static void poll_socket( struct sock *poll_sock, struct async *async, int exclus
 
         pollfd.fd = get_unix_fd( sock->fd );
         pollfd.events = poll_flags_from_afd( sock, mask );
+        pollfd.revents = 0;
         if (pollfd.events >= 0 && poll( &pollfd, 1, 0 ) >= 0)
             sock_poll_event( sock->fd, pollfd.revents );
+        IOS_LB_WAIT( sock, "poll mask=%x events=%x revents=%x flags=%x wait=%d", mask, pollfd.events,
+                     pollfd.revents, req->sockets[i].flags, timeout != 0 );
 
         /* FIXME: do other error conditions deserve a similar treatment? */
         if (sock->state != SOCK_CONNECTING && sock->errors[AFD_POLL_BIT_CONNECT_ERR] && (mask & AFD_POLL_CONNECT_ERR))
@@ -4184,6 +4230,9 @@ DECL_HANDLER(recv_socket)
 
     if (status == STATUS_PENDING && !req->force_async && sock->nonblocking)
         status = STATUS_DEVICE_NOT_READY;
+
+    IOS_LB_WAIT( sock, "recv status=%08x nb=%d force=%d queued=%d", status, sock->nonblocking,
+                 req->force_async, async_queued( &sock->read_q ) );
 
     sock->pending_events &= ~(req->oob ? AFD_POLL_OOB : AFD_POLL_READ);
     sock->reported_events &= ~(req->oob ? AFD_POLL_OOB : AFD_POLL_READ);
