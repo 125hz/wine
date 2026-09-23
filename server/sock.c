@@ -1916,12 +1916,47 @@ static int sock_close_handle( struct object *obj, struct process *process, obj_h
     return async_close_obj_handle( obj, process, handle );
 }
 
+/* iOS-Madeira ml1450: the program side of [tcp-end] (see ntdll socket.c
+ * ios_tcp_end_trace). A connected stream socket with a non-loopback peer being
+ * destroyed means its last handle was closed; what the server had seen by then
+ * (hangup from the peer, shutdowns, reset, error) says whether the program closed
+ * a healthy connection or one that had already failed. Ports and flags only; 48
+ * lines per app lifetime. MADEIRA_TCP_END_TRACE=0 disables. */
+static void ios_tcp_close_trace( struct sock *sock )
+{
+    static int enabled = -1;
+    static unsigned int total;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_TCP_END_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (!enabled || total >= 48 || sock->type != WS_SOCK_STREAM || sock->state != SOCK_CONNECTED) return;
+    if (sock->peer_addr.addr.sa_family == WS_AF_INET)
+    {
+        if (sock->peer_addr.in.sin_addr.S_un.S_un_b.s_b1 == 127) return;
+    }
+    else if (sock->peer_addr.addr.sa_family == WS_AF_INET6)
+    {
+        static const unsigned char loop6[16] = { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
+        if (!memcmp( &sock->peer_addr.in6.sin6_addr, loop6, sizeof(loop6) )) return;
+    }
+    else return;
+    total++;
+    fprintf( stderr, "[tcp-end] ml1450 closed by program local=%u peer-port=%u age=%llds hangup=%d rd_shut=%d wr_shut=%d "
+             "reset=%d aborted=%d\n", ntohs( sock->addr.in.sin_port ), ntohs( sock->peer_addr.in.sin_port ),
+             (long long)(sock->connect_time ? (current_time - sock->connect_time) / 10000000 : -1),
+             sock->hangup, sock->rd_shutdown, sock->wr_shutdown, sock->reset, sock->aborted );
+}
+
 static void sock_destroy( struct object *obj )
 {
     struct sock *sock = (struct sock *)obj;
     unsigned int i;
 
     assert( obj->ops == &sock_ops );
+    ios_tcp_close_trace( sock );
 
     /* FIXME: special socket shutdown stuff? */
 
