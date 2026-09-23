@@ -1291,11 +1291,14 @@ done:
  * browser gave up on them 11 s later without showing a window. The first
  * six successful sends/receives (and any hard error) per loopback connection
  * are logged as direction, byte count and ports only, never contents, with an
- * app-lifetime cap. MADEIRA_LOOPBACK_IO_TRACE=0 disables. */
+ * app-lifetime cap. MADEIRA_LOOPBACK_IO_TRACE=0 disables.
+ * ml1410: also the first receive per connection that would block, logged as
+ * "recv-would-block" (device log 171: one connection's receiving side never
+ * logged a read; the server-side [loopback-wait] trace records its requests). */
 static void ios_loopback_io( int fd, int is_send, long ret_bytes, int err )
 {
     enum { SLOTS = 32, PER_CONN = 6, TOTAL = 120, CHECKS = 100000 };
-    static struct { int fd; unsigned short lport, pport; unsigned int n; } tab[SLOTS];
+    static struct { int fd; unsigned short lport, pport; unsigned int n, wb; } tab[SLOTS];
     static unsigned int total, next_slot, checks;
     static int enabled = -1;
     struct sockaddr_storage la, pa;
@@ -1310,7 +1313,7 @@ static void ios_loopback_io( int fd, int is_send, long ret_bytes, int err )
         enabled = !env || strcmp( env, "0" );
     }
     if (!enabled || fd < 0 || __atomic_load_n( &total, __ATOMIC_RELAXED ) >= TOTAL) return;
-    if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) return;
+    if (err == EINTR || ((err == EAGAIN || err == EWOULDBLOCK) && is_send)) return;
     /* two socket queries per call: stop looking after a bounded number of calls
      * so ordinary network traffic does not pay for this for the whole session */
     if (__atomic_fetch_add( &checks, 1, __ATOMIC_RELAXED ) >= CHECKS) return;
@@ -1334,7 +1337,14 @@ static void ios_loopback_io( int fd, int is_send, long ret_bytes, int err )
     if (i == SLOTS)
     {
         i = __atomic_fetch_add( &next_slot, 1, __ATOMIC_RELAXED ) % SLOTS;
-        tab[i].fd = fd + 1; tab[i].lport = lport; tab[i].pport = pport; tab[i].n = 0;
+        tab[i].fd = fd + 1; tab[i].lport = lport; tab[i].pport = pport; tab[i].n = 0; tab[i].wb = 0;
+    }
+    if (err == EAGAIN || err == EWOULDBLOCK)
+    {
+        if (tab[i].wb++) return;
+        if (__atomic_fetch_add( &total, 1, __ATOMIC_RELAXED ) >= TOTAL) return;
+        dprintf( 2, "[loopback-io] ml1410 fd=%d local=%u peer=%u recv-would-block\n", fd, lport, pport );
+        return;
     }
     if (tab[i].n++ >= PER_CONN && !err) return;
     if (__atomic_fetch_add( &total, 1, __ATOMIC_RELAXED ) >= TOTAL) return;

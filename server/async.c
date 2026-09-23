@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -132,6 +133,7 @@ struct async
     unsigned int         unknown_status :1; /* initial status is not known yet */
     unsigned int         blocking :1;     /* async is blocking */
     unsigned int         is_system :1;    /* background system operation not affecting userspace visible state. */
+    unsigned int         ios_completed :1; /* iOS-Madeira ml1410: final result stored (async_set_result) */
     struct completion   *completion;      /* completion associated with fd */
     apc_param_t          comp_key;        /* completion key associated with fd */
     unsigned int         comp_flags;      /* completion flags */
@@ -412,6 +414,7 @@ struct async *create_async( struct fd *fd, struct thread *thread, const struct a
     async->alerted       = 0;
     async->terminated    = 0;
     async->canceled      = 0;
+    async->ios_completed = 0;
     async->unknown_status = 0;
     async->blocking      = !is_fd_overlapped( fd );
     async->is_system     = 0;
@@ -657,6 +660,7 @@ void async_set_result( struct object *obj, unsigned int status, apc_param_t tota
         if (async->timeout) remove_timeout_user( async->timeout );
         async->timeout = NULL;
         async->terminated = 1;
+        async->ios_completed = 1;
         if (async->iosb) async->iosb->status = status;
 
         /* don't signal completion if the async failed synchronously
@@ -743,12 +747,44 @@ static struct async *find_async_from_user( struct process *process, client_ptr_t
     return NULL;
 }
 
+/* iOS-Madeira ml1410: keep each async alive across its own cancellation.
+ *
+ * cancel_async() -> async_terminate() queues the completion APC to the
+ * async's thread. When it cannot be queued (that thread is gone and no other
+ * thread of the process takes it), the APC is discarded, which completes the
+ * async immediately (async_set_result()), removes it from its queue and can
+ * drop its last reference. The async is then freed inside cancel_async(), and
+ * the list_remove() below writes through freed memory. Device log 170: shortly
+ * after a thread of the Windows Steam client's browser process left through
+ * read_request EOF -> kill_thread (which, unlike terminate_thread, does not
+ * cancel that thread's asyncs), the server thread faulted in
+ * req_cancel_async+0x158 (this list_remove, NULL link) and every process
+ * stopped. That the async was freed there is inferred from the fault site.
+ *
+ * Holding a reference keeps it valid until it is back on the process list.
+ * An async that completed during its cancellation has nothing left to wait
+ * for, so no cancel object is attached (async_destroy() asserts there is none).
+ * Completion is tracked explicitly: a pending non-blocking async is already
+ * signaled, so the signaled bit cannot tell whether the result was stored.
+ * MADEIRA_ASYNC_CANCEL_HOLD=0 restores the previous loop. */
+static int ios_async_cancel_hold(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_ASYNC_CANCEL_HOLD" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    return enabled;
+}
+
 static int cancel_process_async( struct process *process, struct object *obj, struct thread *thread, client_ptr_t iosb, obj_handle_t *wait_handle )
 {
     struct async_cancel *cancel = NULL;
     struct async *async, *next_async;
     struct list tracked;
     int count = 0;
+    int hold = ios_async_cancel_hold();
 
     if (thread && !(cancel = create_async_cancel( process ))) return 0;
 
@@ -766,8 +802,20 @@ restart:
             (!thread || async->thread == thread) &&
             (!iosb || async->data.iosb == iosb))
         {
+            if (hold) grab_object( async );
             if (!async->canceled) cancel_async( async );
-            if (cancel)
+            if (hold && async->ios_completed)
+            {
+                static unsigned int reported;
+                if (reported < 8)
+                {
+                    reported++;
+                    fprintf( stderr, "[async-cancel] ml1410 async completed during cancel (owner thread %04x %s); held, no wait\n",
+                             async->thread ? async->thread->id : 0,
+                             async->thread && async->thread->state == TERMINATED ? "gone" : "alive" );
+                }
+            }
+            else if (cancel)
             {
                 assert( !async->async_cancel );
                 async->async_cancel = cancel;
@@ -784,6 +832,7 @@ restart:
     {
         list_remove( &async->process_entry );
         list_add_tail( &process->asyncs, &async->process_entry );
+        if (hold) release_object( async );
     }
     if (cancel)
     {
