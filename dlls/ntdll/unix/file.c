@@ -8872,7 +8872,7 @@ static int ios_steam_log_mirror_enabled(void)
 static void ios_guest_log_error( int fd, const void *buffer, unsigned int length )
 {
     static int enabled = -1, reported;
-    static unsigned int emitted, conn_emitted;
+    static unsigned int emitted, conn_emitted, content_emitted, steam_misses;
     static unsigned long long previous_hash;
     char text[1025], lower[1025], path[PATH_MAX];
     const char *name, *ext;
@@ -8892,7 +8892,8 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
         dprintf( 2, "[guest-log] ml1300 text-log support; error excerpts=%d limit=32 (MADEIRA_GUEST_LOG_ERRORS=0 disables)\n", !!mode );
     if (!mode || length < 5) goto out;
     if (__atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32 &&
-        (!steam_mirror || __atomic_load_n( &conn_emitted, __ATOMIC_RELAXED ) >= 96)) goto out;
+        (!steam_mirror || (__atomic_load_n( &conn_emitted, __ATOMIC_RELAXED ) >= 96 &&
+                           __atomic_load_n( &content_emitted, __ATOMIC_RELAXED ) >= 96))) goto out;
     n = min( length, sizeof(text) - 1 );
     for (i = 0; i < n; ++i)
     {
@@ -8905,8 +8906,13 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
     text[n] = lower[n] = 0;
     is_error = strstr( lower, "exception" ) || strstr( lower, "error" ) ||
                strstr( lower, "failed" ) || strstr( lower, "unsupported" );
-    is_conn_word = steam_mirror && (strstr( lower, "connect" ) || strstr( lower, "logged" ) ||
-                                    strstr( lower, "timeout" ) || strstr( lower, "cm" ));
+    /* ml1390: the Steam keywords cost a path lookup for ordinary text writes;
+     * stop using them after 16384 lookups that were not a Steam log. */
+    is_conn_word = steam_mirror && __atomic_load_n( &steam_misses, __ATOMIC_RELAXED ) < 16384 &&
+                                   (strstr( lower, "connect" ) || strstr( lower, "logged" ) ||
+                                    strstr( lower, "timeout" ) || strstr( lower, "cm" ) ||
+                                    strstr( lower, "appid" ) || strstr( lower, "depot" ) ||
+                                    strstr( lower, "update" ) || strstr( lower, "state" ));
     if (!is_error && !is_conn_word) goto out;
     if (fcntl( fd, F_GETPATH, path ) == -1) goto out;
     name = strrchr( path, '/' );
@@ -8921,6 +8927,19 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
         }
         goto out;
     }
+    /* ml1390: content_log.txt says why the client considers an installed app
+     * out of date ("state changed : Update Required", scheduler results). */
+    if (steam_mirror && !strcasecmp( name, "content_log.txt" ))
+    {
+        serial = __atomic_fetch_add( &content_emitted, 1, __ATOMIC_RELAXED );
+        if (serial < 96)
+        {
+            ios_mask_account_data( text );
+            dprintf( 2, "[steam-contentlog] ml1390 #%u %s%s\n", serial + 1, text, length > n ? " [truncated]" : "" );
+        }
+        goto out;
+    }
+    if (is_conn_word && !is_error) __atomic_fetch_add( &steam_misses, 1, __ATOMIC_RELAXED );
     if (!is_error || __atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32) goto out;
     /* ml1370: Chromium's VERBOSE lines mention socket "error" codes for
      * optional services and used the whole budget in device logs 164-166. */
