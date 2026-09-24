@@ -25,8 +25,8 @@
 #pragma makedep unix
 #endif
 
+#include "config.h"   /* makedep requires it first */
 #include "../../../../build/madeira_cfg.h"   /* ml1122: before the Wine headers, which ban strncpy by macro */
-#include "config.h"
 
 #include <assert.h>
 #include <errno.h>
