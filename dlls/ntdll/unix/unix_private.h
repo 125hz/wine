@@ -81,10 +81,32 @@ static inline WOW_TEB *get_wow_teb( TEB *teb )
     return teb->WowTebOffset ? (WOW_TEB *)((char *)teb + teb->WowTebOffset) : NULL;
 }
 
+#ifdef WINE_IOS
+/* MADEIRA ml1590: wow_peb is a SESSION global on iOS (pseudo-processes share one
+ * address space) and is cleared or swapped when another 32-bit process's window
+ * is released or a 64-bit child starts ([wow-peb] lines). A 32-bit program still
+ * running then got is_wow64() == FALSE, get_cpu_area() NULL and
+ * STATUS_INVALID_PARAMETER from its own ThreadWow64Context query: wow64 built the
+ * launcher's first thread on Esp 0 (device log 206, 64 retries) and the
+ * installer's callbacks on a stack at guest 0xffffffb0 (tablet log 6, installer
+ * stuck). A thread whose own TEB carries a 32-bit TEB is WoW64 whatever the
+ * global says. ios_wow64_by_teb = 0 (MADEIRA_WOW64_BY_TEB=0) restores the global. */
+extern int ios_wow64_by_teb;
+static inline BOOL is_wow64(void)
+{
+    if (ios_wow64_by_teb)
+    {
+        TEB *teb = NtCurrentTeb();
+        if (teb && teb->WowTebOffset) return TRUE;
+    }
+    return !!wow_peb;
+}
+#else
 static inline BOOL is_wow64(void)
 {
     return !!wow_peb;
 }
+#endif
 
 /* check for old-style Wow64 (using a 32-bit ntdll.so) */
 static inline BOOL is_old_wow64(void)

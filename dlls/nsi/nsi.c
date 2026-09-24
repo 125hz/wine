@@ -66,6 +66,31 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
     return TRUE;
 }
 
+/* iOS-Madeira ml1510: remember that the device is missing.
+ *
+ * On a platform with the in-process fallback the device never appears, yet
+ * every call retried CreateFileW(\\.\Nsi): a full NtCreateFile and a failed
+ * wineserver open_file_object each time. A launcher's network-polling thread
+ * made about 1,700 of those a second (device log 195: 368,640 sampled opens of
+ * \??\Nsi, all STATUS_OBJECT_NAME_NOT_FOUND, over about 3.5 minutes), keeping
+ * the server busy. The first failure's error is kept and returned by later
+ * calls, so callers see exactly what they saw before. Only when the fallback
+ * exists; MADEIRA_NSI_DEVICE_CACHE=0 retries every time as before. */
+static LONG nsi_device_missing[2];
+static DWORD nsi_device_missing_err[2];
+
+static BOOL nsi_missing_cache_enabled( void )
+{
+    static LONG enabled = -1;
+    if (enabled < 0)
+    {
+        WCHAR value[4];
+        DWORD len = GetEnvironmentVariableW( L"MADEIRA_NSI_DEVICE_CACHE", value, ARRAY_SIZE(value) );
+        enabled = !(len && len < ARRAY_SIZE(value) && value[0] == '0');
+    }
+    return enabled;
+}
+
 static inline HANDLE get_nsi_device( BOOL async )
 {
     HANDLE *cached_device = async ? &nsi_device_async : &nsi_device;
@@ -73,13 +98,85 @@ static inline HANDLE get_nsi_device( BOOL async )
 
     if (*cached_device == INVALID_HANDLE_VALUE)
     {
+        if (nsi_device_missing[async ? 1 : 0])
+        {
+            SetLastError( nsi_device_missing_err[async ? 1 : 0] );
+            return INVALID_HANDLE_VALUE;
+        }
         device = CreateFileW( L"\\\\.\\Nsi", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
                               async ? FILE_FLAG_OVERLAPPED : 0, NULL );
-        if (device != INVALID_HANDLE_VALUE
-            && InterlockedCompareExchangePointer( cached_device, device, INVALID_HANDLE_VALUE ) != INVALID_HANDLE_VALUE)
+        if (device == INVALID_HANDLE_VALUE)
+        {
+            DWORD err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND && nsi_unix_fallback() && nsi_missing_cache_enabled())
+            {
+                nsi_device_missing_err[async ? 1 : 0] = err;
+                InterlockedExchange( &nsi_device_missing[async ? 1 : 0], 1 );
+                ERR( "no \\\\.\\Nsi: not retried from now on (MADEIRA_NSI_DEVICE_CACHE=0 retries) rev=ml1510\n" );
+            }
+            SetLastError( err );
+        }
+        else if (InterlockedCompareExchangePointer( cached_device, device, INVALID_HANDLE_VALUE ) != INVALID_HANDLE_VALUE)
             CloseHandle( device );
     }
     return *cached_device;
+}
+
+/* iOS-Madeira ml1520: a change request with no device stays pending.
+ *
+ * Without \\.\Nsi every NsiRequestChangeNotification (NotifyAddrChange) failed
+ * at once, so a caller that waits for an address change and then re-reads the
+ * adapters looped instead: device log 196 had ~40 adapter enumerations a
+ * second (ndis interfaces, IPv4 addresses, IPv4 routes; ~1,500 NSI reads a
+ * second) for the whole session, game included. The fallback's addresses do
+ * not change during a session, so the honest answer is a request that never
+ * completes: the caller's OVERLAPPED is left STATUS_PENDING with its event
+ * reset and the returned handle is a private event nothing sets; a caller
+ * without an OVERLAPPED waits the way it would for a change. Cancelling
+ * completes the request with STATUS_CANCELLED. Only when the fallback serves
+ * reads; MADEIRA_NSI_NOTIFY_PENDING=0 fails the request as before. */
+static HANDLE nsi_never_event;
+
+static BOOL nsi_notify_pending_enabled( void )
+{
+    static LONG enabled = -1;
+    if (enabled < 0)
+    {
+        WCHAR value[4];
+        DWORD len = GetEnvironmentVariableW( L"MADEIRA_NSI_NOTIFY_PENDING", value, ARRAY_SIZE(value) );
+        enabled = !(len && len < ARRAY_SIZE(value) && value[0] == '0');
+    }
+    return enabled && nsi_unix_fallback();
+}
+
+static HANDLE nsi_never_signaled( void )
+{
+    HANDLE event;
+
+    if (nsi_never_event) return nsi_never_event;
+    if (!(event = CreateEventW( NULL, TRUE, FALSE, NULL ))) return NULL;
+    if (InterlockedCompareExchangePointer( &nsi_never_event, event, NULL )) CloseHandle( event );
+    return nsi_never_event;
+}
+
+static DWORD nsi_pending_notification( OVERLAPPED *ovr, HANDLE *handle )
+{
+    static LONG logged;
+    HANDLE never = nsi_never_signaled();
+
+    if (!never) return GetLastError();
+    if (!InterlockedExchange( &logged, 1 ))
+        ERR( "no \\\\.\\Nsi: change requests stay pending (MADEIRA_NSI_NOTIFY_PENDING=0 fails them) rev=ml1520\n" );
+    if (!ovr)
+    {
+        WaitForSingleObject( never, INFINITE );
+        return ERROR_SUCCESS;
+    }
+    ovr->Internal = STATUS_PENDING;
+    ovr->InternalHigh = 0;
+    if (ovr->hEvent) ResetEvent( (HANDLE)((ULONG_PTR)ovr->hEvent & ~(ULONG_PTR)1) );
+    if (handle) *handle = never;
+    return ERROR_IO_PENDING;
 }
 
 DWORD WINAPI NsiAllocateAndGetTable( DWORD unk, const NPI_MODULEID *module, DWORD table, void **key_data, DWORD key_size,
@@ -142,6 +239,14 @@ DWORD WINAPI NsiCancelChangeNotification( OVERLAPPED *ovr )
     TRACE( "%p.\n", ovr );
 
     if (!ovr) return ERROR_NOT_FOUND;
+    /* ml1520: a request left pending by nsi_pending_notification() */
+    if (nsi_never_event && get_nsi_device( TRUE ) == INVALID_HANDLE_VALUE)
+    {
+        if (ovr->Internal != STATUS_PENDING) return ERROR_NOT_FOUND;
+        ovr->Internal = STATUS_CANCELLED;
+        if (ovr->hEvent) SetEvent( (HANDLE)((ULONG_PTR)ovr->hEvent & ~(ULONG_PTR)1) );
+        return ERROR_SUCCESS;
+    }
     if (!CancelIoEx(  get_nsi_device( TRUE ), ovr ))
         err = GetLastError();
 
@@ -414,7 +519,14 @@ DWORD WINAPI NsiRequestChangeNotificationEx( struct nsi_request_change_notificat
 
     if (params->unk) FIXME( "unknown parameter %#lx.\n", params->unk );
 
-    if (device == INVALID_HANDLE_VALUE) return GetLastError();
+    if (device == INVALID_HANDLE_VALUE)
+    {
+        err = GetLastError();
+        /* ml1520: see nsi_pending_notification() */
+        if (err == ERROR_FILE_NOT_FOUND && nsi_notify_pending_enabled())
+            return nsi_pending_notification( params->ovr, params->handle );
+        return err;
+    }
 
     in = malloc( in_size );
     if (!in) return ERROR_OUTOFMEMORY;

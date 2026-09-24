@@ -1270,6 +1270,24 @@ static DWORD WINAPI process_init( RTL_RUN_ONCE *once, void *param, void **contex
 /**********************************************************************
  *           thread_init
  */
+/* MADEIRA ml1560: MADEIRA_WOW_INIT_CTX_RETRY=0 disables the checked initial context (thread_init). */
+static BOOL wow_init_ctx_retry_enabled(void)
+{
+    static LONG enabled = -1;
+
+    if (enabled < 0)
+    {
+        UNICODE_STRING name = RTL_CONSTANT_STRING( L"MADEIRA_WOW_INIT_CTX_RETRY" ), value;
+        WCHAR buffer[8];
+
+        value.Buffer = buffer;
+        value.Length = 0;
+        value.MaximumLength = sizeof(buffer);
+        enabled = !(!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length && buffer[0] == '0');
+    }
+    return enabled;
+}
+
 static void thread_init(void)
 {
     /* BTCpuGetBopCode() returns a GUEST address — store verbatim */
@@ -1285,8 +1303,35 @@ static void thread_init(void)
         {
             I386_CONTEXT *ctx_ptr, ctx = { CONTEXT_I386_FULL };
             ULONG *stack;
+            NTSTATUS status;
 
-            pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
+            status = pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
+            /* MADEIRA ml1560: the result was never checked. Device log 203: a new
+             * 32-bit process's first thread got Esp == 0 back (the context left as
+             * initialised: the call failed, or the CPU area was not filled yet),
+             * and the copy below went to 0 - sizeof(I386_CONTEXT) (wild write in
+             * memcpy, c0000005 in the launcher right after its install). Ask
+             * again a few times, yielding between tries, and log what came back;
+             * if it never succeeds, end the process with that status instead of
+             * writing through a null stack. MADEIRA_WOW_INIT_CTX_RETRY=0 keeps the
+             * old unchecked path. */
+            if ((status || !ctx.Esp) && wow_init_ctx_retry_enabled())
+            {
+                unsigned int tries;
+
+                ERR( "[wow-init-ctx] ml1560 initial context: status %#lx Esp %#lx; retrying\n",
+                     (long)status, (long)ctx.Esp );
+                for (tries = 0; tries < 64 && (status || !ctx.Esp); tries++)
+                {
+                    NtYieldExecution();
+                    memset( &ctx, 0, sizeof(ctx) );
+                    ctx.ContextFlags = CONTEXT_I386_FULL;
+                    status = pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
+                }
+                ERR( "[wow-init-ctx] ml1560 after %u retries: status %#lx Esp %#lx\n", tries, (long)status, (long)ctx.Esp );
+                if (status || !ctx.Esp)
+                    NtTerminateProcess( GetCurrentProcess(), status ? status : STATUS_INVALID_PARAMETER );
+            }
             ctx_ptr = (I386_CONTEXT *)guest_ptr32( ctx.Esp ) - 1;
             *ctx_ptr = ctx;
             stack = (ULONG *)ctx_ptr;

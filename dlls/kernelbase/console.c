@@ -502,9 +502,13 @@ error:
 /******************************************************************
  *      AllocConsole   (kernelbase.@)
  */
+static BOOL madeira_headless_console( const RTL_USER_PROCESS_PARAMETERS *params );
+
 BOOL WINAPI AllocConsole(void)
 {
-    return alloc_console( FALSE );
+    /* MADEIRA ml1600: a listed program that allocates its own console (a launcher's
+     * browser helper does) gets it without a window too; tablet photo 20:18. */
+    return alloc_console( madeira_headless_console( RtlGetCurrentPeb()->ProcessParameters ) );
 }
 
 
@@ -2348,6 +2352,40 @@ static BOOL is_tty_handle( HANDLE handle )
     return ((UINT_PTR)handle & 3) == 1;
 }
 
+/* MADEIRA ml1560: console programs named in MADEIRA_HEADLESS_CONSOLE_EXES (base names,
+ * ';' or ',' separated, case-insensitive; set by the front end for its launcher
+ * sessions) get a console without a window. Device log 204: the console windows of a
+ * helper command interpreter and of a launcher's browser helper sat on top of the
+ * launcher's sign-in window, so every tap on the sign-in form landed on a console
+ * nobody could see. A window-less console behaves the same for the program.
+ * MADEIRA_HEADLESS_CONSOLES=0 disables it; [console-headless] logs each use. */
+static BOOL madeira_headless_console( const RTL_USER_PROCESS_PARAMETERS *params )
+{
+    WCHAR list[512], flag[4];
+    const WCHAR *path = params->ImagePathName.Buffer, *name, *p;
+    DWORD len, n, start = 0, i;
+
+    if (GetEnvironmentVariableW( L"MADEIRA_HEADLESS_CONSOLES", flag, ARRAY_SIZE(flag) ) && flag[0] == '0') return FALSE;
+    len = GetEnvironmentVariableW( L"MADEIRA_HEADLESS_CONSOLE_EXES", list, ARRAY_SIZE(list) );
+    if (!len || len >= ARRAY_SIZE(list) || !path) return FALSE;
+    n = params->ImagePathName.Length / sizeof(WCHAR);
+    for (i = 0; i < n; i++) if (path[i] == '\\' || path[i] == '/') start = i + 1;
+    name = path + start;
+    n -= start;
+    for (p = list; *p; )
+    {
+        const WCHAR *end = p;
+        while (*end && *end != ';' && *end != ',') end++;
+        if ((DWORD)(end - p) == n && !wcsnicmp( p, name, n ))
+        {
+            ERR( "[console-headless] ml1560 %s gets a console without a window\n", debugstr_wn( name, n ) );
+            return TRUE;
+        }
+        p = *end ? end + 1 : end;
+    }
+    return FALSE;
+}
+
 void init_console( void )
 {
     RTL_USER_PROCESS_PARAMETERS *params = RtlGetCurrentPeb()->ProcessParameters;
@@ -2394,6 +2432,7 @@ void init_console( void )
         BOOL no_window = params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW;
         HMODULE mod = GetModuleHandleW( NULL );
         params->ConsoleHandle = NULL;
+        if (!no_window && madeira_headless_console( params )) no_window = TRUE;
         if (RtlImageNtHeader( mod )->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI)
             alloc_console( no_window );
     }

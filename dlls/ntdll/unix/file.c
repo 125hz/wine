@@ -8878,7 +8878,7 @@ static int ios_steam_log_mirror_enabled(void)
 static void ios_guest_log_error( int fd, const void *buffer, unsigned int length )
 {
     static int enabled = -1, reported;
-    static unsigned int emitted, conn_emitted, content_emitted, steam_misses;
+    static unsigned int emitted, conn_emitted, content_emitted, console_emitted, steam_misses;
     static unsigned long long previous_hash;
     char text[1025], lower[1025], path[PATH_MAX];
     const char *name, *ext;
@@ -8899,7 +8899,8 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
     if (!mode || length < 5) goto out;
     if (__atomic_load_n( &emitted, __ATOMIC_RELAXED ) >= 32 &&
         (!steam_mirror || (__atomic_load_n( &conn_emitted, __ATOMIC_RELAXED ) >= IOS_STEAM_MIRROR_LINES &&
-                           __atomic_load_n( &content_emitted, __ATOMIC_RELAXED ) >= IOS_STEAM_MIRROR_LINES))) goto out;
+                           __atomic_load_n( &content_emitted, __ATOMIC_RELAXED ) >= IOS_STEAM_MIRROR_LINES &&
+                           __atomic_load_n( &console_emitted, __ATOMIC_RELAXED ) >= IOS_STEAM_MIRROR_LINES))) goto out;
     n = min( length, sizeof(text) - 1 );
     for (i = 0; i < n; ++i)
     {
@@ -8942,6 +8943,23 @@ static void ios_guest_log_error( int fd, const void *buffer, unsigned int length
         {
             ios_mask_account_data( text );
             dprintf( 2, "[steam-contentlog] ml1390 #%u %s%s\n", serial + 1, text, length > n ? " [truncated]" : "" );
+        }
+        goto out;
+    }
+    /* ml1520: console_log.txt names each launch task as the client moves
+     * through it ("GameAction [AppID n, ActionID n] : LaunchApp changed task
+     * to ...", "Game process added"), which is what says where the seconds
+     * between sign-in and the game's process go. Those lines only. */
+    if (steam_mirror && !strcasecmp( name, "console_log.txt" ))
+    {
+        if (strstr( lower, "gameaction" ) || strstr( lower, "game process" ))
+        {
+            serial = __atomic_fetch_add( &console_emitted, 1, __ATOMIC_RELAXED );
+            if (serial < IOS_STEAM_MIRROR_LINES)
+            {
+                ios_mask_account_data( text );
+                dprintf( 2, "[steam-console] ml1520 #%u %s%s\n", serial + 1, text, length > n ? " [truncated]" : "" );
+            }
         }
         goto out;
     }
