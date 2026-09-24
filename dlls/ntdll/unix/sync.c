@@ -89,8 +89,16 @@
  * inline ios_frame_tracking() predicate, which is a register read and a
  * compare on every other thread. */
 # include "ios_frame_stats.h"
+/* ml1510: move a listed program's thread to its current scheduling class
+ * (build/ntdll-unix/signal_arm64_ios.c) when it next waits. */
+extern void ios_qos_refresh( void );
+/* ml1520: a program the front end parks while the game runs ends at its next
+ * wait, and the launcher gives the ended program's window back (same file). */
+extern void ios_park_check( void );
+# define IOS_QOS_REFRESH() do { ios_qos_refresh(); ios_park_check(); } while (0)
 #else
 # define ios_srv_nt_count(which) ((void)0)
+# define IOS_QOS_REFRESH() ((void)0)
 # define ios_frame_tracking() 0
 # define ios_frame_wait_add(kind, ns) ((void)0)
 # define IOS_FRAME_WAIT_FAST 0
@@ -4362,6 +4370,7 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
     if (type != WaitAll && type != WaitAny) FIXME( "Unsupported wait type %u\n", type );
     ios_srv_nt_count( count > 1 ? IOS_NT_WAIT_MULTI : IOS_NT_WAIT_SINGLE );
+    IOS_QOS_REFRESH();
 
     if (TRACE_ON(sync))
     {
@@ -4442,6 +4451,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
     ios_srv_nt_count( IOS_NT_WAIT_SINGLE );
+    IOS_QOS_REFRESH();
 
     __sync_fetch_and_add( &ios_xp_wait_single, 1 );   /* ml1131 */
     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
@@ -4961,6 +4971,7 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         __sync_fetch_and_add( &ios_xp_delay, 1 );
         __sync_fetch_and_add( &ios_xp_delay_hist[d < 0 ? 5 : d == 0 ? 0 : d < 10000 ? 1 : d < 50000 ? 2 : d < 200000 ? 3 : 4], 1 );
     }
+    IOS_QOS_REFRESH();
 
     /* if alertable, we need to query the server */
     if (alertable)
