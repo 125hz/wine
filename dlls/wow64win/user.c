@@ -1814,6 +1814,11 @@ NTSTATUS WINAPI wow64_NtUserCallTwoParam( UINT *args )
             return TRUE;
         }
 
+    case NtUserCallTwoParam_GetGamepadState:
+        /* The state/capabilities payload contains no pointers and has the
+         * same layout on both architectures. Only widen the output pointer. */
+        return NtUserCallTwoParam( arg1, (UINT_PTR)UlongToPtr( arg2 ), code );
+
     default:
         return NtUserCallTwoParam( arg1, arg2, code );
     }
