@@ -1221,7 +1221,36 @@ enum
     NtUserCallTwoParam_GetVirtualScreenRect,
     /* temporary exports */
     NtUserAllocWinProc,
+    /* Madeira/iOS (ml668): read the host gamepad slot the app publishes. See
+     * build/win32u-unix/driver_ios.c ios_gamepad_query. APPENDED, never
+     * inserted — these codes are an ABI between win32u.dll and the win32u unix
+     * library, and the farms' prebuilt win32u.dll/wow64win.dll are not rebuilt
+     * in lockstep with every unix-side change.
+     *
+     * A win32u that does not know this code answers 0 (the `default:` FIXME
+     * arm), which is the same answer as "no pad in that slot" — so xinput1_3's
+     * probe needs no #ifdef and a stock Wine keeps its HID path. */
+    NtUserCallTwoParam_GetGamepadState,
 };
+
+/* `op` values for NtUserCallTwoParam_GetGamepadState, packed into arg1 above
+ * the user index. Both payloads are pointer-free structs with identical 32-
+ * and 64-bit layout, which is what lets the wow64 thunk pass them through
+ * with nothing but a pointer translation. */
+enum
+{
+    NtUserGamepadOp_State,   /* buffer: XINPUT_STATE        (16 bytes, out) */
+    NtUserGamepadOp_Caps,    /* buffer: XINPUT_CAPABILITIES (20 bytes, out) */
+};
+
+/* Returns TRUE when a pad is connected in `index` and `buffer` was filled.
+ * One syscall into a host snapshot read, no
+ * allocation or server round trip — games poll this at up to 1 kHz. */
+static inline BOOL NtUserGetGamepadState( UINT index, UINT op, void *buffer )
+{
+    return NtUserCallTwoParam( index | (op << 8), (UINT_PTR)buffer,
+                               NtUserCallTwoParam_GetGamepadState );
+}
 
 static inline DLGPROC NtUserGetDialogProc( DLGPROC proc, BOOL ansi )
 {
