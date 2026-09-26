@@ -2029,6 +2029,23 @@ static BOOL notification_filter_matches( DEV_BROADCAST_HDR *filter, const WCHAR 
     return TRUE;
 }
 
+/* iOS-Madeira ml2000 [devnotify]: when the plug-and-play service is not
+ * running (\pipe\wine_plugplay missing), this thread used to exit within
+ * milliseconds of being created.  A thread that is born and dies at once
+ * donates its just-freed TEB/TLS to the next thread the program creates,
+ * which device logs show landing on exactly that memory.  Windows keeps the
+ * notification thread alive for the life of the process, so keep it alive
+ * here too: wait and retry the connection with a growing back-off (30 s up to
+ * 10 min), which also picks the service up if it starts later.
+ * MADEIRA_DEVNOTIFY_PERSIST=0 restores the immediate exit. */
+static BOOL device_notify_persist(void)
+{
+    WCHAR value[4];
+    DWORD len = GetEnvironmentVariableW( L"MADEIRA_DEVNOTIFY_PERSIST", value, ARRAY_SIZE(value) );
+
+    return !(len == 1 && value[0] == '0');
+}
+
 static DWORD WINAPI device_notify_proc( void *arg )
 {
     WCHAR endpoint[] = L"\\pipe\\wine_plugplay";
@@ -2042,36 +2059,56 @@ static DWORD WINAPI device_notify_proc( void *arg )
     unsigned int size;
     WCHAR *path;
     BYTE *buf;
+    BOOL persist = device_notify_persist();
+    DWORD retry_ms = 30 * 1000;
+    unsigned int attempts = 0;
 
     SetThreadDescription( GetCurrentThread(), L"wine_sechost_device_notify" );
 
-    if ((err = RpcStringBindingComposeW( NULL, protseq, NULL, endpoint, NULL, &binding_str )))
+    for (;;)
     {
-        ERR("RpcStringBindingCompose() failed, error %#lx\n", err);
-        return err;
-    }
-    err = RpcBindingFromStringBindingW( binding_str, &plugplay_binding_handle );
-    RpcStringFreeW( &binding_str );
-    if (err)
-    {
-        ERR("RpcBindingFromStringBinding() failed, error %#lx\n", err);
-        return err;
-    }
+        attempts++;
+        if ((err = RpcStringBindingComposeW( NULL, protseq, NULL, endpoint, NULL, &binding_str )))
+        {
+            ERR("RpcStringBindingCompose() failed, error %#lx\n", err);
+            if (!persist) return err;
+            goto wait_and_retry;
+        }
+        err = RpcBindingFromStringBindingW( binding_str, &plugplay_binding_handle );
+        RpcStringFreeW( &binding_str );
+        if (err)
+        {
+            ERR("RpcBindingFromStringBinding() failed, error %#lx\n", err);
+            if (!persist) return err;
+            goto wait_and_retry;
+        }
 
-    __TRY
-    {
-        handle = plugplay_register_listener();
-    }
-    __EXCEPT(rpc_filter)
-    {
-        err = map_exception_code( GetExceptionCode() );
-    }
-    __ENDTRY
+        __TRY
+        {
+            handle = plugplay_register_listener();
+        }
+        __EXCEPT(rpc_filter)
+        {
+            err = map_exception_code( GetExceptionCode() );
+        }
+        __ENDTRY
 
-    if (!handle)
-    {
+        if (handle)
+        {
+            if (attempts > 1) ERR("[devnotify] ml2000 connected to plugplay after %u attempts\n", attempts);
+            break;
+        }
+
         ERR("failed to open RPC handle, error %lu\n", err);
-        return 1;
+        if (!persist) return 1;
+        RpcBindingFree( &plugplay_binding_handle );
+
+    wait_and_retry:
+        if (attempts == 1)
+            ERR("[devnotify] ml2000 plugplay unavailable (error %lu): notification thread stays alive "
+                "and retries with back-off (MADEIRA_DEVNOTIFY_PERSIST=0 restores exit)\n", err);
+        Sleep( retry_ms );
+        retry_ms = min( retry_ms * 2, 10 * 60 * 1000 );
     }
 
     for (;;)

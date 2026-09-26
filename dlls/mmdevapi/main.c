@@ -363,7 +363,19 @@ static DWORD WINAPI notify_thread( void *p )
 
     while (1)
     {
-        MIDI_CALL( midi_notify_wait, &params );
+        /* Both outputs are read straight back off this stack, so both are
+         * reset before every call and both default to "stop".  midi_notify_wait
+         * is defined to BLOCK until there is a notification or the driver is
+         * released; a backend that returns immediately without writing *quit
+         * left this loop reading an uninitialised slot, and the loop then
+         * became a busy wait that burned a whole core for the lifetime of the
+         * process -- with notify.send_notify equally uninitialised and able to
+         * send DriverCallback through a garbage function pointer.  Failing
+         * closed costs nothing when the driver does fill them in: every real
+         * one assigns *quit on every return. */
+        quit = TRUE;
+        notify.send_notify = FALSE;
+        if (MIDI_CALL( midi_notify_wait, &params )) break;
         if (quit) break;
         if (notify.send_notify) notify_client(&notify);
     }
@@ -405,6 +417,9 @@ LRESULT WINAPI DriverProc( DWORD_PTR id, HANDLE driver, UINT msg, LPARAM param1,
 DWORD WINAPI midMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DWORD_PTR param2 )
 {
     struct midi_in_message_params params;
+    /* send_notify is read back whenever the driver reports success, so it is
+     * cleared first for the same reason as in notify_thread: a driver that
+     * leaves it alone must not make us dispatch through uninitialised stack. */
     struct notify_context notify;
     UINT err = 0;
 
@@ -420,6 +435,7 @@ DWORD WINAPI midMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DW
 
     do
     {
+        notify.send_notify = FALSE;
         MIDI_CALL( midi_in_message, &params );
         if ((!err || err == ERROR_RETRY) && notify.send_notify) notify_client( &notify );
     } while (err == ERROR_RETRY);
@@ -430,7 +446,7 @@ DWORD WINAPI midMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DW
 DWORD WINAPI modMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DWORD_PTR param2 )
 {
     struct midi_out_message_params params;
-    struct notify_context notify;
+    struct notify_context notify;   /* see midMessage */
     UINT err = 0;
 
     TRACE( "%04x %04x %08Ix %08Ix %08Ix\n", id, msg, user, param1, param2 );
@@ -443,6 +459,7 @@ DWORD WINAPI modMessage( UINT id, UINT msg, DWORD_PTR user, DWORD_PTR param1, DW
     params.err     = &err;
     params.notify  = &notify;
 
+    notify.send_notify = FALSE;
     MIDI_CALL( midi_out_message, &params );
     if (!err && notify.send_notify) notify_client( &notify );
     return err;

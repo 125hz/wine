@@ -2903,6 +2903,35 @@ static void adapter_no3d_release_context(struct wined3d_context *context)
 
 static void adapter_no3d_get_wined3d_caps(const struct wined3d_adapter *adapter, struct wined3d_caps *caps)
 {
+    /* MADEIRA: the 2D surface capabilities a DirectDraw application needs.
+     *
+     * Upstream leaves this empty, so under no3d the only DDSCAPS wined3d
+     * reports are the ones the generic block above sets (FLIP, OFFSCREENPLAIN,
+     * PALETTE, PRIMARYSURFACE, TEXTURE, ZBUFFER, MIPMAP), and every surface
+     * kind a flipping primary chain is made of -- FRONTBUFFER, BACKBUFFER,
+     * COMPLEX -- reads as unsupported. A DirectDraw title checks DDCAPS
+     * before it builds that chain, so it takes a windowed-blit fallback, or
+     * refuses, on a host where the chain would in fact have worked: ddraw
+     * implements flipping itself and does not need a 3D backend for any of
+     * it.
+     *
+     * The three added beyond that are what a 2D-only display driver has
+     * always reported: OWNDC (each surface keeps its own DC), VIDEOMEMORY and
+     * LOCALVIDMEM. The last two are the pair a period title tests before it
+     * will use a surface for anything performance-sensitive; the memory is
+     * accounted against the same vram figure GetAvailableVidMem reports, so
+     * the claim is consistent with the rest of the adapter.
+     *
+     * Deliberately NOT added: WINEDDCAPS_3D and WINEDDSCAPS_3DDEVICE, which
+     * is the whole point of no3d -- ddraw reads their absence and sets
+     * DDRAW_NO3D (ddraw.c ddraw_init) -- and NONLOCALVIDMEM, which describes
+     * an AGP aperture that does not exist here. */
+    caps->ddraw_caps.dds_caps |= WINEDDSCAPS_FRONTBUFFER
+            | WINEDDSCAPS_BACKBUFFER
+            | WINEDDSCAPS_COMPLEX
+            | WINEDDSCAPS_OWNDC
+            | WINEDDSCAPS_VIDEOMEMORY
+            | WINEDDSCAPS_LOCALVIDMEM;
 }
 
 static BOOL adapter_no3d_check_format(const struct wined3d_adapter *adapter,
@@ -3336,9 +3365,29 @@ static struct wined3d_adapter *wined3d_adapter_no3d_create(unsigned int ordinal,
     struct wined3d_adapter *adapter;
     LUID primary_luid, *luid = NULL;
 
+    /* MADEIRA: the identity the 2D path reports.
+     *
+     * Upstream is HW_VENDOR_SOFTWARE / CARD_WINE, i.e. vendor 0 and device 0,
+     * with a purely descriptive name. Two things are wrong with that on this
+     * port. First, a title of the 2000-2010 era typically carries a hard-coded
+     * vendor table and reads an unknown vendor -- and 0 in particular -- as
+     * "no usable adapter", taking a reduced path or refusing outright.
+     * Second, and worse, this is the identity IDirectDraw7::GetDeviceIdentifier
+     * hands back (ddraw.c ddraw7_GetDeviceIdentifier -> wined3d_adapter_get_identifier,
+     * which reads driver_info and needs no 3D backend), while D3D9 on the same
+     * machine reports 0x106B / 0x0001 from
+     * research/dxmt/src/d3d9/d3d9_interface.cpp. A title that asks both and
+     * compares them concludes it is looking at two different GPUs.
+     *
+     * So the no3d adapter reports the same pair, and
+     * build/win32u-unix/sysparams_ios.c puts the same pair in the synthesized
+     * EnumDisplayDevices DeviceID. All three answers now agree. The vidmem
+     * figure is left at the upstream 128 MB: it is the amount the no3d path
+     * can honestly account for, and inflating it would only mislead a title
+     * that budgets against it. */
     static const struct wined3d_gpu_description gpu_description =
     {
-        HW_VENDOR_SOFTWARE, CARD_WINE, "WineD3D DirectDraw Emulation", DRIVER_WINE, 128,
+        HW_VENDOR_APPLE, CARD_APPLE_GPU, "DXMT (Metal) 2D", DRIVER_WINE, 128,
     };
 
     TRACE("ordinal %u, wined3d_creation_flags %#x.\n", ordinal, wined3d_creation_flags);
@@ -3507,8 +3556,43 @@ HRESULT wined3d_init(struct wined3d *wined3d, uint32_t flags)
 
     if (!(wined3d->adapters[0] = wined3d_adapter_create(0, flags)))
     {
-        WARN("Failed to create adapter.\n");
-        return E_FAIL;
+        /* MADEIRA: fall back to the no3d adapter when no 3D backend can be
+         * brought up at all.
+         *
+         * On a host with neither OpenGL nor Vulkan, wined3d_adapter_gl_create
+         * fails inside wined3d_caps_gl_ctx_create ("Failed to find a suitable
+         * pixel format"), and without this wined3d_create returns NULL to
+         * every caller. ddraw copes -- it retries the whole create with
+         * WINED3D_NO3D (ddraw.c ddraw_init, main.c DirectDrawEnumerateExA) --
+         * but it is the ONLY caller that does: d3d8, dxgi and dxcore have no
+         * retry, so on such a host they lose even the 2D, display-mode and
+         * adapter-identity surface no3d would have given them, and the
+         * application sees a hard failure where the honest answer is "this
+         * adapter has no 3D".
+         *
+         * The flag has to go on the wined3d object, not just the adapter:
+         * wined3d_check_device_format consults wined3d->flags to refuse
+         * texture capabilities under no3d, and an adapter that is no3d while
+         * its wined3d is not would advertise a 3D capability that nothing can
+         * back. Setting it here also means ddraw's own retry finds the object
+         * already built and stops paying for a second doomed GL attempt --
+         * the log showed the same pixel-format error four times in one run,
+         * once per DirectDraw entry point.
+         *
+         * Strictly a recovery path: on a host where a 3D backend does come
+         * up, none of this runs. */
+        WARN("Failed to create adapter; retrying without 3D support.\n");
+        if (flags & WINED3D_NO3D)
+            return E_FAIL;
+
+        flags |= WINED3D_NO3D;
+        wined3d->flags = flags;
+        if (!(wined3d->adapters[0] = wined3d_adapter_create(0, flags)))
+        {
+            WARN("Failed to create adapter.\n");
+            return E_FAIL;
+        }
+        ERR_(winediag)("Disabling 3D support: no OpenGL or Vulkan adapter is available.\n");
     }
     wined3d->adapter_count = 1;
 
