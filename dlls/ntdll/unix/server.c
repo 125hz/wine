@@ -916,6 +916,7 @@ unsigned int server_queue_process_apc( HANDLE process, const union apc_call *cal
 
             /* remove the handle from the cache, get_apc_result will close it for us */
             close_inproc_sync( handle );
+            madeira_fast_close( handle );   /* ml952 fastsync */
 
             SERVER_START_REQ( get_apc_result )
             {
@@ -1736,6 +1737,12 @@ void server_init_process_done(void)
     FILE_FS_DEVICE_INFORMATION info;
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
 
+    /* ml982 fastsync: drop any handle -> cell cache entry left behind by a
+     * dead pseudo-process whose id we have just been reissued.  (The iOS build
+     * compiles build/ntdll-unix/server_ios.c in place of this file; the call is
+     * mirrored there.  Keep the two in step.) */
+    madeira_fast_flush_pid();
+
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );
     close( initial_cwd );
@@ -1865,6 +1872,7 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
     {
         fd = remove_fd_from_cache( source );
         close_inproc_sync( source );
+        madeira_fast_close( source );   /* ml952 fastsync */
     }
 
     SERVER_START_REQ( dup_handle )
@@ -1939,6 +1947,7 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
      * retrieve it again */
     fd = remove_fd_from_cache( handle );
     close_inproc_sync( handle );
+    madeira_fast_close( handle );   /* ml952 fastsync */
 
     SERVER_START_REQ( close_handle )
     {
