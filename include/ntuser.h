@@ -1244,8 +1244,8 @@ enum
 };
 
 /* Returns TRUE when a pad is connected in `index` and `buffer` was filled.
- * Cheap by construction: one syscall into a plain memory read, no lock, no
- * allocation, no server round trip — games poll this at up to 1 kHz. */
+ * One syscall into a host snapshot read, no
+ * allocation or server round trip — games poll this at up to 1 kHz. */
 static inline BOOL NtUserGetGamepadState( UINT index, UINT op, void *buffer )
 {
     return NtUserCallTwoParam( index | (op << 8), (UINT_PTR)buffer,
