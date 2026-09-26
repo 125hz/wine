@@ -81,10 +81,32 @@ static inline WOW_TEB *get_wow_teb( TEB *teb )
     return teb->WowTebOffset ? (WOW_TEB *)((char *)teb + teb->WowTebOffset) : NULL;
 }
 
+#ifdef WINE_IOS
+/* MADEIRA ml1590: wow_peb is a SESSION global on iOS (pseudo-processes share one
+ * address space) and is cleared or swapped when another 32-bit process's window
+ * is released or a 64-bit child starts ([wow-peb] lines). A 32-bit program still
+ * running then got is_wow64() == FALSE, get_cpu_area() NULL and
+ * STATUS_INVALID_PARAMETER from its own ThreadWow64Context query: wow64 built the
+ * launcher's first thread on Esp 0 (device log 206, 64 retries) and the
+ * installer's callbacks on a stack at guest 0xffffffb0 (tablet log 6, installer
+ * stuck). A thread whose own TEB carries a 32-bit TEB is WoW64 whatever the
+ * global says. ios_wow64_by_teb = 0 (MADEIRA_WOW64_BY_TEB=0) restores the global. */
+extern int ios_wow64_by_teb;
+static inline BOOL is_wow64(void)
+{
+    if (ios_wow64_by_teb)
+    {
+        TEB *teb = NtCurrentTeb();
+        if (teb && teb->WowTebOffset) return TRUE;
+    }
+    return !!wow_peb;
+}
+#else
 static inline BOOL is_wow64(void)
 {
     return !!wow_peb;
 }
+#endif
 
 /* check for old-style Wow64 (using a 32-bit ntdll.so) */
 static inline BOOL is_old_wow64(void)
@@ -198,6 +220,10 @@ extern unsigned int supported_machines_count;
 extern USHORT supported_machines[8];
 extern BOOL process_exiting;
 extern HANDLE keyed_event;
+#ifdef WINE_IOS
+/* per-pseudo-process default keyed event (sync.c) — handle tables are not shared */
+extern HANDLE ios_default_keyed_event(void);
+#endif
 extern int inproc_device_fd;
 extern timeout_t server_start_time;
 extern sigset_t server_block_set;
@@ -391,6 +417,19 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
 extern void dbg_init(void);
 
 extern void close_inproc_sync( HANDLE handle );
+#ifdef WINE_IOS
+/* iOS-Madeira ml952 fastsync: drop a handle from the handle -> cell cache.
+ * Must be called wherever close_inproc_sync() is, i.e. everywhere a handle
+ * stops meaning what it used to mean. */
+extern void madeira_fast_close( HANDLE handle );
+/* ml982: drop every cache entry belonging to the calling process id.  Called
+ * once, from server_init_process_done(), because a pseudo-process that dies
+ * leaves its positive entries behind and the server reissues process ids. */
+extern void madeira_fast_flush_pid(void);
+#else
+#define madeira_fast_close(handle) ((void)0)
+#define madeira_fast_flush_pid() ((void)0)
+#endif
 
 extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
                                           ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status );
@@ -488,9 +527,16 @@ static inline NTSTATUS wait_async( HANDLE handle, BOOL alertable )
     return server_wait_for_object( handle, alertable, NULL );
 }
 
+#ifdef WINE_IOS
+extern BOOL ios_in_wow64_call(void);
+#endif
 static inline BOOL in_wow64_call(void)
 {
+#ifdef WINE_IOS
+    return ios_in_wow64_call();
+#else
     return is_win64 && is_wow64();
+#endif
 }
 
 static inline void set_async_iosb( client_ptr_t iosb, NTSTATUS status, ULONG_PTR info )
@@ -600,11 +646,19 @@ static inline void init_unicode_string( UNICODE_STRING *str, const WCHAR *data )
     str->Buffer = (WCHAR *)data;
 }
 
+#ifdef WINE_IOS
+extern ULONG_PTR ios_section_zero_bits(void);
+#endif
+
 static inline NTSTATUS map_section( HANDLE mapping, void **ptr, SIZE_T *size, ULONG protect )
 {
     *ptr = NULL;
     *size = 0;
-    return NtMapViewOfSection( mapping, NtCurrentProcess(), ptr, user_space_wow_limit,
+    ULONG_PTR zero_bits = user_space_wow_limit;
+#ifdef WINE_IOS
+    zero_bits = ios_section_zero_bits();
+#endif
+    return NtMapViewOfSection( mapping, NtCurrentProcess(), ptr, zero_bits,
                                0, NULL, size, ViewShare, 0, protect );
 }
 
