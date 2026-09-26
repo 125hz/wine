@@ -1997,6 +1997,153 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
 
 
 /*************************************************************************
+ *              TLS quarantine  (iOS-Madeira ml2000)
+ *
+ * [tls-quarantine] Delay the reuse of an exited thread's module TLS memory.
+ *
+ * DEVICE EVIDENCE (three identical runs): a short-lived thread exits, and the
+ * very next thread created gets byte-for-byte the SAME TLS pointer array and
+ * the same TLS data blocks, because the process heap hands the just-freed
+ * blocks straight back.  That thread later dies on a NULL object loaded from
+ * its own TLS.  A program that keeps a stale pointer into the dead thread's
+ * TLS (or whose cleanup runs late on another thread) then writes straight into
+ * the LIVE thread's TLS.  Windows makes that immediate recycling much less
+ * likely, so programs get away with it there.
+ *
+ * Instead of freeing the array and blocks at thread exit, park them in a small
+ * ring (TLS_QUARANTINE_DEPTH exited threads) and free the oldest entry once the
+ * ring is full.  Memory cost is bounded by DEPTH threads' TLS.  Late writes to
+ * a parked block hit dead memory instead of a live thread.
+ *
+ * All state is protected by loader_section (LdrShutdownThread and
+ * alloc_thread_tls both run under it).  The environment is read once at
+ * process init (the PEB lock orders the other way during environment edits).
+ * MADEIRA_TLS_QUARANTINE=0 restores immediate freeing; MADEIRA_TLS_REUSE_LOG=0
+ * silences the [tls-reuse] diagnostic.
+ */
+#define TLS_QUARANTINE_DEPTH 16
+#define TLS_REUSE_HISTORY    64
+
+struct tls_quarantine_entry
+{
+    void **pointers;
+    UINT   count;
+};
+
+static struct tls_quarantine_entry tls_quarantine[TLS_QUARANTINE_DEPTH];
+static UINT tls_quarantine_pos;          /* next ring slot == oldest entry once full */
+static int  tls_quarantine_on = 1;       /* MADEIRA_TLS_QUARANTINE, default on */
+static int  tls_reuse_log_on = 1;        /* MADEIRA_TLS_REUSE_LOG, default on */
+static void *tls_freed_addr[TLS_REUSE_HISTORY];   /* recently freed TLS arrays/blocks */
+static ULONG tls_freed_seq[TLS_REUSE_HISTORY];
+static ULONG tls_freed_count;            /* total thread-exit TLS releases */
+static UINT  tls_freed_pos;
+
+static int madeira_env_is_zero( const WCHAR *var )
+{
+    UNICODE_STRING name, value;
+    WCHAR buffer[2];
+
+    RtlInitUnicodeString( &name, var );
+    value.Buffer = buffer;
+    value.Length = 0;
+    value.MaximumLength = sizeof(buffer);
+    return !RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+           value.Length == sizeof(WCHAR) && buffer[0] == '0';
+}
+
+/* Called once from process init, environment ready, before other threads. */
+static void tls_quarantine_init(void)
+{
+    tls_quarantine_on = !madeira_env_is_zero( L"MADEIRA_TLS_QUARANTINE" );
+    tls_reuse_log_on = !madeira_env_is_zero( L"MADEIRA_TLS_REUSE_LOG" );
+    ERR( "[tls-quarantine] ml2000 enabled=%d depth=%u reuse-log=%d bits=%u\n",
+         tls_quarantine_on, TLS_QUARANTINE_DEPTH, tls_reuse_log_on, (unsigned)(sizeof(void *) * 8) );
+}
+
+static void tls_note_freed( void *ptr, ULONG seq )
+{
+    if (!ptr) return;
+    tls_freed_addr[tls_freed_pos] = ptr;
+    tls_freed_seq[tls_freed_pos] = seq;
+    tls_freed_pos = (tls_freed_pos + 1) % TLS_REUSE_HISTORY;
+}
+
+/* Really free an exited thread's TLS array and blocks.  loader_section held. */
+static void tls_release_thread_data( void **pointers, UINT count )
+{
+    ULONG seq = ++tls_freed_count;
+    UINT i;
+
+    for (i = 0; i < count; i++)
+    {
+        if (!pointers[i]) continue;
+        if (tls_reuse_log_on) tls_note_freed( pointers[i], seq );
+        RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
+    }
+    if (tls_reuse_log_on) tls_note_freed( pointers, seq );
+    RtlFreeHeap( GetProcessHeap(), 0, pointers );
+}
+
+/* Park an exited thread's TLS; release the oldest parked entry if the ring is
+ * full.  loader_section held. */
+static void tls_quarantine_thread_data( void **pointers, UINT count )
+{
+    struct tls_quarantine_entry *slot;
+    static int evict_logged;
+
+    if (!tls_quarantine_on)
+    {
+        tls_release_thread_data( pointers, count );
+        return;
+    }
+    slot = &tls_quarantine[tls_quarantine_pos];
+    if (slot->pointers)
+    {
+        if (!evict_logged)
+        {
+            evict_logged = 1;
+            ERR( "[tls-quarantine] ml2000 ring full: releasing the oldest exited thread's TLS "
+                 "(array %p, %u slots); later exits recycle in FIFO order\n", slot->pointers, slot->count );
+        }
+        tls_release_thread_data( slot->pointers, slot->count );
+    }
+    slot->pointers = pointers;
+    slot->count = count;
+    tls_quarantine_pos = (tls_quarantine_pos + 1) % TLS_QUARANTINE_DEPTH;
+}
+
+/* [tls-reuse]: does a new thread's TLS memory match memory freed by a thread
+ * exit shortly before?  Only possible with the quarantine off or after the ring
+ * recycled.  loader_section held.  Low volume: capped. */
+static void tls_check_reuse( void **pointers, UINT count )
+{
+    static int reuse_logged;
+    UINT i, h, n = min( count, 8 );
+
+    if (!tls_reuse_log_on || !tls_freed_count || reuse_logged >= 16) return;
+    for (h = 0; h < TLS_REUSE_HISTORY; h++)
+    {
+        void *freed = tls_freed_addr[h];
+
+        if (!freed) continue;
+        for (i = 0; i <= n && reuse_logged < 16; i++)
+        {
+            void *cur = (i == n) ? (void *)pointers : pointers[i];
+
+            if (cur != freed) continue;
+            reuse_logged++;
+            ERR( "[tls-reuse] ml2000 tid=%04lx teb=%p new TLS %s slot=%d %p was freed by a thread exit "
+                 "(age=%lu releases, total=%lu) quarantine=%d\n",
+                 HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), NtCurrentTeb(),
+                 (i == n) ? "array" : "block", (i == n) ? -1 : (int)i, cur,
+                 tls_freed_count - tls_freed_seq[h], tls_freed_count, tls_quarantine_on );
+        }
+    }
+}
+
+
+/*************************************************************************
  *              alloc_thread_tls
  *
  * Allocate the per-thread structure for module TLS storage.
@@ -2030,6 +2177,7 @@ static NTSTATUS alloc_thread_tls(void)
         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
     }
     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
+    tls_check_reuse( pointers, tls_module_count );  /* ml2000 [tls-reuse] */
     ERR( "iOS-Madeira alloc_thread_tls: TEB=%p TEB->TLS=%p TLS[0]=%p TLS[1]=%p TLS[2]=%p TLS[3]=%p (count=%u)\n",
          NtCurrentTeb(), pointers,
          tls_module_count > 0 ? pointers[0] : NULL,
@@ -4893,7 +5041,6 @@ void WINAPI LdrShutdownThread(void)
     PLIST_ENTRY mark, entry;
     LDR_DATA_TABLE_ENTRY *mod;
     WINE_MODREF *wm;
-    UINT i;
     void **pointers;
 
     TRACE("()\n");
@@ -4901,6 +5048,8 @@ void WINAPI LdrShutdownThread(void)
     /* don't do any detach calls if process is exiting */
     if (process_detaching) return;
 
+#if defined(__aarch64__) || defined(__arm64ec__)
+    /* ml1940: this diagnostic reads ARM64's CHPE area, absent from an i386 TEB. */
     /* iOS-Madeira ml843 [detach-probe]: is the FEX emulator stack top already
      * sitting in this thread's TLS BEFORE any detach cleanup runs?
      *
@@ -4964,6 +5113,7 @@ void WINAPI LdrShutdownThread(void)
         }
     }
 
+#endif
     RtlProcessFlsData( NtCurrentTeb()->FlsSlots, 1 );
 
     RtlEnterCriticalSection( &loader_section );
@@ -5000,8 +5150,9 @@ void WINAPI LdrShutdownThread(void)
     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
     {
         NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
-        for (i = 0; i < tls_module_count; i++) RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
-        RtlFreeHeap( GetProcessHeap(), 0, pointers );
+        /* ml2000 [tls-quarantine]: park instead of freeing immediately (see
+         * tls_quarantine_thread_data); MADEIRA_TLS_QUARANTINE=0 frees now. */
+        tls_quarantine_thread_data( pointers, tls_module_count );
     }
     RtlProcessFlsData( NtCurrentTeb()->FlsSlots, 2 );
     NtCurrentTeb()->FlsSlots = NULL;
@@ -5629,6 +5780,10 @@ void loader_init( CONTEXT *context, void **entry )
             InitializeListHead( &hash_table[i] );
 
         init_user_process_params();
+#ifdef __i386__
+        heap_init_madeira_policy();  /* ml1940: environment ready, no guest threads yet */
+#endif
+        tls_quarantine_init();       /* ml2000: same point, every architecture */
         load_global_options();
         version_init();
         open_known_dll_ntdir();

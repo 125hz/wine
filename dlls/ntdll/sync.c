@@ -47,12 +47,17 @@ struct ios_xp_nt ios_xp_nt;   /* layout: ntdll_misc.h */
 
 static inline ULONGLONG ios_xp_ticks(void)
 {
+#if defined(__aarch64__) || defined(__arm64ec__)
     ULONGLONG v;
     __asm__ __volatile__( "mrs %0, cntvct_el0" : "=r"(v) );
     return v;
+#else
+    return 0;  /* ml1940: ARM counter diagnostics do not apply to emulated i386. */
+#endif
 }
 void ios_xp_nt_init(void)
 {
+#if defined(__aarch64__) || defined(__arm64ec__)
     if (!ios_xp_nt.freq)
     {
         ULONGLONG f;
@@ -60,9 +65,11 @@ void ios_xp_nt_init(void)
         ios_xp_nt.freq = f;
         ios_xp_nt.magic = 0x31544e5058444d41ull;   /* 'AMDXPNT1' */
     }
+#endif
 }
 static void ios_xp_cs_waited( RTL_CRITICAL_SECTION *crit, ULONGLONG t0 )
 {
+#if defined(__aarch64__) || defined(__arm64ec__)
     ULONGLONG d = ios_xp_ticks() - t0, us;
     LONG64 idx;
     ios_xp_nt_init();
@@ -73,6 +80,7 @@ static void ios_xp_cs_waited( RTL_CRITICAL_SECTION *crit, ULONGLONG t0 )
     InterlockedIncrement64( &ios_xp_nt.cs_wait_hist[us < 2 ? 0 : us < 10 ? 1 : us < 50 ? 2 : us < 200 ? 3 : us < 1000 ? 4 : 5] );
     idx = InterlockedIncrement64( &ios_xp_nt.cs_ring_idx );
     if (!(idx & 3)) ios_xp_nt.cs_ring[(idx >> 2) & 1023] = (ULONG_PTR)crit;
+#endif
 }
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);

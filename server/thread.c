@@ -1092,6 +1092,19 @@ void stop_thread( struct thread *thread )
 #endif
 }
 
+#ifdef WINE_IOS
+/* ml1980: the first thread's start wait was cleared (process.c,
+ * init_process_done). A context left PENDING by an earlier reader becomes
+ * refreshable, so the next stop_thread captures it instead of waiting for a
+ * start post that never comes. (Not captured here: this runs in the thread's
+ * own request.) */
+void ios_start_wait_cleared( struct thread *thread )
+{
+    if (thread->context && thread->context->status == STATUS_PENDING)
+        thread->context->ios_snapshot = 1;
+}
+#endif
+
 /* suspend a thread */
 int suspend_thread( struct thread *thread )
 {

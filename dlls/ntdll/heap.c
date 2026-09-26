@@ -300,6 +300,8 @@ struct heap
     RTL_CRITICAL_SECTION cs;
     struct entry     free_lists[FREE_LIST_COUNT];
     struct bin      *bins;
+    SIZE_T           madeira_large_ops; /* ml1950: diagnostic cadence, under heap lock */
+    SIZE_T           madeira_large_frees;
     SUBHEAP          subheap;
 };
 
@@ -329,6 +331,56 @@ C_ASSERT( HEAP_MIN_LARGE_BLOCK_SIZE <= HEAP_INITIAL_GROW_SIZE );
 #define HEAP_CHECKING_ENABLED 0x80000000
 
 static struct heap *process_heap;  /* main process heap */
+
+/* ml1940: initialized once by the loader, after the environment is available
+ * and before application threads run. Never query the environment while holding
+ * a heap lock: the PEB lock has the opposite lock order during environment edits.
+ * These opt-ins apply only to 32-bit heaps; the host's heaps keep Wine defaults. */
+static unsigned int madeira_heap_policy;
+#define MADEIRA_HEAP_COMPACT 1
+#define MADEIRA_HEAP_COMBINED 2
+#define MADEIRA_HEAP_RECLAIM 4
+#define MADEIRA_HEAP_STATS 8
+
+void heap_init_madeira_policy(void)
+{
+#ifdef __i386__
+    static const WCHAR * const names[] = { L"MADEIRA_HEAP_COMPACT", L"MADEIRA_HEAP_COMBINED",
+                                          L"MADEIRA_HEAP_RECLAIM", L"MADEIRA_HEAP_STATS" };
+    UNICODE_STRING name, value;
+    WCHAR buffer[2];
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(names); i++)
+    {
+        RtlInitUnicodeString( &name, names[i] );
+        value.Buffer = buffer;
+        value.MaximumLength = sizeof(buffer);
+        if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
+            value.Length == sizeof(WCHAR) && buffer[0] == '1') madeira_heap_policy |= 1u << i;
+    }
+    ERR( "[heap-policy] ml1940 compact=%u combined=%u bits=32\n",
+         !!(madeira_heap_policy & MADEIRA_HEAP_COMPACT), !!(madeira_heap_policy & MADEIRA_HEAP_COMBINED) );
+    ERR( "[heap-policy] ml1950 reclaim=%u stats=%u bits=32\n",
+         !!(madeira_heap_policy & MADEIRA_HEAP_RECLAIM), !!(madeira_heap_policy & MADEIRA_HEAP_STATS) );
+#endif
+}
+
+/* Smaller growable regions bound unused VA and let wholly free regions return
+ * sooner. Do not change the requested size of fixed heaps or large allocations.
+ * Explicit Windows allocation sizes and 32-bit address limits remain intact. */
+static SIZE_T madeira_heap_grow_limit(void)
+{
+    return (madeira_heap_policy & MADEIRA_HEAP_COMPACT) ? 0x200000 : HEAP_MAX_GROW_SIZE;
+}
+
+static SIZE_T madeira_heap_retry_size( SIZE_T grow, SIZE_T required )
+{
+    if (!(madeira_heap_policy & MADEIRA_HEAP_COMPACT))
+        return grow <= required || grow <= 4 * 1024 * 1024 ? 0 : grow / 2;
+    required = ROUND_SIZE( max(required, REGION_ALIGN), REGION_ALIGN - 1 );
+    return grow <= required ? 0 : max( grow / 2, required );
+}
 
 static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct block *block );
 
@@ -983,6 +1035,21 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
     *region_size = ROUND_SIZE( *region_size, align - 1 );
     *commit_size = ROUND_SIZE( *commit_size, align - 1 );
 
+    /* ml1940: large heap blocks are fully committed. Combining these requests
+     * avoids a second guest/native transition, VM lock and executable-range
+     * notification on this high-frequency path, without retaining freed blocks. */
+    if ((madeira_heap_policy & MADEIRA_HEAP_COMBINED) && *region_size == *commit_size)
+    {
+        if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, region_size,
+                                               MEM_RESERVE | MEM_COMMIT, get_protection_type( flags ) )))
+        {
+            WARN( "Could not allocate/commit %#Ix bytes, status %#lx\n", *region_size, status );
+            return NULL;
+        }
+        *commit_size = *region_size;
+        return addr;
+    }
+
     /* allocate the memory block */
     if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, 0, region_size, MEM_RESERVE,
                                            get_protection_type( flags ) )))
@@ -994,6 +1061,11 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
                                            get_protection_type( flags ) )))
     {
         WARN( "Could not commit %#Ix bytes, status %#lx\n", *commit_size, status );
+        if (madeira_heap_policy)
+        {
+            SIZE_T release_size = 0;
+            NtFreeVirtualMemory( NtCurrentProcess(), &addr, &release_size, MEM_RELEASE );
+        }
         return NULL;
     }
 
@@ -1001,8 +1073,10 @@ static void *allocate_region( struct heap *heap, ULONG flags, SIZE_T *region_siz
 }
 
 
+static void madeira_heap_snapshot( struct heap *heap, ULONG flags, SIZE_T request, ULONG_PTR caller );
+
 static NTSTATUS heap_allocate_large( struct heap *heap, ULONG flags, SIZE_T block_size,
-                                     SIZE_T size, void **ret )
+                                     SIZE_T size, void **ret, ULONG_PTR caller )
 {
     ARENA_LARGE *arena;
     SIZE_T total_size = ROUND_SIZE( sizeof(*arena) + size, REGION_ALIGN - 1 );
@@ -1014,6 +1088,9 @@ static NTSTATUS heap_allocate_large( struct heap *heap, ULONG flags, SIZE_T bloc
     block = &arena->block;
     arena->data_size = size;
     arena->block_size = (char *)arena + total_size - (char *)block;
+    /* Private padding, not the application's user_value. Preserve the arena
+     * layout and record an allocation site without another allocation/table. */
+    arena->__pad[0] = (madeira_heap_policy & MADEIRA_HEAP_STATS) ? caller : 0;
 
     block_set_type( block, BLOCK_TYPE_LARGE );
     block_set_base( block, arena );
@@ -1022,6 +1099,8 @@ static NTSTATUS heap_allocate_large( struct heap *heap, ULONG flags, SIZE_T bloc
 
     heap_lock( heap, flags );
     list_add_tail( &heap->large_list, &arena->entry );
+    if ((madeira_heap_policy & MADEIRA_HEAP_STATS) && !(heap->madeira_large_ops++ & 0xffff))
+        madeira_heap_snapshot( heap, flags, size, caller );
     heap_unlock( heap, flags );
 
     valgrind_make_noaccess( (char *)block + sizeof(*block) + arena->data_size,
@@ -1040,6 +1119,7 @@ static NTSTATUS heap_free_large( struct heap *heap, ULONG flags, struct block *b
 
     heap_lock( heap, flags );
     list_remove( &arena->entry );
+    if (madeira_heap_policy & MADEIRA_HEAP_STATS) heap->madeira_large_frees++;
     heap_unlock( heap, flags );
 
     return NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
@@ -1133,14 +1213,16 @@ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T blo
     total_size = sizeof(SUBHEAP) + block_size + sizeof(struct entry);
     if (total_size < block_size) return NULL;  /* overflow */
 
+    heap->grow_size = min( heap->grow_size, madeira_heap_grow_limit() );
     if ((subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size )))
     {
-        heap->grow_size = min( heap->grow_size * 2, HEAP_MAX_GROW_SIZE );
+        heap->grow_size = min( heap->grow_size * 2, madeira_heap_grow_limit() );
     }
     else while (!subheap)  /* shrink the grow size again if we are running out of space */
     {
-        if (heap->grow_size <= total_size || heap->grow_size <= 4 * 1024 * 1024) return NULL;
-        heap->grow_size /= 2;
+        SIZE_T retry = madeira_heap_retry_size( heap->grow_size, total_size );
+        if (!retry) return NULL;
+        heap->grow_size = retry;
         subheap = create_subheap( heap, flags, max( heap->grow_size, total_size ), total_size );
     }
 
@@ -1529,6 +1611,7 @@ HANDLE WINAPI RtlCreateHeap( ULONG flags, void *addr, SIZE_T total_size, SIZE_T 
     heap->magic         = HEAP_MAGIC;
     heap->grow_size     = HEAP_INITIAL_GROW_SIZE;
     heap->min_size      = commit_size;
+    heap->madeira_large_ops = heap->madeira_large_frees = 0;
     list_init( &heap->subheap_list );
     list_init( &heap->large_list );
 
@@ -1797,7 +1880,7 @@ static struct group *group_allocate( struct heap *heap, ULONG flags, SIZE_T bloc
     heap_lock( heap, flags );
 
     if (group_block_size >= HEAP_MIN_LARGE_BLOCK_SIZE)
-        status = heap_allocate_large( heap, flags & ~HEAP_ZERO_MEMORY, group_block_size, group_size, (void **)&group );
+        status = heap_allocate_large( heap, flags & ~HEAP_ZERO_MEMORY, group_block_size, group_size, (void **)&group, 0 );
     else
         status = heap_allocate_block( heap, flags & ~HEAP_ZERO_MEMORY, group_block_size, group_size, (void **)&group );
 
@@ -1840,6 +1923,95 @@ static NTSTATUS group_release( struct heap *heap, ULONG flags, struct bin *bin, 
     heap_unlock( heap, flags );
 
     return status;
+}
+
+/* ml1950: bounded pressure recovery. Detaching a group transfers allocation
+ * ownership to us, just like heap_acquire_bin_group. Other threads may finish
+ * freeing its blocks, but cannot allocate from it until we publish it again.
+ * Only the all-free bitmask permits release. Partially occupied groups are
+ * returned to the shared list; live application pointers never move. */
+static unsigned int madeira_heap_reclaim( struct heap *heap, ULONG flags )
+{
+    unsigned int i, j, released = 0;
+    struct group *group;
+    SLIST_ENTRY *entry, *next;
+
+    if (!(madeira_heap_policy & MADEIRA_HEAP_RECLAIM) || !heap->bins) return 0;
+    for (i = 0; i < BLOCK_SIZE_BIN_COUNT; i++)
+    {
+        struct bin *bin = heap->bins + i;
+        /* Flush once, so concurrently returned groups cannot make this walk
+         * unbounded. The detached chain belongs exclusively to this call. */
+        entry = RtlInterlockedFlushSList( &bin->groups );
+        for (j = 0; j < ARRAY_SIZE(affinity_mapping); j++)
+        {
+            group = InterlockedExchangePointer( (void *)bin_get_affinity_group( bin, j ), NULL );
+            if (!group) continue;
+            group->entry.Next = entry;
+            entry = &group->entry;
+        }
+        while (entry)
+        {
+            next = entry->Next;
+            group = CONTAINING_RECORD( entry, struct group, entry );
+            /* Pair with concurrent InterlockedOr frees before releasing the
+             * backing storage, including frees completed after detachment. */
+            if ((ULONG)ReadAcquire( &group->free_bits ) == ~GROUP_FLAG_FREE)
+            {
+                if (!group_release( heap, flags, bin, group )) released++;
+            }
+            else RtlInterlockedPushEntrySList( &bin->groups, entry );
+            entry = next;
+        }
+    }
+    ERR( "[heap-reclaim] ml1950 heap=%p released-groups=%u\n", heap, released );
+    return released;
+}
+
+/* Called under the ordinary heap lock; no stack walking, loader lock,
+ * environment query, allocation or module-name lookup. Addresses are allocation
+ * sites, not a claim that a live allocation is leaked. Zero means an internal
+ * LFH group or a block allocated before attribution was enabled. */
+static void madeira_heap_snapshot( struct heap *heap, ULONG flags, SIZE_T request, ULONG_PTR caller )
+{
+    struct { ULONG_PTR caller; unsigned int n; ULONGLONG bytes; } sites[32] = {{0}};
+    const ARENA_LARGE *arena;
+    const SUBHEAP *subheap;
+    const struct block *block;
+    ULONGLONG large_bytes = 0, sub_bytes = 0, sub_free = 0, other = 0;
+    unsigned int large_n = 0, sub_n = 0, i, j, used = 0;
+
+    if (!(madeira_heap_policy & MADEIRA_HEAP_STATS)) return;
+    LIST_FOR_EACH_ENTRY( subheap, &heap->subheap_list, SUBHEAP, entry )
+    {
+        sub_n++;
+        sub_bytes += subheap_size( subheap );
+        for (block = first_block( subheap ); block; block = next_block( subheap, block ))
+            if (block_get_flags( block ) & BLOCK_FLAG_FREE) sub_free += block_get_size( block );
+    }
+    LIST_FOR_EACH_ENTRY( arena, &heap->large_list, ARENA_LARGE, entry )
+    {
+        ULONGLONG bytes = arena->block_size + offsetof( ARENA_LARGE, block );
+        large_n++;
+        large_bytes += bytes;
+        for (i = 0; i < used && sites[i].caller != arena->__pad[0]; i++) {}
+        if (i == ARRAY_SIZE(sites)) { other += bytes; continue; }
+        if (i == used) { sites[i].caller = arena->__pad[0]; used++; }
+        sites[i].n++;
+        sites[i].bytes += bytes;
+    }
+    ERR( "[heap-live] ml1950 heap=%p request=%#Ix caller=%p large=%u/%lluKiB sub=%u/%lluKiB sub-free=%lluKiB allocs=%Iu frees=%Iu untracked=%lluKiB\n",
+         heap, request, (void *)caller, large_n, large_bytes >> 10, sub_n, sub_bytes >> 10,
+         sub_free >> 10, heap->madeira_large_ops, heap->madeira_large_frees, other >> 10 );
+    for (j = 0; j < 6 && j < used; j++)
+    {
+        unsigned int best = 0;
+        for (i = 1; i < used; i++) if (sites[i].bytes > sites[best].bytes) best = i;
+        if (!sites[best].bytes) break;
+        ERR( "[heap-site] ml1950 heap=%p caller=%p live=%u bytes=%lluKiB\n",
+             heap, (void *)sites[best].caller, sites[best].n, sites[best].bytes >> 10 );
+        sites[best].bytes = 0;
+    }
 }
 
 static inline ULONG heap_current_thread_affinity(void)
@@ -2042,12 +2214,15 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
     void *ptr = NULL;
     ULONG heap_flags;
     NTSTATUS status;
+    BOOL reclaimed = FALSE;
+    ULONG_PTR caller = (ULONG_PTR)__builtin_return_address(0);
 
     heap = unsafe_heap_from_handle( handle, flags, &heap_flags );
+retry:
     if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
         status = STATUS_NO_MEMORY;
     else if (block_size >= HEAP_MIN_LARGE_BLOCK_SIZE)
-        status = heap_allocate_large( heap, heap_flags, block_size, size, &ptr );
+        status = heap_allocate_large( heap, heap_flags, block_size, size, &ptr, caller );
     else if (heap->bins && !heap_allocate_block_lfh( heap, heap_flags, block_size, size, &ptr ))
         status = STATUS_SUCCESS;
     else
@@ -2064,6 +2239,16 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
         }
     }
 
+    if (status == STATUS_NO_MEMORY && heap && !reclaimed)
+    {
+        unsigned int released;
+        reclaimed = TRUE;
+        heap_lock( heap, heap_flags );
+        madeira_heap_snapshot( heap, heap_flags, size, caller );
+        released = madeira_heap_reclaim( heap, heap_flags );
+        heap_unlock( heap, heap_flags );
+        if (released) goto retry;
+    }
     if (!status) valgrind_notify_alloc( ptr, size, flags & HEAP_ZERO_MEMORY );
 
     TRACE( "handle %p, flags %#lx, size %#Ix, return %p, status %#lx.\n", handle, flags, size, ptr, status );
