@@ -68,6 +68,15 @@
 
 static struct list process_list = LIST_INIT(process_list);
 static int running_processes, user_processes;
+
+#ifdef WINE_IOS
+/* Read only on the server thread, after handling process creation/exit. The
+ * session's original client may exit while its descendants still need IPC. */
+int ios_server_user_process_count(void)
+{
+    return user_processes;
+}
+#endif
 static struct event *shutdown_event;           /* signaled when shutdown starts */
 static struct timeout_user *shutdown_timeout;  /* timeout for server shutdown */
 static int shutdown_stage;  /* current stage in the shutdown process */
@@ -1522,6 +1531,33 @@ DECL_HANDLER(init_process_done)
         process->idle_event = create_event( NULL, NULL, 0, 1, 0, NULL );
     if (process->debug_obj) set_process_debug_flag( process, 1 );
     reply->suspend = (current->suspend || process->suspend);
+#ifdef WINE_IOS
+    /* ml1970: the first thread starts through here, not init_thread. A parent
+     * that created the process suspended and resumed it before this point
+     * leaves the ml1330 start-context wait armed, but a thread told not to park
+     * never posts that context: the next suspend+GetThreadContext of the main
+     * thread (a garbage collector's stop-the-world, for instance) then waited
+     * forever. Clear it exactly as init_thread does. */
+    /* ml1980: whatever this reply says. The iOS client (server_ios.c,
+     * server_init_process_done) always overrides suspend to 0 for the first
+     * thread, so it never parks and never posts a start context. ml1970 only
+     * cleared the wait when reply->suspend was 0, and device log 76 showed the
+     * reply was 1 (the parent resumes after startup), so the deadlock stayed. */
+    if (current->ios_start_pending)
+    {
+        static unsigned int n_cleared;
+        current->ios_start_pending = 0;
+        if (++n_cleared <= 8)
+            fprintf( stderr, "[ctx-start] ml1980 tid=%04x first thread runs unparked (reply suspend=%d): start wait cleared\n",
+                     current->id, reply->suspend );
+        /* A reader that got in before this point left a PENDING context that
+         * nothing will ever post: make it refreshable (thread.c). */
+        {
+            extern void ios_start_wait_cleared( struct thread *thread );
+            ios_start_wait_cleared( current );
+        }
+    }
+#endif
 }
 
 /* open a handle to a process */
