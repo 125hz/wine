@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -132,6 +133,8 @@ struct async
     unsigned int         unknown_status :1; /* initial status is not known yet */
     unsigned int         blocking :1;     /* async is blocking */
     unsigned int         is_system :1;    /* background system operation not affecting userspace visible state. */
+    unsigned int         ios_completed :1; /* iOS-Madeira ml1410: final result stored (async_set_result) */
+    unsigned int         ios_trace :1;     /* iOS-Madeira ml1460: log this async's completion chain */
     struct completion   *completion;      /* completion associated with fd */
     apc_param_t          comp_key;        /* completion key associated with fd */
     unsigned int         comp_flags;      /* completion flags */
@@ -238,6 +241,60 @@ static void async_destroy( struct object *obj )
     release_object( async->thread );
 }
 
+/* iOS-Madeira ml1460: ACCEPT COMPLETION CHAIN. Device logs 171 and 181: a
+ * desktop client's listener accepted a second and third local connection from its
+ * browser process (server trace: accepted, delivered), the browser sent its request,
+ * and the client never issued a single read on the new socket, then reported
+ * "Unexpected Transport Error". Between the server finishing the accept and the
+ * program reading, four steps are invisible: the completion APC to the thread that
+ * issued AcceptEx, that thread storing the result, the completion-port post, and a
+ * thread dequeuing it. For accepts on loopback listeners this logs each step (thread
+ * ids, whether the target was in a server wait, statuses, the completion value);
+ * 48 lines per app lifetime. MADEIRA_ACCEPT_CHAIN_TRACE=0 disables. */
+#define IOS_CHAIN_SLOTS 16
+static apc_param_t ios_chain_cvalue[IOS_CHAIN_SLOTS];
+static unsigned int ios_chain_lines;
+
+static int ios_chain_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_ACCEPT_CHAIN_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    return enabled && ios_chain_lines < 48;
+}
+
+void async_set_ios_trace( struct async *async )
+{
+    if (!ios_chain_enabled()) return;
+    async->ios_trace = 1;
+    ios_chain_lines++;
+    fprintf( stderr, "[accept-chain] ml1460 accepted; completion goes to thread %04x (%s, in server wait=%d)\n",
+             async->thread ? async->thread->id : 0,
+             async->thread && async->thread->state == TERMINATED ? "gone" : "alive",
+             async->thread && async->thread->wait ? 1 : 0 );
+}
+
+void ios_chain_note_dequeue( apc_param_t cvalue, const char *how )
+{
+    unsigned int i;
+    if (!cvalue) return;
+    for (i = 0; i < IOS_CHAIN_SLOTS; i++)
+    {
+        if (ios_chain_cvalue[i] != cvalue) continue;
+        ios_chain_cvalue[i] = 0;
+        if (ios_chain_enabled())
+        {
+            ios_chain_lines++;
+            fprintf( stderr, "[accept-chain] ml1460 dequeued %llx by thread %04x (%s)\n",
+                     (unsigned long long)cvalue, current ? current->id : 0, how );
+        }
+        return;
+    }
+}
+
 /* notifies client thread of new status of its async request */
 void async_terminate( struct async *async, unsigned int status )
 {
@@ -280,7 +337,21 @@ void async_terminate( struct async *async, unsigned int status )
         else
             data.async_io.status = status;
 
-        thread_queue_apc( async->thread->process, async->thread, &async->obj, &data );
+        {
+            int queued = thread_queue_apc( async->thread->process, async->thread, &async->obj, &data );
+            if (async->ios_trace && ios_chain_enabled())
+            {
+                ios_chain_lines++;
+                fprintf( stderr, "[accept-chain] ml1460 completion APC status=%08x to thread %04x queued=%d "
+                         "(in server wait=%d)\n", data.async_io.status, async->thread->id, queued,
+                         async->thread->wait ? 1 : 0 );
+            }
+        }
+    }
+    else if (async->ios_trace && ios_chain_enabled())
+    {
+        ios_chain_lines++;
+        fprintf( stderr, "[accept-chain] ml1460 direct result status=%08x (no APC)\n", status );
     }
 
     async_reselect( async );
@@ -412,6 +483,8 @@ struct async *create_async( struct fd *fd, struct thread *thread, const struct a
     async->alerted       = 0;
     async->terminated    = 0;
     async->canceled      = 0;
+    async->ios_completed = 0;
+    async->ios_trace     = 0;
     async->unknown_status = 0;
     async->blocking      = !is_fd_overlapped( fd );
     async->is_system     = 0;
@@ -657,6 +730,7 @@ void async_set_result( struct object *obj, unsigned int status, apc_param_t tota
         if (async->timeout) remove_timeout_user( async->timeout );
         async->timeout = NULL;
         async->terminated = 1;
+        async->ios_completed = 1;
         if (async->iosb) async->iosb->status = status;
 
         /* don't signal completion if the async failed synchronously
@@ -684,6 +758,23 @@ void async_set_result( struct object *obj, unsigned int status, apc_param_t tota
 
             if (async->event) set_event( async->event );
             else if (async->fd && !async->is_system) set_fd_signaled( async->fd, 1 );
+        }
+        if (async->ios_trace && ios_chain_enabled())
+        {
+            /* ml1460: a posted completion is followed to its dequeue by its value */
+            int posted = !async->data.apc && async->data.apc_context && async->completion &&
+                         (async->pending || !(async->comp_flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) &&
+                         (async->pending || !NT_ERROR( status ));
+            ios_chain_lines++;
+            fprintf( stderr, "[accept-chain] ml1460 result status=%08x pending=%d port=%d posted=%d value=%llx "
+                     "user-apc=%d event=%d\n", status, async->pending, async->completion ? 1 : 0, posted,
+                     (unsigned long long)async->data.apc_context, async->data.apc ? 1 : 0, async->event ? 1 : 0 );
+            if (posted)
+            {
+                unsigned int i;
+                for (i = 0; i < IOS_CHAIN_SLOTS; i++)
+                    if (!ios_chain_cvalue[i]) { ios_chain_cvalue[i] = async->data.apc_context; break; }
+            }
         }
 
         if (!async->signaled)
@@ -743,12 +834,44 @@ static struct async *find_async_from_user( struct process *process, client_ptr_t
     return NULL;
 }
 
+/* iOS-Madeira ml1410: keep each async alive across its own cancellation.
+ *
+ * cancel_async() -> async_terminate() queues the completion APC to the
+ * async's thread. When it cannot be queued (that thread is gone and no other
+ * thread of the process takes it), the APC is discarded, which completes the
+ * async immediately (async_set_result()), removes it from its queue and can
+ * drop its last reference. The async is then freed inside cancel_async(), and
+ * the list_remove() below writes through freed memory. Device log 170: shortly
+ * after a thread of a desktop client's browser helper left through
+ * read_request EOF -> kill_thread (which, unlike terminate_thread, does not
+ * cancel that thread's asyncs), the server thread faulted in
+ * req_cancel_async+0x158 (this list_remove, NULL link) and every process
+ * stopped. That the async was freed there is inferred from the fault site.
+ *
+ * Holding a reference keeps it valid until it is back on the process list.
+ * An async that completed during its cancellation has nothing left to wait
+ * for, so no cancel object is attached (async_destroy() asserts there is none).
+ * Completion is tracked explicitly: a pending non-blocking async is already
+ * signaled, so the signaled bit cannot tell whether the result was stored.
+ * MADEIRA_ASYNC_CANCEL_HOLD=0 restores the previous loop. */
+static int ios_async_cancel_hold(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_ASYNC_CANCEL_HOLD" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    return enabled;
+}
+
 static int cancel_process_async( struct process *process, struct object *obj, struct thread *thread, client_ptr_t iosb, obj_handle_t *wait_handle )
 {
     struct async_cancel *cancel = NULL;
     struct async *async, *next_async;
     struct list tracked;
     int count = 0;
+    int hold = ios_async_cancel_hold();
 
     if (thread && !(cancel = create_async_cancel( process ))) return 0;
 
@@ -766,8 +889,20 @@ restart:
             (!thread || async->thread == thread) &&
             (!iosb || async->data.iosb == iosb))
         {
+            if (hold) grab_object( async );
             if (!async->canceled) cancel_async( async );
-            if (cancel)
+            if (hold && async->ios_completed)
+            {
+                static unsigned int reported;
+                if (reported < 8)
+                {
+                    reported++;
+                    fprintf( stderr, "[async-cancel] ml1410 async completed during cancel (owner thread %04x %s); held, no wait\n",
+                             async->thread ? async->thread->id : 0,
+                             async->thread && async->thread->state == TERMINATED ? "gone" : "alive" );
+                }
+            }
+            else if (cancel)
             {
                 assert( !async->async_cancel );
                 async->async_cancel = cancel;
@@ -784,6 +919,7 @@ restart:
     {
         list_remove( &async->process_entry );
         list_add_tail( &process->asyncs, &async->process_entry );
+        if (hold) release_object( async );
     }
     if (cancel)
     {

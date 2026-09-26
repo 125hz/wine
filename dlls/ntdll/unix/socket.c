@@ -95,6 +95,77 @@ WINE_DEFAULT_DEBUG_CHANNEL(winsock);
 
 #define u64_to_user_ptr(u) ((void *)(uintptr_t)(u))
 
+#ifdef WINE_IOS
+/* iOS-Madeira — WOW64_DESIGN.md §2/§3.
+ *
+ * Every pointer a 32-bit program puts inside an AFD request (the WSABUF array
+ * of a send/recv, the sockaddr, the control block, the flags word, the
+ * TransmitFile head/tail buffers) is a GUEST address; the unix side always
+ * dereferences HOST addresses.  On classic WoW64 the two are the same number,
+ * so upstream simply truncates the 64-bit field — which here yields a bare
+ * 32-bit value with the guest window base missing.
+ *
+ * DEVICE EVIDENCE: a 32-bit program's first winsock send faulted in
+ * sock_ioctl_send reading the WSABUF array at 0xe8fa9c, the untranslated
+ * guest address of a buffer that actually lives at B + 0xe8fa9c:
+ *   [mach_exc] UNHANDLED pc=...`sock_ioctl_send+0xe8 addr=0xe8fa9c
+ *              bt: sock_ioctl -> NtDeviceIoControlFile -> __wine_syscall_dispatcher
+ * The program's startup network call failed and it put up an error dialog.
+ *
+ * ios_wow_base() is the exact PER-PROCESS predicate: nonzero if and only if
+ * the calling thread's pseudo-process owns a guest window, i.e. is 32-bit.
+ * in_wow64_call() cannot be used for this here — it reads is_wow64(), which
+ * in this fork is SESSION-wide, so it stays true for a 64-bit pseudo-process
+ * that merely shares the session with a 32-bit one.  NULL stays NULL (§3.3).
+ */
+extern ULONG_PTR ios_wow_base(void);
+#define afd_is_wow64_caller()   (ios_wow_base() != 0)
+static inline void *afd_guest_ptr( ULONG64 addr )
+{
+    ULONG_PTR base;
+
+    if (!addr) return NULL;
+    if (!(base = ios_wow_base())) return (void *)(uintptr_t)addr;
+    return (void *)(base + (ULONG_PTR)(ULONG)addr);
+}
+
+/* iOS-Madeira ml1350: IOCTL_AFD_GET_EVENTS carries the event to reset as a
+ * HANDLE in the InputBuffer argument (Windows' convention; ws2_32's
+ * WSAEnumNetworkEvents passes it that way, with an input size of 0).  The
+ * WoW64 thunk converts every buffer argument as a guest address, so a 32-bit
+ * caller's handle arrives as B + handle.  wine_server_obj_handle() turns that
+ * 64-bit value into 0xfffffff0, the server answers STATUS_INVALID_HANDLE, and
+ * winsock reports WSAENOTSOCK for a valid socket whenever the caller passes
+ * an event.  Undo the window offset for that one argument.
+ * MADEIRA_AFD_EVENT_HANDLE=0 keeps the converted value. */
+static HANDLE afd_event_handle_arg( void *in_buffer )
+{
+    static int enabled = -1;
+    static unsigned int reported;
+    ULONG_PTR base = ios_wow_base(), value = (ULONG_PTR)in_buffer;
+    int mode = __atomic_load_n( &enabled, __ATOMIC_RELAXED );
+    HANDLE ret = in_buffer;
+
+    if (mode < 0)
+    {
+        const char *env = getenv( "MADEIRA_AFD_EVENT_HANDLE" );
+        mode = !env || strcmp( env, "0" );
+        __atomic_store_n( &enabled, mode, __ATOMIC_RELAXED );
+    }
+    if (!base || !value) return ret;
+    if (mode && value > base && value - base <= 0xffffffffu)
+        ret = LongToHandle( (LONG)(ULONG)(value - base) );
+    if (__atomic_load_n( &reported, __ATOMIC_RELAXED ) < 8 &&
+        __atomic_fetch_add( &reported, 1, __ATOMIC_RELAXED ) < 8)
+        dprintf( 2, "[afd-event-handle] ml1350 raw=%#lx handle=%#lx enabled=%d\n",
+                 (unsigned long)value, (unsigned long)(ULONG_PTR)ret, mode );
+    return ret;
+}
+#else
+#define afd_is_wow64_caller()   in_wow64_call()
+static inline void *afd_guest_ptr( ULONG64 addr ) { return u64_to_user_ptr( addr ); }
+#endif
+
 union unix_sockaddr
 {
     struct sockaddr addr;
@@ -529,7 +600,7 @@ static size_t cmsg_align_32( size_t len )
  * true for all messages */
 static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_32 *control32 )
 {
-    char *const buf32 = ULongToPtr(control32->buf);
+    char *const buf32 = afd_guest_ptr(control32->buf);
     const ULONG max_len = control32->len;
     const char *ptr64 = control64->buf;
     char *ptr32 = buf32;
@@ -1213,10 +1284,133 @@ done:
 #endif
 }
 
+/* iOS-Madeira ml1370: LOOPBACK TRANSPORT METADATA. ml591's timeline skips
+ * loopback on purpose, so nothing recorded whether a local WebSocket upgrade
+ * request and its reply ever crossed. Device logs 163 and 166: both local
+ * transport connections were accepted by the listening process, and the
+ * browser gave up on them 11 s later without showing a window. The first
+ * six successful sends/receives (and any hard error) per loopback connection
+ * are logged as direction, byte count and ports only, never contents, with an
+ * app-lifetime cap. MADEIRA_LOOPBACK_IO_TRACE=0 disables.
+ * ml1410: also the first receive per connection that would block, logged as
+ * "recv-would-block" (device log 171: one connection's receiving side never
+ * logged a read; the server-side [loopback-wait] trace records its requests). */
+static void ios_loopback_io( int fd, int is_send, long ret_bytes, int err )
+{
+    enum { SLOTS = 32, PER_CONN = 6, TOTAL = 120, CHECKS = 100000 };
+    static struct { int fd; unsigned short lport, pport; unsigned int n, wb; } tab[SLOTS];
+    static unsigned int total, next_slot, checks;
+    static int enabled = -1;
+    struct sockaddr_storage la, pa;
+    socklen_t ll = sizeof(la), pl = sizeof(pa);
+    unsigned short lport, pport;
+    unsigned int i;
+    int loop;
+
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_LOOPBACK_IO_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (!enabled || fd < 0 || __atomic_load_n( &total, __ATOMIC_RELAXED ) >= TOTAL) return;
+    if (err == EINTR || ((err == EAGAIN || err == EWOULDBLOCK) && is_send)) return;
+    /* two socket queries per call: stop looking after a bounded number of calls
+     * so ordinary network traffic does not pay for this for the whole session */
+    if (__atomic_fetch_add( &checks, 1, __ATOMIC_RELAXED ) >= CHECKS) return;
+    if (getpeername( fd, (struct sockaddr *)&pa, &pl ) || getsockname( fd, (struct sockaddr *)&la, &ll )) return;
+    if (pa.ss_family == AF_INET)
+    {
+        loop = (ntohl( ((struct sockaddr_in *)&pa)->sin_addr.s_addr ) >> 24) == 127;
+        pport = ntohs( ((struct sockaddr_in *)&pa)->sin_port );
+        lport = ntohs( ((struct sockaddr_in *)&la)->sin_port );
+    }
+    else if (pa.ss_family == AF_INET6)
+    {
+        loop = IN6_IS_ADDR_LOOPBACK( &((struct sockaddr_in6 *)&pa)->sin6_addr );
+        pport = ntohs( ((struct sockaddr_in6 *)&pa)->sin6_port );
+        lport = ntohs( ((struct sockaddr_in6 *)&la)->sin6_port );
+    }
+    else return;
+    if (!loop) return;
+    for (i = 0; i < SLOTS; i++)
+        if (tab[i].fd == fd + 1 && tab[i].lport == lport && tab[i].pport == pport) break;
+    if (i == SLOTS)
+    {
+        i = __atomic_fetch_add( &next_slot, 1, __ATOMIC_RELAXED ) % SLOTS;
+        tab[i].fd = fd + 1; tab[i].lport = lport; tab[i].pport = pport; tab[i].n = 0; tab[i].wb = 0;
+    }
+    if (err == EAGAIN || err == EWOULDBLOCK)
+    {
+        if (tab[i].wb++) return;
+        if (__atomic_fetch_add( &total, 1, __ATOMIC_RELAXED ) >= TOTAL) return;
+        dprintf( 2, "[loopback-io] ml1410 fd=%d local=%u peer=%u recv-would-block\n", fd, lport, pport );
+        return;
+    }
+    if (tab[i].n++ >= PER_CONN && !err) return;
+    if (__atomic_fetch_add( &total, 1, __ATOMIC_RELAXED ) >= TOTAL) return;
+    dprintf( 2, "[loopback-io] ml1370 fd=%d local=%u peer=%u %s bytes=%ld errno=%d\n",
+             fd, lport, pport, is_send ? "send" : "recv", err ? -1L : ret_bytes, err );
+}
+
+/* iOS-Madeira ml1450: HOW A REMOTE TCP CONNECTION ENDED. Device log 179: a
+ * desktop client's server connection (a WebSocket) carried normal
+ * traffic, then the client reported ConnectionDisconnected('I/O Operation
+ * Failed') and its own HTTP connectivity test failed in the same second, and
+ * nothing in the log said whether the peer closed the connection, a receive or
+ * send failed, or the program gave up on it. For stream sockets with a
+ * non-loopback peer this logs a receive that returns 0 (the peer closed) and
+ * any send/receive error other than would-block, with ports and errno only,
+ * never contents; 48 lines per app lifetime. The zero-length case is only
+ * checked on the success path, which is not the per-byte hot path.
+ * MADEIRA_TCP_END_TRACE=0 disables. */
+static void ios_tcp_end_trace( int fd, int is_send, long ret_bytes, int err )
+{
+    static int enabled = -1;
+    static unsigned int total;
+    struct sockaddr_storage la, pa;
+    socklen_t ll = sizeof(la), pl = sizeof(pa);
+    unsigned short lport, pport;
+    int type = 0;
+    socklen_t tl = sizeof(type);
+
+    if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) return;
+    if (!err && (is_send || ret_bytes != 0)) return;
+    if (enabled < 0)
+    {
+        const char *env = getenv( "MADEIRA_TCP_END_TRACE" );
+        enabled = !env || strcmp( env, "0" );
+    }
+    if (!enabled || fd < 0 || __atomic_load_n( &total, __ATOMIC_RELAXED ) >= 48) return;
+    if (getsockopt( fd, SOL_SOCKET, SO_TYPE, &type, &tl ) || type != SOCK_STREAM) return;
+    /* The LOCAL address decides loopback: after a reset the peer is often gone
+     * (getpeername fails with ENOTCONN), and that is the case worth logging. */
+    if (getsockname( fd, (struct sockaddr *)&la, &ll )) return;
+    if (la.ss_family == AF_INET)
+    {
+        if ((ntohl( ((struct sockaddr_in *)&la)->sin_addr.s_addr ) >> 24) == 127) return;
+        lport = ntohs( ((struct sockaddr_in *)&la)->sin_port );
+    }
+    else if (la.ss_family == AF_INET6)
+    {
+        if (IN6_IS_ADDR_LOOPBACK( &((struct sockaddr_in6 *)&la)->sin6_addr )) return;
+        lport = ntohs( ((struct sockaddr_in6 *)&la)->sin6_port );
+    }
+    else return;
+    pport = 0;
+    if (!getpeername( fd, (struct sockaddr *)&pa, &pl ))
+        pport = pa.ss_family == AF_INET6 ? ntohs( ((struct sockaddr_in6 *)&pa)->sin6_port )
+                                          : ntohs( ((struct sockaddr_in *)&pa)->sin_port );
+    if (__atomic_fetch_add( &total, 1, __ATOMIC_RELAXED ) >= 48) return;
+    dprintf( 2, "[tcp-end] ml1450 fd=%d local=%u peer-port=%u %s errno=%d\n", fd, lport, pport,
+             err ? (is_send ? "send-error" : "recv-error") : "peer-closed", err );
+}
+
 #else
+#define ios_tcp_end_trace( fd, is_send, ret_bytes, err ) do { } while (0)
 #define ios_sock_big_note( fd, is_send, ret_bytes, err ) do { } while (0)
 #define ios_sock_wire( fd, is_send, buf, ret_bytes, err ) do { } while (0)
 #define ios_sock_tl( fd, is_send, buf, ret_bytes, err ) do { } while (0)
+#define ios_loopback_io( fd, is_send, ret_bytes, err ) do { } while (0)
 #endif
 
 static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *size )
@@ -1248,14 +1442,24 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
             errno = EWOULDBLOCK;
 
         if (errno != EWOULDBLOCK) WARN( "recvmsg: %s\n", strerror( errno ) );
-        ios_sock_big_note( fd, 0, 0, errno );
-        ios_sock_wire( fd, 0, NULL, 0, errno );
-        ios_sock_tl( fd, 0, NULL, 0, errno );
-        return sock_errno_to_status( errno );
+        {
+            /* ml1450: the probes below query the socket (getpeername and the
+             * like), which sets errno when it fails, as it does on a reset
+             * connection; the program must see the receive's own error. */
+            const int recv_err = errno;
+            ios_sock_big_note( fd, 0, 0, recv_err );
+            ios_sock_wire( fd, 0, NULL, 0, recv_err );
+            ios_sock_tl( fd, 0, NULL, 0, recv_err );
+            ios_loopback_io( fd, 0, 0, recv_err );
+            ios_tcp_end_trace( fd, 0, 0, recv_err );
+            return sock_errno_to_status( recv_err );
+        }
     }
     ios_sock_big_note( fd, 0, ret, 0 );
     ios_sock_wire( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
     ios_sock_tl( fd, 0, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+    ios_loopback_io( fd, 0, ret, 0 );
+    ios_tcp_end_trace( fd, 0, ret, 0 );
 
     status = (hdr.msg_flags & MSG_TRUNC) ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
     if (async->icmp_over_dgram)
@@ -1266,7 +1470,7 @@ static NTSTATUS try_recv( int fd, struct async_recv_ioctl *async, ULONG_PTR *siz
         if (async->icmp_over_dgram)
             FIXME( "May return extra control headers.\n" );
 
-        if (in_wow64_call())
+        if (afd_is_wow64_caller())
         {
             char control_buffer64[512];
             WSABUF wsabuf;
@@ -1425,13 +1629,13 @@ static NTSTATUS sock_ioctl_recv( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
         return STATUS_NO_MEMORY;
 
     async->count = count;
-    if (in_wow64_call())
+    if (afd_is_wow64_caller())
     {
         const struct afd_wsabuf_32 *buffers = buffers_ptr;
 
         for (i = 0; i < count; ++i)
         {
-            async->iov[i].iov_base = ULongToPtr( buffers[i].buf );
+            async->iov[i].iov_base = afd_guest_ptr( buffers[i].buf );
             async->iov[i].iov_len = buffers[i].len;
         }
     }
@@ -1551,10 +1755,15 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
                 continue;
             }
 
-            ios_sock_big_note( fd, 1, 0, errno );
-            ios_sock_wire( fd, 1, NULL, 0, errno );
-            ios_sock_tl( fd, 1, NULL, 0, errno );
-            return sock_errno_to_status( errno );
+            {
+                const int send_err = errno; /* ml1450: see try_recv */
+                ios_sock_big_note( fd, 1, 0, send_err );
+                ios_sock_wire( fd, 1, NULL, 0, send_err );
+                ios_sock_tl( fd, 1, NULL, 0, send_err );
+                ios_loopback_io( fd, 1, 0, send_err );
+                ios_tcp_end_trace( fd, 1, 0, send_err );
+                return sock_errno_to_status( send_err );
+            }
         }
     }
 
@@ -1562,6 +1771,7 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
     ios_sock_big_note( fd, 1, ret, 0 );
     ios_sock_wire( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
     ios_sock_tl( fd, 1, (async->count && async->iov) ? async->iov[0].iov_base : NULL, ret, 0 );
+    ios_loopback_io( fd, 1, ret, 0 );
 
     while (async->iov_cursor < async->count && ret >= async->iov[async->iov_cursor].iov_len)
         ret -= async->iov[async->iov_cursor++].iov_len;
@@ -1747,13 +1957,13 @@ static NTSTATUS sock_ioctl_send( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
         return STATUS_NO_MEMORY;
 
     async->count = count;
-    if (in_wow64_call())
+    if (afd_is_wow64_caller())
     {
         const struct afd_wsabuf_32 *buffers = buffers_ptr;
 
         for (i = 0; i < count; ++i)
         {
-            async->iov[i].iov_base = ULongToPtr( buffers[i].buf );
+            async->iov[i].iov_base = afd_guest_ptr( buffers[i].buf );
             async->iov[i].iov_len = buffers[i].len;
         }
     }
@@ -1970,9 +2180,9 @@ static NTSTATUS sock_transmit( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc,
     async->tail_cursor = 0;
     async->file_len = params->file_len;
     async->flags = params->flags;
-    async->head = u64_to_user_ptr(params->head_ptr);
+    async->head = afd_guest_ptr(params->head_ptr);
     async->head_len = params->head_len;
-    async->tail = u64_to_user_ptr(params->tail_ptr);
+    async->tail = afd_guest_ptr(params->tail_ptr);
     async->tail_len = params->tail_len;
     async->offset = params->offset;
 
@@ -2126,7 +2336,11 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
         case IOCTL_AFD_GET_EVENTS:
         {
             struct afd_get_events_params *params = out_buffer;
+#ifdef WINE_IOS
+            HANDLE reset_event = afd_event_handle_arg( in_buffer ); /* sic */
+#else
             HANDLE reset_event = in_buffer; /* sic */
+#endif
 
             TRACE( "reset_event %p\n", reset_event );
             if (in_size) FIXME( "unexpected input size %u\n", in_size );
@@ -2169,7 +2383,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
             if (out_size) FIXME( "unexpected output size %u\n", out_size );
 
-            if (in_wow64_call())
+            if (afd_is_wow64_caller())
             {
                 const struct afd_recv_params_32 *params32 = in_buffer;
 
@@ -2181,7 +2395,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
 
                 params.recv_flags = params32->recv_flags;
                 params.msg_flags = params32->msg_flags;
-                params.buffers = ULongToPtr( params32->buffers );
+                params.buffers = afd_guest_ptr( params32->buffers );
                 params.count = params32->count;
             }
             else
@@ -2222,7 +2436,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
         case IOCTL_AFD_WINE_RECVMSG:
         {
             struct afd_recvmsg_params *params = in_buffer;
-            unsigned int *ws_flags = u64_to_user_ptr(params->ws_flags_ptr);
+            unsigned int *ws_flags = afd_guest_ptr(params->ws_flags_ptr);
             int unix_flags = 0;
 
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
@@ -2240,9 +2454,9 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
                 unix_flags |= MSG_PEEK;
             if (*ws_flags & WS_MSG_WAITALL)
                 FIXME( "MSG_WAITALL is not supported\n" );
-            status = sock_ioctl_recv( handle, event, apc, apc_user, io, fd, u64_to_user_ptr(params->buffers_ptr),
-                                      params->count, u64_to_user_ptr(params->control_ptr),
-                                      u64_to_user_ptr(params->addr_ptr), u64_to_user_ptr(params->addr_len_ptr),
+            status = sock_ioctl_recv( handle, event, apc, apc_user, io, fd, afd_guest_ptr(params->buffers_ptr),
+                                      params->count, afd_guest_ptr(params->control_ptr),
+                                      afd_guest_ptr(params->addr_ptr), afd_guest_ptr(params->addr_len_ptr),
                                       ws_flags, unix_flags, params->force_async );
             if (needs_close) close( fd );
             return status;
@@ -2268,8 +2482,8 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
                 WARN( "ignoring MSG_PARTIAL\n" );
             if (params->ws_flags & ~(WS_MSG_OOB | WS_MSG_PARTIAL))
                 FIXME( "unknown flags %#x\n", params->ws_flags );
-            status = sock_ioctl_send( handle, event, apc, apc_user, io, fd, u64_to_user_ptr( params->buffers_ptr ),
-                                      params->count, u64_to_user_ptr( params->addr_ptr ), params->addr_len,
+            status = sock_ioctl_send( handle, event, apc, apc_user, io, fd, afd_guest_ptr( params->buffers_ptr ),
+                                      params->count, afd_guest_ptr( params->addr_ptr ), params->addr_len,
                                       unix_flags, params->force_async );
             if (needs_close) close( fd );
             return status;
