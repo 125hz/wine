@@ -1791,6 +1791,45 @@ static struct thread *ios_apc_requeue_target( struct thread *thread, const struc
                  target == thread ? "kept on" : "waiting thread", target->id );
     return target;
 }
+
+/* ml2015: A PROCESS-WIDE SYSTEM APC FAILED WHENEVER EVERY THREAD OF THE TARGET WAS BUSY.
+ *
+ * Another process's handle work (DuplicateHandle with DUPLICATE_CLOSE_SOURCE, remote virtual
+ * memory calls, CreateRemoteThread) runs as a system APC in the target process. Upstream queues
+ * it on a thread waiting in the server, else interrupts one with SIGUSR1. On iOS the signal can
+ * never be sent (see ml1480 above), so a target whose threads were all running failed at once
+ * with STATUS_PROCESS_IS_TERMINATING -- ERROR_ACCESS_DENIED to the caller. Device log 108: an
+ * MSI package's custom-action server had just written its thread handle and was on its way back
+ * to its pipe read when the client duplicated that handle, so the action "returned" 5 and the
+ * install ended with 1603.
+ *
+ * Instead queue it on the process's first live thread; that thread runs system APCs on its next
+ * server wait, which is where upstream's signal would have sent it too, only later. The caller
+ * already waits for the APC's completion. MADEIRA_PROCESS_APC_QUEUE=0 restores the failure. */
+static struct thread *ios_process_apc_fallback( struct process *process, const struct thread_apc *apc )
+{
+    static int enabled = -1;
+    static unsigned int count;
+    struct thread *candidate;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_PROCESS_APC_QUEUE" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled) return NULL;
+    LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
+    {
+        if (candidate->state == TERMINATED) continue;
+        count++;
+        if (count <= 16 || !(count & 1023))
+            fprintf( stderr, "[process-apc] ml2015 #%u type=%u pid %04x has no waiting thread -> queued on %04x "
+                     "(MADEIRA_PROCESS_APC_QUEUE=0 fails it)\n",
+                     count, apc->call.type, process->id, candidate->id );
+        return candidate;
+    }
+    return NULL;
+}
 #endif
 
 /* queue an existing APC to a given thread */
@@ -1827,6 +1866,9 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
                 }
             }
         }
+#ifdef WINE_IOS
+        if (!thread) thread = ios_process_apc_fallback( process, apc );
+#endif
         if (!thread) return 0;  /* nothing found */
         if (!(queue = get_apc_queue( thread, apc->call.type ))) return 1;
     }
