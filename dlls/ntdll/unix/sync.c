@@ -588,10 +588,27 @@ enum madeira_fast_result
  * program that died on the ml952 snapshot on the path it survives.
  * MADEIRA_FASTSYNC=0 forces everything off, cells included.
  */
+/* ml2013: exactly one in-process sync engine per session.  When the server
+ * handed this process madsync's device (madeira.cfg inproc-sync = 1),
+ * inproc_wait() already answers every wait it can, and the fastsync client
+ * paths would only compete with it for the rest.  Settings writes
+ * env.MADEIRA_FASTSYNC = 0 with Madsync; this also covers a hand-edited
+ * madeira.cfg that turns madsync on and leaves fastsync at its default.  The
+ * client then takes no shortcut at all, i.e. every non-madsync operation goes
+ * to the server, which stays authoritative for any cell it keeps.
+ * MADEIRA_SYNC_EXCLUSIVE=0 keeps both as configured. */
+static int madeira_sync_engine_mode( int mode, int inproc_on, const char *exclusive )
+{
+    if (!inproc_on || mode == MADEIRA_FS_MODE_OFF) return mode;
+    if (exclusive && (!strcmp( exclusive, "0" ) || !strcmp( exclusive, "off" ) || !strcmp( exclusive, "no" )))
+        return mode;
+    return MADEIRA_FS_MODE_OFF;
+}
+
 static void madeira_fast_parse_env(void)
 {
     const char *e = getenv( "MADEIRA_FASTSYNC" );
-    int mode = MADEIRA_FS_MODE_AUTO, peek, sem;
+    int mode = MADEIRA_FS_MODE_AUTO, peek, sem, asked;
 
     if (e)
     {
@@ -604,6 +621,8 @@ static void madeira_fast_parse_env(void)
         else if (!strcmp( e, "cells" ))
             mode = MADEIRA_FS_MODE_CELLS;   /* ml990: the old default, still reachable */
     }
+    asked = mode;
+    mode = madeira_sync_engine_mode( mode, inproc_device_fd >= 0, getenv( "MADEIRA_SYNC_EXCLUSIVE" ) );
 
     /* the peek needs a cell to read, so "off" turns it off whatever it says */
     e = getenv( "MADEIRA_FS_POLLPEEK" );
@@ -647,6 +666,13 @@ static void madeira_fast_parse_env(void)
     __atomic_store_n( &madeira_fast_on, mode == MADEIRA_FS_MODE_ON ? 1 : 0, __ATOMIC_RELAXED );
     __atomic_store_n( &madeira_fast_mode, mode, __ATOMIC_RELAXED );
     if (__atomic_exchange_n( &madeira_fast_ready, 1, __ATOMIC_RELEASE )) return;   /* announce once */
+
+    ERR( "[sync-engine] ml2013 client engine=%s madsync=%s fastsync=%s%s (madeira.cfg inproc-sync /"
+         " env.MADEIRA_FASTSYNC select; MADEIRA_SYNC_EXCLUSIVE=0 keeps both)\n",
+         inproc_device_fd >= 0 ? (mode > MADEIRA_FS_MODE_OFF ? "both" : "madsync")
+                               : (mode > MADEIRA_FS_MODE_OFF ? "fastsync" : "off"),
+         inproc_device_fd >= 0 ? "on" : "off", mode > MADEIRA_FS_MODE_OFF ? "on" : "off",
+         asked != mode ? " (fastsync turned off: madsync owns in-process sync)" : "" );
 
     ERR( "[fastsync] rev=ml1060 mode=%s peek=%s sem=%s cells=%u cache=%u spin=%u cap=%uus auto=%u/10s"
          " gen-packed watch=alertable+plain - MADEIRA_FASTSYNC=0|cells|auto|1 selects"
