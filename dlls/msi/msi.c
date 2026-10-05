@@ -1897,6 +1897,33 @@ UINT WINAPI MsiEnableLogA( DWORD dwLogMode, const char *szLogFile, DWORD attribu
     return r;
 }
 
+/* iOS-Madeira: a bootstrapper can hold the log file open for reading while it runs
+ * the package. Opening it with write sharing only then fails with a sharing violation
+ * and the package writes no log at all. Retry exactly that failure with read sharing
+ * added; every other open is unchanged. MADEIRA_MSI_LOG_SHARE_READ=0: no retry, as
+ * before. */
+HANDLE msi_open_log_file( const WCHAR *path, DWORD disposition )
+{
+    static LONG noted;
+    WCHAR value[2];
+    HANDLE file = CreateFileW( path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, disposition,
+                               FILE_ATTRIBUTE_NORMAL, NULL );
+
+    if (file != INVALID_HANDLE_VALUE || GetLastError() != ERROR_SHARING_VIOLATION) return file;
+    if (GetEnvironmentVariableW( L"MADEIRA_MSI_LOG_SHARE_READ", value, ARRAY_SIZE(value) ) == 1 &&
+        value[0] == '0')
+    {
+        SetLastError( ERROR_SHARING_VIOLATION );
+        return file;
+    }
+    file = CreateFileW( path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, disposition,
+                        FILE_ATTRIBUTE_NORMAL, NULL );
+    if (file != INVALID_HANDLE_VALUE && InterlockedIncrement( &noted ) <= 4)
+        ERR( "[msi-log] the log file is open for reading elsewhere: opened with read sharing "
+             "(MADEIRA_MSI_LOG_SHARE_READ=0 reverts)\n" );
+    return file;
+}
+
 UINT WINAPI MsiEnableLogW( DWORD dwLogMode, const WCHAR *szLogFile, DWORD attributes )
 {
     TRACE( "%#lx, %s, %#lx\n", dwLogMode, debugstr_w(szLogFile), attributes );
@@ -1909,8 +1936,7 @@ UINT WINAPI MsiEnableLogW( DWORD dwLogMode, const WCHAR *szLogFile, DWORD attrib
 
         if (!(attributes & INSTALLLOGATTRIBUTES_APPEND))
             DeleteFileW(szLogFile);
-        file = CreateFileW(szLogFile, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
+        file = msi_open_log_file( szLogFile, OPEN_ALWAYS );
         if (file != INVALID_HANDLE_VALUE)
         {
             gszLogFile = wcsdup(szLogFile);

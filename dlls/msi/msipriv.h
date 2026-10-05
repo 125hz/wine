@@ -1010,6 +1010,7 @@ extern LPVOID gUIContext;
 extern LPVOID gUIContextRecord;
 extern WCHAR *gszLogFile;
 extern HINSTANCE msi_hInstance;
+extern HANDLE msi_open_log_file( const WCHAR *path, DWORD disposition );
 
 /* action related functions */
 extern UINT ACTION_PerformAction(MSIPACKAGE *package, const WCHAR *action);
