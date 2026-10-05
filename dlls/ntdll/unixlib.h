@@ -134,6 +134,17 @@ struct ios_get_fex_arena_params
     ULONG64 end;    /* OUT: exclusive */
 };
 
+/* A MADEIRA_* switch read from the app's own environment (env.NAME in
+ * madeira.cfg). The Windows environment of a process cannot be trusted for
+ * this: the service manager starts every service with a fresh
+ * CreateEnvironmentBlock block that never carries the host's variables. No
+ * pointers, so the layout is the same for every caller. */
+struct ios_host_switch_params
+{
+    char name[56];  /* IN:  NUL-terminated, must start with MADEIRA_ */
+    char value[8];  /* OUT: NUL-terminated (truncated) value, empty when unset */
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -151,6 +162,7 @@ enum ntdll_unix_funcs
     unix_ios_jit_alias_probe,   /* ml631 — APPEND ONLY (see note above) */
     unix_ios_mono_bridge_ptr,   /* ml648 — APPEND ONLY: inserting renumbers every later ordinal */
     unix_ios_get_fex_arena,     /* ml800 — APPEND ONLY */
+    unix_ios_host_switch,       /* APPEND ONLY */
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;
