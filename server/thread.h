@@ -128,6 +128,9 @@ struct thread
      * applies a SetThreadContext only while both are unchanged. */
     unsigned long long     ios_ctx_frame;
     unsigned int           ios_ctx_seq;
+    /* Async I/O APCs parked in this thread's system queue (thread.c, ios_apc_park):
+     * nonzero means the thread is busy and holds undelivered completions. */
+    unsigned int           ios_parked_count;
 #endif
 };
 
