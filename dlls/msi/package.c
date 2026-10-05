@@ -1511,8 +1511,7 @@ UINT MSI_OpenPackageW(LPCWSTR szPackage, DWORD dwOptions, MSIPACKAGE **pPackage)
         return r;
     }
     if (gszLogFile)
-        package->log_file = CreateFileW( gszLogFile, GENERIC_WRITE, FILE_SHARE_WRITE, NULL,
-                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL );
+        package->log_file = msi_open_log_file( gszLogFile, OPEN_EXISTING );
 
     /* FIXME: when should these messages be sent? */
     data_row = MSI_CreateRecord(3);
