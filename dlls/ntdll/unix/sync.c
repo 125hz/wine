@@ -431,6 +431,21 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
 
     do { ret = ioctl( device, request, &args ); }
     while (ret < 0 && errno == EINTR);
+#ifdef WINE_IOS
+    /* madsync: the server parked an async I/O APC for this process and cannot signal us to
+     * collect it (server/thread.c, ios_apc_park); the wait ended with nothing consumed. Run it
+     * in a zero-timeout server wait and wait again: args.timeout is absolute, so the deadline
+     * is unchanged. */
+    while (ret < 0 && errno == ECANCELED)
+    {
+        static const LARGE_INTEGER zero;
+
+        server_wait( NULL, 0, SELECT_INTERRUPTIBLE, &zero );
+        args.index = ~0u;
+        do { ret = ioctl( device, request, &args ); }
+        while (ret < 0 && errno == EINTR);
+    }
+#endif
 
     if (!ret)
     {
