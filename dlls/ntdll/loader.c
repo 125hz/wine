@@ -5309,12 +5309,77 @@ static void open_known_dll_ntdir(void)
 
 #ifdef __arm64ec__
 
+/* iOS-Madeira: the emulator module's dependencies come from the system directory.
+ *
+ * xtajit64.dll is FEX, a C++ module that imports the CRT (api-ms-win-crt-*, which
+ * build_import_name turns into the bare name ucrtbase.dll) and through it kernel32 and
+ * kernelbase. With a NULL load path those names were searched in the default DLL path,
+ * which starts with the program's own directory, so a program that ships its own x86-64
+ * copy of one of them had that copy bound under the emulator itself. Its DllMain then ran
+ * in the dependency walk below, before arm64ec_process_init installs the real call
+ * checker (the early one treats every target as native) and before the emulator can run
+ * any x86-64 code: the x86-64 entry point executed as ARM64 and the process died with an
+ * illegal instruction during DLL initialisation. The emulator cannot run on an x86-64 CRT
+ * (Windows' own emulator module imports none), so its dependency tree is searched in the
+ * system directory only; in a mixed session the ARM64 copies there fall back to
+ * C:\windows\sysx64 in find_dll_file, exactly as when the program's directory has no
+ * such copy. What the program imports later binds to the loaded system copy by base name,
+ * as it already does in every process whose directory has none.
+ *
+ * Read from the host (unix_ios_host_switch), not from this process's environment, so the
+ * switch reaches services too. MADEIRA_EC_EMULATOR_SYSTEM_DEPS=0: the default DLL path,
+ * as before. */
+static BOOL ec_emulator_system_deps(void)
+{
+    struct ios_host_switch_params params = { "MADEIRA_EC_EMULATOR_SYSTEM_DEPS" };
+
+    if (WINE_UNIX_CALL( unix_ios_host_switch, &params )) return TRUE;
+    return params.value[0] != '0';
+}
+
+/* Name (at most 4 per process) each emulator dependency whose base name is also in the
+ * program's directory, i.e. each one the system load path decided. */
+static void ec_emulator_deps_note( WINE_MODREF *emulator )
+{
+    const UNICODE_STRING *image = &NtCurrentTeb()->Peb->ProcessParameters->ImagePathName;
+    LIST_ENTRY *list = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList, *entry;
+    FILE_BASIC_INFORMATION info;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING nt_name;
+    WCHAR path[MAX_PATH];
+    ULONG dir = image->Length / sizeof(WCHAR), noted = 0;
+
+    while (dir && image->Buffer[dir - 1] != '\\') dir--;
+    if (!dir) return;
+    for (entry = emulator->ldr.InLoadOrderLinks.Flink; entry != list && noted < 4; entry = entry->Flink)
+    {
+        LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
+        ULONG len = mod->BaseDllName.Length / sizeof(WCHAR);
+
+        if (!len || dir + len >= ARRAY_SIZE(path)) continue;
+        memcpy( path, image->Buffer, dir * sizeof(WCHAR) );
+        memcpy( path + dir, mod->BaseDllName.Buffer, len * sizeof(WCHAR) );
+        path[dir + len] = 0;
+        if (RtlDosPathNameToNtPathName_U_WithStatus( path, &nt_name, NULL, NULL )) continue;
+        InitializeObjectAttributes( &attr, &nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+        if (!NtQueryAttributesFile( &attr, &info ))
+        {
+            ERR( "[ec-deps] the program's directory has its own %s; the emulator uses %s "
+                 "(MADEIRA_EC_EMULATOR_SYSTEM_DEPS=0 reverts)\n",
+                 debugstr_us(&mod->BaseDllName), debugstr_us(&mod->FullDllName) );
+            noted++;
+        }
+        RtlFreeUnicodeString( &nt_name );
+    }
+}
+
 static void load_arm64ec_module(void)
 {
     ULONG buffer[16];
     KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
     UNICODE_STRING nameW = RTL_CONSTANT_STRING( L"\\Registry\\Machine\\Software\\Microsoft\\Wow64\\amd64" );
     WCHAR module[64] = L"C:\\windows\\system32\\xtajit64.dll";
+    BOOL system_deps = ec_emulator_system_deps();
     OBJECT_ATTRIBUTES attr;
     WINE_MODREF *wm;
     NTSTATUS status;
@@ -5335,11 +5400,12 @@ static void load_arm64ec_module(void)
         NtClose( key );
     }
 
-    if ((status = load_dll( NULL, module, 0, &wm, FALSE )))
+    if ((status = load_dll( system_deps ? system_dir : NULL, module, 0, &wm, FALSE )))
     {
         ERR( "could not load %s, status %lx\n", debugstr_w(module), status );
         NtTerminateProcess( GetCurrentProcess(), status );
     }
+    if (system_deps) ec_emulator_deps_note( wm );
 
     /* Phase 1: set up dispatcher pointers and FEX function pointers BEFORE
      * the DllMain dependency walk, so that exception dispatch
