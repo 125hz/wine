@@ -348,3 +348,14 @@ DECL_HANDLER(get_inproc_sync_fd)
 
     release_object( obj );
 }
+
+#ifdef WINE_IOS
+/* the in-process sync fd behind an object (madsync), or -1 (thread.c: the waiters on an async
+ * I/O's event are sent to the server when its completion is parked) */
+int get_object_inproc_fd( struct object *obj )
+{
+    int type;
+
+    return obj ? get_obj_inproc_sync( obj, &type ) : -1;
+}
+#endif

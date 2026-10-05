@@ -131,11 +131,14 @@ struct thread
     /* Async I/O APCs parked in this thread's system queue (thread.c, ios_apc_park):
      * nonzero means the thread is busy and holds undelivered completions. */
     unsigned int           ios_parked_count;
-    /* The server has told this thread STATUS_KERNEL_APC or STATUS_USER_APC (a select reply or a
-     * wakeup) and its ntdll will call select again; cleared when it does. */
+    /* The server has sent this thread a STATUS_KERNEL_APC or STATUS_USER_APC wakeup and its
+     * ntdll will call select again to fetch it; cleared when it does. */
     int                    ios_apc_returning;
     /* madsync: escalation timer of the park episode this thread started (thread.c). */
     struct timeout_user   *ios_park_timer;
+    /* System APCs a select reply handed this thread whose result has not come back yet: it
+     * will select again with it, even if a nested wait runs in between (thread.c). */
+    unsigned int           ios_apc_inflight;
 #endif
 };
 

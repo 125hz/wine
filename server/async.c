@@ -706,6 +706,17 @@ void async_set_result( struct object *obj, unsigned int status, apc_param_t tota
     }
 }
 
+#ifdef WINE_IOS
+/* the event the client gave this async, or NULL (thread.c, ios_apc_park); no reference taken */
+struct object *async_get_event( struct object *obj )
+{
+    struct async *async = (struct async *)obj;
+
+    if (!obj || obj->ops != &async_ops || !async->event) return NULL;
+    return (struct object *)async->event;
+}
+#endif
+
 int async_queue_has_waiting_asyncs( struct async_queue *queue )
 {
     struct async *async;

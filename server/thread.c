@@ -96,6 +96,7 @@ struct thread_apc
     struct thread      *ios_parked_on;    /* busy thread whose queue holds this parked apc, else NULL */
     struct list         ios_parked_entry; /* entry in ios_parked_apcs while parked */
     int                 ios_relocated;    /* moved off the thread it was queued for (hand-over, adoption) */
+    struct thread      *ios_handed_to;    /* a select reply handed it to this thread, result still out (compared only) */
 #endif
 };
 
@@ -110,6 +111,41 @@ static struct list ios_parked_apcs = LIST_INIT( ios_parked_apcs );
 static void ios_apc_adopt( struct thread *thread );
 static void ios_apc_unpark( struct thread_apc *apc );
 static void ios_apc_thread_dies( struct thread *thread );
+
+/* The thread will call select again by itself: it was sent a KERNEL_APC/USER_APC wakeup it has
+ * not come back for yet, or a select reply handed it system APCs whose results are still out
+ * (counted, so a nested wait run inside one of them does not hide the outer loop). */
+static inline int ios_apc_coming_back( const struct thread *thread )
+{
+    return thread->ios_apc_returning || thread->ios_apc_inflight;
+}
+
+/* DECL_HANDLER(select), on entry: the thread is back */
+static inline void ios_apc_select_enter( struct thread *thread )
+{
+    thread->ios_apc_returning = 0;
+}
+
+/* DECL_HANDLER(select), req->prev_apc: the result of an APC it was handed came back */
+static inline void ios_apc_result_back( struct thread *thread, struct thread_apc *apc )
+{
+    if (apc->ios_handed_to != thread) return;
+    apc->ios_handed_to = NULL;
+    thread->ios_apc_inflight--;
+}
+
+/* DECL_HANDLER(select), STATUS_KERNEL_APC reply: server_select runs the APC and selects again,
+ * with its result when it got a handle for it */
+static inline void ios_apc_hand_out( struct thread *thread, struct thread_apc *apc, obj_handle_t handle )
+{
+    if (!handle)
+    {
+        thread->ios_apc_returning = 1;
+        return;
+    }
+    apc->ios_handed_to = thread;
+    thread->ios_apc_inflight++;
+}
 #endif
 
 static const struct object_ops thread_apc_ops =
@@ -452,6 +488,7 @@ static inline void init_thread_structure( struct thread *thread )
     thread->ios_parked_count   = 0;
     thread->ios_apc_returning  = 0;
     thread->ios_park_timer     = NULL;
+    thread->ios_apc_inflight   = 0;
 #endif
     thread->dbg_hidden      = 0;
     thread->bypass_proc_suspend = 0;
@@ -788,6 +825,7 @@ static struct thread_apc *create_apc( struct object *owner, const union apc_call
 #ifdef WINE_IOS
         apc->ios_parked_on = NULL;
         apc->ios_relocated = 0;
+        apc->ios_handed_to = NULL;
 #endif
         if (owner) grab_object( owner );
 
@@ -1796,31 +1834,34 @@ static inline int is_in_apc_wait( struct thread *thread )
  * takes all of the process's parked APCs, in the order they were parked (ios_apc_adopt, from
  * select_on); a thread that never waits in the server cannot hold one.
  *
- * Only a thread that is not coming back by itself gets the hand-over or the park. That is exact:
- * ios_apc_returning is set whenever the server tells a thread STATUS_KERNEL_APC (a select reply,
- * after which server_select runs the APC and selects again) or sends it a KERNEL_APC/USER_APC
- * wakeup (after which it selects again to fetch it), and cleared when its next select arrives. A
- * system APC for a returning thread is appended behind what it already has, as upstream does, so
- * a just-woken thread's second completion stays behind the first. For any other thread not in an
- * interruptible wait, an async I/O APC goes to a waiting thread of the process together with all
- * of the process's parked APCs, in order, or is parked behind them: completions are never
- * reordered by this path.
+ * Only a thread that is not coming back by itself gets the hand-over or the park. That is exact
+ * (ios_apc_coming_back): a thread is coming back while a KERNEL_APC/USER_APC wakeup it was sent
+ * is unanswered (ios_apc_returning, set in send_thread_wakeup, cleared when its next select
+ * arrives) or while a system APC a select reply handed it has not had its result returned
+ * (ios_apc_inflight, counted, so a nested wait that a system APC makes does not hide the outer
+ * loop, which selects again with the result). A system APC for such a thread is appended behind
+ * what it already has, as upstream does. For any other thread not in an interruptible wait, an
+ * async I/O APC goes to a waiting thread together with all of the process's parked APCs, in
+ * order, or is parked behind them: completions are never reordered by this path.
  *
  * In-process waits. fastsync parks for at most 2 ms before its server wait, so it needs nothing.
- * Under madsync each park sends the thread it is parked on a sticky madsync_kick: its current
- * madsync wait, or its next wait or poll, ends with ECANCELED and nothing consumed, and ntdll's
- * linux_wait_objs makes a zero-timeout interruptible server wait, which takes the process's parked
- * APCs, and waits again with the same deadline. That thread is the one that started the I/O and
- * normally waits for it, so this is usually the only kick. If the process still has parked APCs
- * IOS_APC_ESCALATE_MS after its first park (the busy thread computes, or waits outside madsync and
- * the server, while another thread polls or waits on the I/O's event), every live thread of the
- * process is kicked once (ios_apc_escalate). The unpark that leaves the process with none takes
- * all unused kicks back with madsync_unkick and cancels the timer, as does a thread's death for
- * its own: no kick outlives its APCs.
+ * A thread waiting in the server is the hand-over target, so it needs nothing either. Under
+ * madsync each park sends a madsync_kick to the thread it is parked on (sticky) and to the
+ * threads blocked on the I/O's event right now (madsync_kick_object; not sticky, so nothing is
+ * left to take back): their madsync wait, or the busy thread's next wait or poll, ends with
+ * ECANCELED and nothing consumed, and ntdll's linux_wait_objs makes a zero-timeout interruptible
+ * server wait, which takes the process's parked APCs, and waits again with the same deadline.
+ * Those are the threads that wait for this completion, so usually nobody else is woken. As a
+ * backstop, a process with parked APCs always has one timer (ios_apc_ensure_timer): if APCs are
+ * still parked IOS_APC_ESCALATE_MS later (a poller, or a waiter that blocked just after the
+ * park), every live thread of the process is kicked once (ios_apc_escalate); if no timer can be
+ * allocated that happens at once. The unpark that leaves the process with none takes all unused
+ * kicks back with madsync_unkick and cancels the timer; a dying thread's kick and timer go with
+ * it, and a new timer is put on a live thread if APCs stay parked: no kick outlives its APCs.
  *
  * A thread that dies hands on only the async I/O APCs that came to it from elsewhere: parked ones
  * (they may be taken by any thread) and ones moved to it by a hand-over, an adoption or another
- * death, to a waiting thread, else to the first live one (parked there unless it is returning).
+ * death, to a waiting thread, else to the first live one (parked there unless it is coming back).
  * Its own plain completions are cleared with its queue as upstream does, and nothing is handed on
  * while the process is terminating. An APC is moved, never copied, and only the client's result
  * (or a clear, as before) completes the async, once, in thread_apc_destroy; a socket queue still
@@ -1963,20 +2004,36 @@ static void ios_apc_escalate( void *private )
     ios_apc_kick_process( thread->process, 1 );
 }
 
-/* the apc was just queued on busy thread's system queue: make it takeable; under madsync kick
- * that thread, and start the process's escalation timer at its first parked APC */
+/* madsync: a process with parked APCs always has exactly one escalation timer; put it on `on'
+ * (a live thread) if it has none. If no timer can be allocated, escalate at once. */
+static void ios_apc_ensure_timer( struct process *process, struct thread *on )
+{
+    struct thread *t;
+
+    if (get_inproc_device_fd() < 0 || !ios_process_parked( process )) return;
+    LIST_FOR_EACH_ENTRY( t, &process->thread_list, struct thread, proc_entry )
+        if (t->ios_park_timer) return;
+    if (on && on->state != TERMINATED &&
+        (on->ios_park_timer = add_timeout_user( -(timeout_t)IOS_APC_ESCALATE_MS * 10000, ios_apc_escalate, on )))
+        return;
+    ios_apc_kick_process( process, 1 );
+}
+
+/* the apc was just queued on busy thread's system queue: make it takeable. Under madsync kick
+ * that thread and the threads blocked on the I/O's event right now (they wait for exactly this
+ * completion), and keep the process's escalation timer as the backstop. */
 static void ios_apc_park( struct thread *thread, struct thread_apc *apc )
 {
     extern void madsync_kick( unsigned int owner, int sticky );
-    int first = !ios_process_parked( thread->process );
+    extern int madsync_kick_object( int fd );
 
     apc->ios_parked_on = thread;
     thread->ios_parked_count++;
     list_add_tail( &ios_parked_apcs, &apc->ios_parked_entry );
     if (get_inproc_device_fd() < 0) return;
     madsync_kick( thread->id, 1 );
-    if (first && !thread->ios_park_timer)
-        thread->ios_park_timer = add_timeout_user( -(timeout_t)IOS_APC_ESCALATE_MS * 10000, ios_apc_escalate, thread );
+    madsync_kick_object( get_object_inproc_fd( async_get_event( apc->owner ) ) );
+    ios_apc_ensure_timer( thread->process, thread );
 }
 
 /* the apc left its queue, or is about to move: it is no longer anyone's to take */
@@ -2035,13 +2092,12 @@ static void ios_apc_thread_dies( struct thread *thread )
     struct thread_apc *apc, *next;
     struct thread *to = NULL, *t;
     unsigned int moved = 0;
-    int park = 0, had_timer = 0;
+    int park = 0;
 
     if (thread->ios_park_timer)
     {
         remove_timeout_user( thread->ios_park_timer );
         thread->ios_park_timer = NULL;
-        had_timer = 1;
     }
     if (thread->state == TERMINATED && !thread->process->is_terminating && ios_apc_park_enabled())
     {
@@ -2053,7 +2109,7 @@ static void ios_apc_thread_dies( struct thread *thread )
                 LIST_FOR_EACH_ENTRY( t, &thread->process->thread_list, struct thread, proc_entry )
                     if (t != thread && t->state != TERMINATED) { to = t; break; }
                 if (!to) break;
-                park = !to->ios_apc_returning;
+                park = !ios_apc_coming_back( to );
             }
             ios_apc_unpark( apc );
             list_remove( &apc->entry );
@@ -2070,12 +2126,12 @@ static void ios_apc_thread_dies( struct thread *thread )
     }
     if (get_inproc_device_fd() < 0) return;
     madsync_unkick( thread->id );
-    /* it carried its process's escalation timer, APCs are still parked and no new episode started
-     * a timer elsewhere: escalate now rather than never */
-    if (!had_timer || !ios_process_parked( thread->process )) return;
-    LIST_FOR_EACH_ENTRY( t, &thread->process->thread_list, struct thread, proc_entry )
-        if (t->ios_park_timer) return;
-    ios_apc_kick_process( thread->process, 1 );
+    /* the timer may have gone with it while APCs stay parked on other threads: give the process
+     * a new one on a live thread (the one they were handed to, else the first) */
+    if (!to)
+        LIST_FOR_EACH_ENTRY( t, &thread->process->thread_list, struct thread, proc_entry )
+            if (t != thread && t->state != TERMINATED) { to = t; break; }
+    ios_apc_ensure_timer( thread->process, to );
 }
 
 /* ml2015: a process-wide system APC failed whenever every thread of the target was busy.
@@ -2163,7 +2219,7 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
             /* an async I/O APC whose issuer has exited: parked like one for a busy issuer, unless
              * that thread is returning and takes it itself */
             park = thread && apc->call.type == APC_ASYNC_IO && ios_apc_park_enabled() &&
-                   !thread->ios_apc_returning;
+                   !ios_apc_coming_back( thread );
         }
         if (thread && apc->call.type == APC_ASYNC_IO) apc->ios_relocated = 1;  /* not its issuer */
 #endif
@@ -2176,13 +2232,13 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
         if (!(queue = get_apc_queue( thread, apc->call.type ))) return 1;
 #ifdef WINE_IOS
         /* an async I/O completion for a thread not in an interruptible wait: one that is returning
-         * (ios_apc_returning, exact) takes it itself behind what it has, as upstream; any other
+         * (ios_apc_coming_back, exact) takes it itself behind what it has, as upstream; any other
          * cannot be signalled, so a waiting thread gets it with the process's parked APCs ahead of
          * it, in order, or it is parked behind them */
         if (queue == &thread->system_apc && apc->call.type == APC_ASYNC_IO && !is_in_apc_wait( thread ) &&
             ios_apc_park_enabled())
         {
-            if (!thread->ios_apc_returning)
+            if (!ios_apc_coming_back( thread ))
             {
                 struct thread *target = ios_apc_requeue_target( thread, apc, &park ), *last;
 
@@ -2742,7 +2798,7 @@ DECL_HANDLER(select)
     unsigned int ctx_count;
 
 #ifdef WINE_IOS
-    current->ios_apc_returning = 0;  /* it is back */
+    ios_apc_select_enter( current );
 #endif
     if (get_req_data_size() < sizeof(*result)) goto invalid_param;
     if (get_req_data_size() - sizeof(*result) < req->size) goto invalid_param;
@@ -2810,6 +2866,9 @@ DECL_HANDLER(select)
                                                          0, &thread_apc_ops ))) return;
         apc->result = *result;
         apc->executed = 1;
+#ifdef WINE_IOS
+        ios_apc_result_back( current, apc );
+#endif
         if (apc->result.type == APC_CREATE_THREAD)  /* transfer the handle to the caller process */
         {
             obj_handle_t handle = duplicate_handle( current->process, apc->result.create_thread.handle,
@@ -2833,9 +2892,6 @@ DECL_HANDLER(select)
     }
     else if (get_error() == STATUS_KERNEL_APC && get_reply_max_size() >= sizeof(union apc_call))
     {
-#ifdef WINE_IOS
-        current->ios_apc_returning = 1;  /* server_select runs it and selects again */
-#endif
         apc = thread_dequeue_apc( current, 1 );
         if ((reply->apc_handle = alloc_handle( current->process, apc, SYNCHRONIZE, 0 )))
         {
@@ -2846,6 +2902,9 @@ DECL_HANDLER(select)
             apc->executed = 1;
             signal_sync( apc->sync );
         }
+#ifdef WINE_IOS
+        ios_apc_hand_out( current, apc, reply->apc_handle );
+#endif
         release_object( apc );
     }
     else if (reply->signaled && get_reply_max_size() >= sizeof(union apc_call) + sizeof(struct context_data) &&
