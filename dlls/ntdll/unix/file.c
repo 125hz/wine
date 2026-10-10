@@ -6873,11 +6873,13 @@ NTSTATUS WINAPI NtReadFileScatter( HANDLE file, HANDLE event, PIO_APC_ROUTINE ap
 
     while (length)
     {
+        /* as in NtReadFile: virtual_locked_* also fill buffers the kernel cannot write directly */
         if (offset && offset->QuadPart != FILE_USE_FILE_POINTER_POSITION)
-            result = pread( unix_handle, (char *)segments->Buffer + pos,
-                            min( length - pos, page_size - pos ), offset->QuadPart + total );
+            result = virtual_locked_pread( unix_handle, (char *)segments->Buffer + pos,
+                                           min( length - pos, page_size - pos ), offset->QuadPart + total );
         else
-            result = read( unix_handle, (char *)segments->Buffer + pos, min( length - pos, page_size - pos ) );
+            result = virtual_locked_read( unix_handle, (char *)segments->Buffer + pos,
+                                          min( length - pos, page_size - pos ) );
 
         if (result == -1)
         {
