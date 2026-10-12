@@ -5129,6 +5129,26 @@ static DWORD ios_wow_volume_serial( WCHAR letter )
 }
 #endif
 
+#ifdef WINE_IOS
+/* madeira-bcd: madeira_fd_stat_only (tools/patch-wine-file-info-fstat.py). The size,
+ * index and end-of-file classes never use the attributes fd_get_file_info reads from
+ * extended attributes, and it fails only when its fstat fails: fstat alone answers them
+ * the same, without two xattr reads per query. MADEIRA_FILE_INFO_FULL=1 restores the call. */
+static int madeira_fd_stat_only( HANDLE handle, int fd, unsigned int options, struct stat *st, ULONG *attr )
+{
+    static int full = -1;
+
+    if (full < 0)
+    {
+        const char *e = getenv( "MADEIRA_FILE_INFO_FULL" );
+        full = e && e[0] == '1';
+    }
+    if (full) return fd_get_file_info( handle, fd, options, st, attr, NULL );
+    *attr = 0;
+    return fstat( fd, st );
+}
+#endif
+
 /******************************************************************************
  *              NtQueryInformationFile   (NTDLL.@)
  */
@@ -5256,7 +5276,11 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             FILE_STANDARD_INFORMATION *info = ptr;
 
+#ifdef WINE_IOS
+            if (madeira_fd_stat_only( handle, fd, options, &st, &attr ) == -1)
+#else
             if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+#endif
                 status = errno_to_status( errno );
             else
             {
@@ -5274,7 +5298,11 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileInternalInformation:
+#ifdef WINE_IOS
+        if (madeira_fd_stat_only( handle, fd, options, &st, &attr ) == -1)
+#else
         if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+#endif
             status = errno_to_status( errno );
         else
             fill_file_info( &st, attr, ptr, class );
@@ -5286,7 +5314,11 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         }
         break;
     case FileEndOfFileInformation:
+#ifdef WINE_IOS
+        if (madeira_fd_stat_only( handle, fd, options, &st, &attr ) == -1)
+#else
         if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+#endif
             status = errno_to_status( errno );
         else
             fill_file_info( &st, attr, ptr, class );
