@@ -42,6 +42,10 @@ HINSTANCE windows_gaming_input;
 
 DEFINE_GUID( GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47,0x67,0x50,0xc5,0xe1,0xa6 );
 
+/* madeira-bcd: tools/patch-wine-wgi-host-pads.py (provider.c) */
+extern void madeira_host_pads_poll( void );
+extern BOOL madeira_host_pads_wait( void );
+
 static LRESULT CALLBACK devnotify_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
     DEV_BROADCAST_DEVICEINTERFACE_W *iface;
@@ -95,6 +99,7 @@ static void initialize_providers( void )
     }
 
     SetupDiDestroyDeviceInfoList( set );
+    madeira_host_pads_poll();
 }
 
 static DWORD WINAPI monitor_thread_proc( void *param )
@@ -132,7 +137,7 @@ static DWORD WINAPI monitor_thread_proc( void *param )
             TranslateMessage( &msg );
             DispatchMessageW( &msg );
         }
-    } while (!MsgWaitForMultipleObjectsEx( 0, NULL, INFINITE, QS_ALLINPUT, MWMO_ALERTABLE ));
+    } while (madeira_host_pads_wait());
 
     UnregisterDeviceNotification( devnotify );
     DestroyWindow( hwnd );
