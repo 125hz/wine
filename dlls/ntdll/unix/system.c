@@ -2633,6 +2633,15 @@ static void get_performance_info( SYSTEM_PERFORMANCE_INFORMATION *info )
     /* Titan Quest refuses to run if TotalPageFile <= TotalPhys */
     if (!totalswap) totalswap = page_size;
 
+#ifdef __APPLE__
+    {
+        /* madeira-bcd: avail-phys (tools/patch-wine-avail-phys.py): with madeira.cfg
+         * avail-phys = 1, what remains before this app's memory limit when that
+         * is less than the phone's free memory (virtual_ios.c). */
+        extern unsigned long long ios_avail_phys( unsigned long long host_free );
+        freeram = ios_avail_phys( freeram );
+    }
+#endif
     info->AvailablePages      = freeram / page_size;
     info->TotalCommittedPages = (totalram + totalswap - freeram - freeswap) / page_size;
     info->TotalCommitLimit    = (totalram + totalswap) / page_size;
