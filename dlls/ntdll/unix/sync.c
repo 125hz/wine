@@ -5066,6 +5066,36 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
 {
     static struct { unsigned long long lock; int strikes; } susp[8];
     int i, j, k;
+    /* madeira-bcd lock-orphan (tools/patch-wine-lock-orphan.py): env
+     * MADEIRA_LOCK_ORPHAN = stamped counts strikes once per lock per cycle and
+     * releases only locks a live thread has stamped (FEX's code-buffer locks);
+     * = 0 releases nothing; unset keeps the reaper as it was. */
+    static int orphan_mode = -1;            /* 0 as before, 1 stamped, 2 off */
+    static unsigned long long ever[64];     /* locks a live thread has stamped */
+    static int never, ever_next;
+    unsigned long long done[32];            /* locks already looked at in this cycle */
+    int ndone = 0;
+
+    if (orphan_mode < 0)
+    {
+        const char *e = getenv( "MADEIRA_LOCK_ORPHAN" );
+        orphan_mode = !e ? 0 : !strcmp( e, "stamped" ) ? 1 : !strcmp( e, "0" ) ? 2 : 0;
+        if (orphan_mode)
+            dprintf( 2, "[lock-orphan] madeira-bcd MADEIRA_LOCK_ORPHAN=%s: %s\n", e,
+                     orphan_mode == 1 ? "only locks a live thread has stamped are released, after 3 monitor cycles"
+                                      : "no orphan-lock releases" );
+    }
+    if (orphan_mode == 2) return;
+    if (orphan_mode == 1)
+        for (k = 0; k < nstamps; k++)
+        {
+            if (!live_stamps[k]) continue;
+            for (j = 0; j < never; j++) if (ever[j] == live_stamps[k]) break;
+            if (j < never) continue;
+            ever[ever_next] = live_stamps[k];
+            ever_next = (ever_next + 1) % 64;
+            if (never < 64) never++;
+        }
     for (i = 0; i < IOS_ALERT_WAITER_MAX; i++)
     {
         const void *a = ios_alert_waiters[i].addr;
@@ -5074,6 +5104,16 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
         int nsame = 0, stamped = 0;
         if (!a || ((ULONG_PTR)a & 3) != 2 || (ULONG_PTR)a < 0x10000 || (ULONG_PTR)a >= 0x8000000000ULL) continue;
         lock = (unsigned long long)(ULONG_PTR)a - 2;
+        if (orphan_mode == 1)
+        {
+            /* madeira-bcd lock-orphan: each lock once per cycle (one strike, not
+             * one per parked waiter), and never a lock nobody has stamped */
+            for (k = 0; k < ndone; k++) if (done[k] == lock) break;
+            if (k < ndone || ndone == 32) continue;
+            done[ndone++] = lock;
+            for (k = 0; k < never; k++) if (ever[k] == lock) break;
+            if (k == never) continue;
+        }
         for (j = 0; j < IOS_ALERT_WAITER_MAX; j++)
             if (ios_alert_waiters[j].addr == a) nsame++;
         if (nsame < 3) continue;
