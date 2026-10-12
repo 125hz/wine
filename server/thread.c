@@ -305,6 +305,29 @@ static void apply_thread_priority( struct thread *thread )
     mach_port_t thread_port, process_port = thread->process->trace_data;
     int effective_priority = get_effective_thread_priority( thread );
 
+#ifdef WINE_IOS
+    /* madeira-bcd: thread priority keeps the pthread QoS (tools/patch-wine-thread-qos.py).
+     * Below the realtime band the Mach precedence/throughput/latency policies only
+     * demote a USER_INTERACTIVE guest thread onto the efficiency cores. */
+    if (effective_priority < LOW_REALTIME_PRIORITY)
+    {
+        static int keep = -1, logged;
+        if (keep < 0)
+        {
+            const char *e = getenv( "MADEIRA_WIN_THREAD_PRIORITY" );
+            keep = !(e && e[0] == '1');
+        }
+        if (logged < 24)
+        {
+            logged++;
+            fprintf( stderr, "[thread-prio] madeira-bcd tid=%04x base=%d effective=%d -> %s\n",
+                     thread->id, thread->base_priority, effective_priority,
+                     keep ? "kept at pthread QoS" : "Mach policies (MADEIRA_WIN_THREAD_PRIORITY=1)" );
+        }
+        if (keep) return;
+    }
+#endif
+
     if (!process_port) return;
     kr = mach_port_extract_right( process_port, thread->unix_tid,
                                   MACH_MSG_TYPE_COPY_SEND, &thread_port, &type );
