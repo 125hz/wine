@@ -385,11 +385,14 @@ extern BOOL win32u_wow_session;
  * check one load and one compare. */
 extern __thread void *win32u_gdi_published_peb;
 extern void win32u_gdi_publish_shared(void);
+extern void win32u_gdi_report_private(void);
 static inline void win32u_gdi_check_publish(void)
 {
-    if (win32u_wow_session && NtCurrentTeb()->WowTebOffset &&
-        win32u_gdi_published_peb != NtCurrentTeb()->Peb)
-        win32u_gdi_publish_shared();
+    if (NtCurrentTeb()->WowTebOffset && win32u_gdi_published_peb != NtCurrentTeb()->Peb)
+    {
+        if (win32u_wow_session) win32u_gdi_publish_shared();
+        else win32u_gdi_report_private();   /* ml1352: once per process */
+    }
 }
 #else
 static inline ULONG_PTR caller_zero_bits(void) { return zero_bits; }
