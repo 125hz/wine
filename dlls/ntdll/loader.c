@@ -2239,6 +2239,10 @@ static NTSTATUS process_attach( LDR_DDAG_NODE *node, LPVOID lpReserved )
 }
 
 
+#ifdef __arm64ec__
+static void *arm64ec_module;  /* the emulator (xtajit64.dll), see load_arm64ec_module */
+#endif
+
 /*************************************************************************
  *		process_detach
  *
@@ -2265,6 +2269,10 @@ static void process_detach(void)
 
             /* Call detach notification */
             mod->Flags &= ~LDR_PROCESS_ATTACHED;
+#ifdef __arm64ec__
+            /* The emulator's detach destroys its state: no more callbacks into it. */
+            if (mod->DllBase == arm64ec_module) arm64ec_emulator_detach();
+#endif
             MODULE_InitDLL( CONTAINING_RECORD(mod, WINE_MODREF, ldr), 
                             DLL_PROCESS_DETACH, ULongToPtr(process_detaching) );
             call_ldr_notifications( LDR_DLL_NOTIFICATION_REASON_UNLOADED, mod );
@@ -5387,6 +5395,8 @@ static void load_arm64ec_module(void)
      * the DllMain dependency walk, so that exception dispatch
      * (KiUserExceptionDispatcher needs __os_arm64x_dispatch_call_no_redirect)
      * and dispatch_emulation (needs pBeginSimulation) work during DllMain. */
+    arm64ec_module = wm->ldr.DllBase;
+
     if ((status = arm64ec_process_init_dispatchers( wm->ldr.DllBase )))
     {
         ERR( "arm64ec_process_init_dispatchers for %s failed, status %lx\n",
