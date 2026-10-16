@@ -1764,6 +1764,26 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
     if (thread) NtClose( thread );
 
     *(DWORD *)dir->AddressOfIndex = i;
+#ifdef __arm64ec__
+    {
+        /* iOS executes this ARM64EC image from a JIT-pool copy made before
+         * alloc_tls_slot. Compiler TLS accesses read AddressOfIndex through
+         * that copy, so leaving its initial zero here makes every DLL use
+         * the main EXE's TLS[0]. Sync the loader's index before any TLS
+         * callback or DllMain can access a thread_local variable. */
+        struct ios_sync_pe_write_params params = { (void *)dir->AddressOfIndex, sizeof(DWORD), 0 };
+        NTSTATUS sync = WINE_UNIX_CALL( unix_ios_sync_pe_write, &params );
+        if (sync)
+        {
+            ERR( "[tls-jit-sync] module=%s slot=%lu status=%lx\n",
+                 debugstr_w(mod->BaseDllName.Buffer), i, sync );
+            NtTerminateProcess( GetCurrentProcess(), sync );
+            return FALSE;
+        }
+        if (i < 24) ERR( "[tls-jit-sync] module=%s slot=%lu copied=%lu\n",
+                         debugstr_w(mod->BaseDllName.Buffer), i, params.synced );
+    }
+#endif
     tls_dirs[i] = *dir;
     {
         /* iOS-Madeira ml704 [tls-life]: which TLS slot each module actually got.
