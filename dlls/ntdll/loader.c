@@ -1340,6 +1340,7 @@ void ios_eager_delay_resolve( const char *when )
  * Keep this separate from any broad auxiliary-IAT or call-checker redesign.
  */
 #include "arm64ec_x64_export_iat.c"
+#include "cs_x64_fastpath.c"   /* MADEIRA_CS_X64 / MADEIRA_TLS_X64 */
 
 static BOOL arm64ec_iat_is_exported_x64( HMODULE module, const IMAGE_THUNK_DATA *slot )
 {
@@ -5474,6 +5475,10 @@ static void load_arm64ec_module(void)
         NtTerminateProcess( GetCurrentProcess(), status );
     }
     ERR( "load_arm64ec_module: arm64ec_process_init returned cleanly, status=%lx\n", status );
+
+    /* MADEIRA_CS_X64 / MADEIRA_TLS_X64: x64 fast paths over the FFS of hot exports (off by
+     * default); the emulator is up and no x64 code has run yet. */
+    madeira_x64_fastpath_install();
 }
 
 #endif
