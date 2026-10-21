@@ -122,6 +122,7 @@ static inline void ascii_to_unicode( WCHAR *dst, const char *src, size_t len )
 extern TEB_FLS_DATA *fls_alloc_data(void);
 extern void heap_thread_detach(void);
 extern void heap_init_madeira_policy(void);
+extern void sync_init_madeira_lean(void);
 
 /* register context */
 

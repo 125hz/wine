@@ -5728,6 +5728,7 @@ void loader_init( CONTEXT *context, void **entry )
 #ifdef __i386__
         heap_init_madeira_policy();  /* environment ready, no guest threads yet */
 #endif
+        sync_init_madeira_lean();  /* environment ready, no guest threads yet */
         load_global_options();
         version_init();
         open_known_dll_ntdir();
