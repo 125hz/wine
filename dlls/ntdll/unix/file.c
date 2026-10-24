@@ -5625,6 +5625,17 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 status = wine_server_call( req );
             }
             SERVER_END_REQ;
+            /* madeira-pipe-state-fd-backed: a unix pipe wrapped as a file object is a pipe by device
+             * type but not a named-pipe object; the mode asked for is what it already is. */
+            if (status == STATUS_INVALID_HANDLE || status == STATUS_OBJECT_TYPE_MISMATCH)
+            {
+                FILE_FS_DEVICE_INFORMATION device;
+                IO_STATUS_BLOCK device_io;
+
+                if (!NtQueryVolumeInformationFile( handle, &device_io, &device, sizeof(device), FileFsDeviceInformation )
+                    && device.DeviceType == FILE_DEVICE_NAMED_PIPE)
+                    status = STATUS_SUCCESS;
+            }
         }
         else status = STATUS_INVALID_PARAMETER_3;
         break;
