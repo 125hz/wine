@@ -3913,7 +3913,23 @@ static BOOL madeira_force_builtin_dll( const WCHAR *name )
         L"xinput9_1_0.dll", L"xinputuap.dll",
     };
     static int native = -1;
+    static int native_ucrt = -1;
     unsigned int i;
+
+    /* The system UCRT is ARM64EC; an app-local x64 copy cannot serve its imports. */
+    if (!wcsicmp( name, L"ucrtbase.dll" ) || !wcsicmp( name, L"ucrtbase" ) ||
+        !wcsnicmp( name, L"api-ms-win-crt-", 15 ))
+    {
+        if (native_ucrt < 0)
+        {
+            UNICODE_STRING nm, val;
+            WCHAR buf[8];
+            RtlInitUnicodeString( &nm, L"MADEIRA_NATIVE_UCRT" );
+            val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
+            native_ucrt = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length && buf[0] == '1');
+        }
+        return !native_ucrt;
+    }
 
     if (native < 0)
     {
