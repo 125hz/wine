@@ -977,6 +977,22 @@ struct thread *async_get_thread( struct async *async )
     return async->thread;
 }
 
+#ifdef WINE_IOS
+/* A pending synchronous request always enters wait_async() on its issuing
+ * thread after the request reply. Its completion APC can arrive in the gap
+ * before that server wait, while signals cannot interrupt the issuer on iOS.
+ * Keeping that APC on the issuer is safe: unlike an overlapped request, its
+ * next wait is guaranteed to process system APCs rather than sleep in madsync.
+ * The wait handle and issuer checks keep this limited to that request path. */
+int async_can_defer_to_issuer( struct object *obj, struct thread *thread )
+{
+    struct async *async = (struct async *)obj;
+
+    return obj && obj->ops == &async_ops && async->thread == thread &&
+           async->blocking && async->wait_handle;
+}
+#endif
+
 /* find the first pending async in queue */
 struct async *find_pending_async( struct async_queue *queue )
 {
