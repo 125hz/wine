@@ -5075,7 +5075,8 @@ void ios_alert_waiter_dump(void)
 void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
 {
     static struct { unsigned long long lock; int strikes; unsigned int word; } susp[8];
-    static unsigned long long ever_stamped[32];   /* ml1295: FEX locks seen held */
+    static unsigned long long ever_stamped[64];
+    static int stamped_count, stamped_next;
     static int guest_lock_logs;
     unsigned long long checked[64];
     int i, j, k, nchecked = 0;
@@ -5084,8 +5085,12 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
     if (mode && !strcmp( mode, "0" )) return;
     for (k = 0; k < nstamps; k++)
     {
-        for (j = 0; j < 32 && ever_stamped[j] && ever_stamped[j] != live_stamps[k]; j++) ;
-        if (j < 32 && !ever_stamped[j]) ever_stamped[j] = live_stamps[k];
+        if (!live_stamps[k]) continue;
+        for (j = 0; j < stamped_count && ever_stamped[j] != live_stamps[k]; j++) ;
+        if (j < stamped_count) continue;
+        ever_stamped[stamped_next] = live_stamps[k];
+        stamped_next = (stamped_next + 1) % 64;
+        if (stamped_count < 64) stamped_count++;
     }
     for (i = 0; i < IOS_ALERT_WAITER_MAX; i++)
     {
@@ -5137,7 +5142,7 @@ void ios_orphan_check( const unsigned long long *live_stamps, int nstamps )
             continue;
         }
         for (k = 0; k < nstamps; k++) if (live_stamps[k] == lock) stamped = 1;
-        for (k = 0; k < 32 && ever_stamped[k]; k++) if (ever_stamped[k] == lock) fex = 1;
+        for (k = 0; k < stamped_count; k++) if (ever_stamped[k] == lock) fex = 1;
         for (j = 0; j < 8; j++) if (susp[j].lock == lock) break;
         if (stamped)
         {
