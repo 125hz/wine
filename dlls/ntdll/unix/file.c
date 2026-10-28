@@ -640,6 +640,87 @@ static void free_dir_data( struct dir_data *data )
     free( data );
 }
 
+#ifdef WINE_IOS
+/* iOS-Madeira: the client half of the directory cache (dir_data_cache) is one array in this
+ * address space, shared by every pseudo-process, but the server hands out its slots per process
+ * (get_directory_cache_entry), so handles of two processes got the same slot. Terraria's first
+ * query of its Content folder found a listing another handle had already read to the end and
+ * returned STATUS_NO_MORE_FILES with nothing in it ([dir-read] names=1 pos=1 on build 32). Each
+ * process now has its own array, switched in under dir_mutex. The server reissues the ids of
+ * dead processes, so a new process drops what a dead one with its id left behind
+ * (madeira_dir_cache_flush_pid, called from server_init_process_done). */
+struct ios_dir_cache
+{
+    struct list        entry;
+    unsigned int       pid;
+    struct dir_data  **cache;
+    unsigned int       size;
+};
+
+static struct list ios_dir_caches = LIST_INIT( ios_dir_caches );
+static struct ios_dir_cache *ios_dir_cache_cur;   /* the process dir_data_cache belongs to */
+
+static unsigned int ios_dir_cache_pid(void)
+{
+    TEB *teb = NtCurrentTeb();
+    return teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
+}
+
+/* make dir_data_cache the calling process's array; dir_mutex held */
+static BOOL ios_dir_cache_select(void)
+{
+    unsigned int pid = ios_dir_cache_pid();
+    struct ios_dir_cache *c;
+
+    if (ios_dir_cache_cur && ios_dir_cache_cur->pid == pid) return TRUE;
+    if (ios_dir_cache_cur)
+    {
+        ios_dir_cache_cur->cache = dir_data_cache;
+        ios_dir_cache_cur->size = dir_data_cache_size;
+    }
+    dir_data_cache = NULL;
+    dir_data_cache_size = 0;
+    ios_dir_cache_cur = NULL;
+    LIST_FOR_EACH_ENTRY( c, &ios_dir_caches, struct ios_dir_cache, entry )
+        if (c->pid == pid) goto found;
+    if (!(c = calloc( 1, sizeof(*c) ))) return FALSE;
+    c->pid = pid;
+    list_add_head( &ios_dir_caches, &c->entry );
+found:
+    dir_data_cache = c->cache;
+    dir_data_cache_size = c->size;
+    ios_dir_cache_cur = c;
+    return TRUE;
+}
+
+void madeira_dir_cache_flush_pid(void)
+{
+    unsigned int pid = ios_dir_cache_pid(), i;
+    struct ios_dir_cache *c;
+
+    if (!pid) return;
+    mutex_lock( &dir_mutex );
+    LIST_FOR_EACH_ENTRY( c, &ios_dir_caches, struct ios_dir_cache, entry )
+    {
+        if (c->pid != pid) continue;
+        if (c == ios_dir_cache_cur)
+        {
+            c->cache = dir_data_cache;
+            c->size = dir_data_cache_size;
+            dir_data_cache = NULL;
+            dir_data_cache_size = 0;
+            ios_dir_cache_cur = NULL;
+        }
+        for (i = 0; i < c->size; i++) free_dir_data( c->cache[i] );
+        free( c->cache );
+        list_remove( &c->entry );
+        free( c );
+        break;
+    }
+    mutex_unlock( &dir_mutex );
+}
+#endif
+
 
 /* support for a directory queue for filesystem searches */
 
@@ -3300,6 +3381,9 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
     unsigned int status;
     BOOLEAN fresh_handle;
 
+#ifdef WINE_IOS
+    if (!ios_dir_cache_select()) return STATUS_NO_MEMORY;
+#endif
     SERVER_START_REQ( get_directory_cache_entry )
     {
         req->handle = wine_server_obj_handle( handle );
