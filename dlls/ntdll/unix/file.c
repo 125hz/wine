@@ -7368,16 +7368,65 @@ static int ios_guest_log_keep( const char *line, size_t len )
         "error", "fail", "exception", "unsupported", "not supported", "gpu", "driver",
         "adapter", "graphics", "monitor", "display", "nvapi", "nvidia",
     };
-    char lower[320];
+    char lower[320], *tag;
     size_t i;
 
     if (len >= sizeof(lower)) len = sizeof(lower) - 1;
     for (i = 0; i < len; i++)
         lower[i] = line[i] >= 'A' && line[i] <= 'Z' ? line[i] + ('a' - 'A') : line[i];
     lower[len] = 0;
+    /* ml2300: a "[DISPLAY]" log-level tag (a launcher's ordinary info lines) is not a
+     * display message; with it every line matched and its startup used the budget. */
+    for (tag = strchr( lower, '[' ); tag; tag = strchr( tag + 1, '[' ))
+    {
+        char *p = tag + 1, *end;
+        while (*p == ' ') p++;
+        if (strncmp( p, "display", 7 )) continue;
+        for (end = p + 7; *end == ' '; end++) ;
+        if (*end == ']') memset( tag, ' ', end + 1 - tag );
+    }
     for (i = 0; i < sizeof(words) / sizeof(words[0]); i++)
         if (strstr( lower, words[i] )) return 1;
     return 0;
+}
+
+/* ml2300: the value of a NAME=value whose name ends in password, token or secret is
+ * written as <redacted> (a store's one-use sign-in code is on a launcher's logged
+ * command line). Returns the length written to dst (at most capacity - 1). */
+static unsigned int ios_guest_log_redact( const char *src, unsigned int len, char *dst, unsigned int capacity )
+{
+    static const char *const keys[] = { "password=", "token=", "secret=" };
+    unsigned int i = 0, o = 0, k;
+
+    while (i < len && o + 1 < capacity)
+    {
+        for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++)
+        {
+            unsigned int kl = strlen( keys[k] ), j;
+            if (i + kl > len) continue;
+            for (j = 0; j < kl; j++)
+            {
+                char c = src[i + j];
+                if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+                if (c != keys[k][j]) break;
+            }
+            if (j == kl) break;
+        }
+        if (k == sizeof(keys) / sizeof(keys[0]))
+        {
+            dst[o++] = src[i++];
+            continue;
+        }
+        {
+            static const char mask[] = "<redacted>";
+            unsigned int kl = strlen( keys[k] ), m;
+            for (m = 0; m < kl && o + 1 < capacity; m++) dst[o++] = src[i++];
+            for (m = 0; mask[m] && o + 1 < capacity; m++) dst[o++] = mask[m];
+            while (i < len && src[i] != ' ' && src[i] != '\t' && src[i] != '"' && src[i] != '&') i++;
+        }
+    }
+    dst[o] = 0;
+    return o;
 }
 
 /* A BOM can be its own NtWriteFile call. Without one, require several ASCII
@@ -7458,7 +7507,7 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
     unsigned int i, n, start, serial;
     int saved_errno = errno, have_path = 0, m = __atomic_load_n( &mode, __ATOMIC_RELAXED );
     char path[PATH_MAX];
-    char decoded[4096];
+    char decoded[4096], clean[4096 + 16];
 
     if (m < 0)
     {
@@ -7539,12 +7588,13 @@ static void ios_guest_log_mirror( int fd, const void *buffer, unsigned int lengt
         if (__atomic_exchange_n( &previous_hash, hash, __ATOMIC_RELAXED ) == hash) continue;
         serial = __atomic_fetch_add( &emitted, 1, __ATOMIC_RELAXED );
         if (serial >= __atomic_load_n( &limit, __ATOMIC_RELAXED )) break;
+        len = ios_guest_log_redact( (const char *)text + start, len, clean, sizeof(clean) );
         shown = len > 300 ? 300 : len;
         /* Keep a truncated UTF-8 line valid, including decoded UTF-16. */
         if (shown < len)
-            while (shown && (text[start + shown] & 0xc0) == 0x80) shown--;
+            while (shown && (clean[shown] & 0xc0) == 0x80) shown--;
         dprintf( 2, "[guest-log] #%u tid=%04x %.*s%s\n", serial + 1, (unsigned int)GetCurrentThreadId(),
-                 (int)shown, (const char *)text + start, shown < len ? " [truncated]" : "" );
+                 (int)shown, clean, shown < len ? " [truncated]" : "" );
     }
 out:
     errno = saved_errno;
