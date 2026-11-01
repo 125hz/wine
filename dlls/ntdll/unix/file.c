@@ -255,6 +255,63 @@ static const BOOL is_case_sensitive = FALSE;
 static pthread_mutex_t dir_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t mnt_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+#ifdef WINE_IOS
+/* iOS-Madeira: every pseudo-process and the wineserver thread share one unix cwd (open_fd()
+ * fchdir()s to a root directory and back to the server dir, child launches and server connects
+ * fchdir() too), so NtQueryDirectoryFile's fchdir( fd ) + names relative to "." can list or stat
+ * another directory, and an entry whose stat fails is skipped as "no longer exists" without a
+ * word. Terraria's one listing of its Content folder came back without PixelShader.xnb and the
+ * game stopped at "Failed to load asset". dir_mutex only serializes NtQueryDirectoryFile itself.
+ * The readers now use the directory's absolute path (F_GETPATH), set under dir_mutex, and leave
+ * the cwd alone. MADEIRA_DIR_BY_PATH=0 restores the fchdir() read. With MADEIRA_FILE_TRACE=1,
+ * [dir-read] logs each listing: the path, the entries read and the ones skipped. */
+static char ios_dir_path[PATH_MAX];
+static unsigned int ios_dir_gone;   /* entries skipped because their stat failed */
+
+static BOOL ios_dir_read_by_path( int fd )
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_DIR_BY_PATH" );
+        enabled = !(e && e[0] == '0');
+    }
+    ios_dir_path[0] = 0;
+    ios_dir_gone = 0;
+    if (!enabled || fcntl( fd, F_GETPATH, ios_dir_path ) == -1)
+    {
+        ios_dir_path[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* the path of a directory entry: absolute while ios_dir_path is set, else name itself */
+static const char *ios_dir_entry_path( const char *name, char *buf, size_t size )
+{
+    if (!ios_dir_path[0] || snprintf( buf, size, "%s/%s", ios_dir_path, name ) >= size) return name;
+    return buf;
+}
+
+static void ios_dir_read_trace( unsigned int status, const IO_STATUS_BLOCK *io, const struct dir_data *data )
+{
+    static int on = -1;
+    static unsigned int n;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_FILE_TRACE" );
+        on = e && e[0] == '1';
+    }
+    if (!on || n >= 2000) return;
+    n++;
+    dprintf( 2, "[dir-read] #%u status=0x%08x bytes=%lu names=%u pos=%u gone=%u by-path=%d path=%s\n",
+             n, status, (unsigned long)io->Information, data ? data->count : 0, data ? data->pos : 0,
+             ios_dir_gone, ios_dir_path[0] != 0, ios_dir_path[0] ? ios_dir_path : "(cwd)" );
+}
+#endif
+
 /* check if a given Unicode char is OK in a DOS short name */
 static inline BOOL is_invalid_dos_char( WCHAR ch )
 {
@@ -582,6 +639,87 @@ static void free_dir_data( struct dir_data *data )
     free( data->mask.Buffer );
     free( data );
 }
+
+#ifdef WINE_IOS
+/* iOS-Madeira: the client half of the directory cache (dir_data_cache) is one array in this
+ * address space, shared by every pseudo-process, but the server hands out its slots per process
+ * (get_directory_cache_entry), so handles of two processes got the same slot. Terraria's first
+ * query of its Content folder found a listing another handle had already read to the end and
+ * returned STATUS_NO_MORE_FILES with nothing in it ([dir-read] names=1 pos=1 on build 32). Each
+ * process now has its own array, switched in under dir_mutex. The server reissues the ids of
+ * dead processes, so a new process drops what a dead one with its id left behind
+ * (madeira_dir_cache_flush_pid, called from server_init_process_done). */
+struct ios_dir_cache
+{
+    struct list        entry;
+    unsigned int       pid;
+    struct dir_data  **cache;
+    unsigned int       size;
+};
+
+static struct list ios_dir_caches = LIST_INIT( ios_dir_caches );
+static struct ios_dir_cache *ios_dir_cache_cur;   /* the process dir_data_cache belongs to */
+
+static unsigned int ios_dir_cache_pid(void)
+{
+    TEB *teb = NtCurrentTeb();
+    return teb ? (unsigned int)(ULONG_PTR)teb->ClientId.UniqueProcess : 0;
+}
+
+/* make dir_data_cache the calling process's array; dir_mutex held */
+static BOOL ios_dir_cache_select(void)
+{
+    unsigned int pid = ios_dir_cache_pid();
+    struct ios_dir_cache *c;
+
+    if (ios_dir_cache_cur && ios_dir_cache_cur->pid == pid) return TRUE;
+    if (ios_dir_cache_cur)
+    {
+        ios_dir_cache_cur->cache = dir_data_cache;
+        ios_dir_cache_cur->size = dir_data_cache_size;
+    }
+    dir_data_cache = NULL;
+    dir_data_cache_size = 0;
+    ios_dir_cache_cur = NULL;
+    LIST_FOR_EACH_ENTRY( c, &ios_dir_caches, struct ios_dir_cache, entry )
+        if (c->pid == pid) goto found;
+    if (!(c = calloc( 1, sizeof(*c) ))) return FALSE;
+    c->pid = pid;
+    list_add_head( &ios_dir_caches, &c->entry );
+found:
+    dir_data_cache = c->cache;
+    dir_data_cache_size = c->size;
+    ios_dir_cache_cur = c;
+    return TRUE;
+}
+
+void madeira_dir_cache_flush_pid(void)
+{
+    unsigned int pid = ios_dir_cache_pid(), i;
+    struct ios_dir_cache *c;
+
+    if (!pid) return;
+    mutex_lock( &dir_mutex );
+    LIST_FOR_EACH_ENTRY( c, &ios_dir_caches, struct ios_dir_cache, entry )
+    {
+        if (c->pid != pid) continue;
+        if (c == ios_dir_cache_cur)
+        {
+            c->cache = dir_data_cache;
+            c->size = dir_data_cache_size;
+            dir_data_cache = NULL;
+            dir_data_cache_size = 0;
+            ios_dir_cache_cur = NULL;
+        }
+        for (i = 0; i < c->size; i++) free_dir_data( c->cache[i] );
+        free( c->cache );
+        list_remove( &c->entry );
+        free( c );
+        break;
+    }
+    mutex_unlock( &dir_mutex );
+}
+#endif
 
 
 /* support for a directory queue for filesystem searches */
@@ -2850,10 +2988,19 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     union file_directory_info *info;
     struct stat st;
     ULONG name_len, start, dir_size, attributes, reparse_tag;
+    const char *path = names->unix_name;
+#ifdef WINE_IOS
+    char full[PATH_MAX];
 
-    if (get_file_info( names->unix_name, &st, &attributes, &reparse_tag ) == -1)
+    path = ios_dir_entry_path( names->unix_name, full, sizeof(full) );
+#endif
+
+    if (get_file_info( path, &st, &attributes, &reparse_tag ) == -1)
     {
         TRACE( "file no longer exists %s\n", debugstr_a(names->unix_name) );
+#ifdef WINE_IOS
+        ios_dir_gone++;
+#endif
         return STATUS_SUCCESS;
     }
     if (is_ignored_file( &st ))
@@ -3017,6 +3164,11 @@ static NTSTATUS read_directory_data_getattrlist( struct dir_data *data, const ch
         char name[NAME_MAX * 3 + 1];
     } buffer;
 #pragma pack(pop)
+#ifdef WINE_IOS
+    char full[PATH_MAX];
+
+    unix_name = ios_dir_entry_path( unix_name, full, sizeof(full) );
+#endif
 
     memset( &attrlist, 0, sizeof(attrlist) );
     attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
@@ -3051,10 +3203,17 @@ static NTSTATUS read_directory_data_getattrlist( struct dir_data *data, const ch
 static NTSTATUS read_directory_data_stat( struct dir_data *data, const char *unix_name )
 {
     struct stat st;
+    const char *dir = ".", *path = unix_name;
+#ifdef WINE_IOS
+    char full[PATH_MAX];
+
+    if (ios_dir_path[0]) dir = ios_dir_path;
+    path = ios_dir_entry_path( unix_name, full, sizeof(full) );
+#endif
 
     /* if the file system is not case sensitive we can't find the actual name through stat() */
-    if (!get_dir_case_sensitivity( AT_FDCWD, "." )) return STATUS_NO_SUCH_FILE;
-    if (stat( unix_name, &st ) == -1) return STATUS_NO_SUCH_FILE;
+    if (!get_dir_case_sensitivity( AT_FDCWD, dir )) return STATUS_NO_SUCH_FILE;
+    if (stat( path, &st ) == -1) return STATUS_NO_SUCH_FILE;
 
     TRACE( "found %s\n", debugstr_a(unix_name) );
 
@@ -3073,7 +3232,11 @@ static NTSTATUS read_directory_data_readdir( struct dir_data *data, const UNICOD
 {
     struct dirent *de;
     NTSTATUS status = STATUS_NO_MEMORY;
+#ifdef WINE_IOS
+    DIR *dir = opendir( ios_dir_path[0] ? ios_dir_path : "." );
+#else
     DIR *dir = opendir( "." );
+#endif
 
     if (!dir) return STATUS_NO_SUCH_FILE;
 
@@ -3218,6 +3381,9 @@ static unsigned int get_cached_dir_data( HANDLE handle, struct dir_data **data_r
     unsigned int status;
     BOOLEAN fresh_handle;
 
+#ifdef WINE_IOS
+    if (!ios_dir_cache_select()) return STATUS_NO_MEMORY;
+#endif
     SERVER_START_REQ( get_directory_cache_entry )
     {
         req->handle = wine_server_obj_handle( handle );
@@ -3286,8 +3452,9 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
 {
     int cwd, fd, needs_close;
     enum server_fd_type type;
-    struct dir_data *data;
+    struct dir_data *data = NULL;
     unsigned int status;
+    BOOL by_path = FALSE;
 
     TRACE("(%p %p %p %p %p %p 0x%08x 0x%08x 0x%08x %s 0x%08x\n",
           handle, event, apc_routine, apc_context, io, buffer,
@@ -3339,8 +3506,11 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
 
     mutex_lock( &dir_mutex );
 
-    cwd = open( ".", O_RDONLY );
-    if (fchdir( fd ) != -1)
+#ifdef WINE_IOS
+    by_path = ios_dir_read_by_path( fd );
+#endif
+    cwd = by_path ? -1 : open( ".", O_RDONLY );
+    if (by_path || fchdir( fd ) != -1)
     {
         if (!(status = get_cached_dir_data( handle, &data, fd, mask, restart_scan )))
         {
@@ -3356,11 +3526,15 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
             if (!last_info) status = STATUS_NO_MORE_FILES;
             else if (status == STATUS_MORE_ENTRIES) status = STATUS_SUCCESS;
         }
-        if (cwd == -1 || fchdir( cwd ) == -1) chdir( "/" );
+        if (!by_path && (cwd == -1 || fchdir( cwd ) == -1)) chdir( "/" );
     }
     else status = errno_to_status( errno );
 
     if (status != STATUS_NO_SUCH_FILE) io->Status = status;
+#ifdef WINE_IOS
+    ios_dir_read_trace( status, io, data );
+    ios_dir_path[0] = 0;
+#endif
 
     mutex_unlock( &dir_mutex );
 
