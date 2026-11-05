@@ -2238,11 +2238,12 @@ static void write_fx_2_annotation(struct hlsl_ir_var *var, struct fx_write_conte
     put_u32(buffer, value_offset);
 }
 
-static uint32_t write_fx_2_state_type(const struct hlsl_state_block_entry *entry, struct fx_write_context *fx)
+/* The type record of a numeric state value. The native compiler writes every
+ * such value as a column of its components (class MATRIX_ROWS, one component
+ * a row): a scalar is 1x1, a float4 colour is 4x1. */
+static uint32_t write_fx_2_state_type(const struct hlsl_type *data_type, struct fx_write_context *fx)
 {
     struct vkd3d_bytecode_buffer *buffer = &fx->unstructured;
-    struct hlsl_ir_node *value = entry->args->node;
-    struct hlsl_type *data_type = value->data_type;
     uint32_t offset;
 
     offset = put_u32(buffer, hlsl_sm1_base_type(data_type, false, HLSL_SAMPLER_DIM_GENERIC));
@@ -2251,7 +2252,7 @@ static uint32_t write_fx_2_state_type(const struct hlsl_state_block_entry *entry
     put_u32(buffer, 0); /* Semantic */
     put_u32(buffer, 0); /* Element count */
 
-    put_u32(buffer, entry->args_count); /* Rows */
+    put_u32(buffer, hlsl_type_component_count(data_type)); /* Rows */
     put_u32(buffer, 1); /* Columns */
 
     return offset;
@@ -2317,15 +2318,26 @@ static void write_fx_2_state_assignment(const struct hlsl_ir_var *var,
     switch (value_node->type)
     {
         case HLSL_IR_CONSTANT:
-            set_u32(buffer, type_offset, write_fx_2_state_type(entry, fx));
+        {
+            const struct hlsl_type *data_type = value_node->data_type;
+            unsigned int count = hlsl_type_component_count(data_type);
+
+            /* A constant node holds one scalar or vector; a matrix-typed value
+             * (a transform) never folds to one, so it is not written here. */
+            if (data_type->class != HLSL_CLASS_SCALAR && data_type->class != HLSL_CLASS_VECTOR)
+            {
+                hlsl_fixme(ctx, &var->loc, "Unsupported constant class %u for state %s.", data_type->class, entry->name);
+                break;
+            }
+
+            set_u32(buffer, type_offset, write_fx_2_state_type(data_type, fx));
             value = unstructured->size;
 
-            for (i = 0; i < entry->args_count; ++i)
-            {
-                c = hlsl_ir_constant(entry->args[i].node);
-                put_u32(unstructured, c->value.u[0].u);
-            }
+            c = hlsl_ir_constant(value_node);
+            for (i = 0; i < count; ++i)
+                put_u32(unstructured, c->value.u[i].u);
             break;
+        }
 
         case HLSL_IR_COMPILE:
         {
@@ -2339,8 +2351,12 @@ static void write_fx_2_state_assignment(const struct hlsl_ir_var *var,
             id = fx->object_variable_count++;
             value = put_u32(unstructured, id);
 
+            /* A shader that does not compile must fail the effect; an id
+             * without bytecode would bind as a NULL shader. */
             if (compile_shader(compile, fx, &code))
                 write_fx_2_resource(0, code.code, code.size, fx);
+            else
+                set_status(fx, VKD3D_ERROR_INVALID_SHADER);
             vkd3d_shader_free_shader_code(&code);
             ++fx->shader_count;
             break;
@@ -2350,7 +2366,16 @@ static void write_fx_2_state_assignment(const struct hlsl_ir_var *var,
         {
             /* Texture = <tex>; the value is an object id, the referenced
              * parameter's name goes to a resource record. */
-            const struct hlsl_ir_var *ref = hlsl_ir_load(value_node)->src.var;
+            const struct hlsl_ir_load *load = hlsl_ir_load(value_node);
+            const struct hlsl_ir_var *ref = load->src.var;
+
+            /* Only a whole uniform parameter can be named; the effect framework
+             * looks the name up in the parameter table. */
+            if (!(ref->storage_modifiers & HLSL_STORAGE_UNIFORM) || load->src.path_len)
+            {
+                hlsl_fixme(ctx, &var->loc, "Unsupported object reference for state %s.", entry->name);
+                break;
+            }
 
             set_u32(buffer, type_offset, write_fx_2_object_type(hlsl_sm1_base_type(ref->data_type,
                     ref->is_combined_sampler, HLSL_SAMPLER_DIM_GENERIC), fx));
@@ -2863,6 +2888,9 @@ static bool state_block_contains_state(const struct hlsl_state_block_entry *entr
 struct replace_state_context
 {
     const struct rhs_named_value *values;
+    /* Names every state of the profile accepts besides its own table
+     * (fx_2_0: TRUE and FALSE, so ZEnable = TRUE resolves next to USEW). */
+    const struct rhs_named_value *fallback;
     struct hlsl_ir_var *var;
 };
 
@@ -2891,13 +2919,16 @@ static bool replace_state_block_constant(struct hlsl_ctx *ctx, struct hlsl_ir_no
     struct hlsl_ir_node *c;
     unsigned int value;
 
-    if (!replace_context->values)
+    if (!replace_context->values && !replace_context->fallback)
         return false;
     if (instr->type != HLSL_IR_STATEBLOCK_CONSTANT)
         return false;
 
     state_constant = hlsl_ir_stateblock_constant(instr);
-    if (!get_fx_4_state_enum_value(replace_context->values, state_constant->name, &value))
+    if (!(replace_context->values
+            && get_fx_4_state_enum_value(replace_context->values, state_constant->name, &value))
+            && !(replace_context->fallback
+            && get_fx_4_state_enum_value(replace_context->fallback, state_constant->name, &value)))
     {
         hlsl_error(ctx, &replace_context->var->loc, VKD3D_SHADER_ERROR_HLSL_INVALID_SYNTAX,
                 "Unrecognized state constant %s.", state_constant->name);
@@ -3324,11 +3355,12 @@ static void resolve_fx_state_block_values(struct hlsl_ir_var *var,
     entry->name_id = state->id;
 
     replace_context.values = state->values;
+    replace_context.fallback = NULL;
     replace_context.var = var;
 
     /* fx_2_0 states take TRUE and FALSE by name whether or not they have a
-     * name table of their own (AlphaBlendEnable = FALSE). */
-    if (!replace_context.values && ctx->profile->major_version == 2)
+     * name table of their own (AlphaBlendEnable = FALSE, ZEnable = TRUE). */
+    if (ctx->profile->major_version == 2)
     {
         static const struct rhs_named_value fx_2_bool_values[] =
         {
@@ -3337,7 +3369,7 @@ static void resolve_fx_state_block_values(struct hlsl_ir_var *var,
             { NULL }
         };
 
-        replace_context.values = fx_2_bool_values;
+        replace_context.fallback = fx_2_bool_values;
     }
 
     /* Turn named constants to actual constants. */
